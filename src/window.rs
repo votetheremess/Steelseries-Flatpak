@@ -47,49 +47,32 @@ impl ChatMixWindow {
             .build();
 
         let toolbar = adw::ToolbarView::new();
-        let header_bar = adw::HeaderBar::new();
+        toolbar.add_top_bar(&adw::HeaderBar::new());
 
-        // Gear button on the left opens the Settings dialog
-        let settings_button = gtk::Button::builder()
-            .icon_name("emblem-system-symbolic")
-            .tooltip_text("Settings")
-            .build();
-        {
-            let app = app.clone();
-            let window_weak = window.downgrade();
-            settings_button.connect_clicked(move |_| {
-                if let Some(parent) = window_weak.upgrade() {
-                    present_settings_dialog(&app, &parent);
-                }
-            });
-        }
-        header_bar.pack_start(&settings_button);
-
-        toolbar.add_top_bar(&header_bar);
-
-        // Battery bar (right under the header)
+        // Battery bar (right under the header, with breathing room)
         let battery_bar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(0)
-            .margin_top(8)
+            .margin_top(16)
             .margin_bottom(8)
-            .margin_start(16)
-            .margin_end(16)
+            .margin_start(20)
+            .margin_end(20)
             .build();
 
         // Headset (left)
         let headset_bat_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
+            .spacing(10)
             .halign(gtk::Align::Start)
             .hexpand(true)
             .build();
         let headphones_icon = gtk::Image::from_icon_name("audio-headphones-symbolic");
-        headphones_icon.set_pixel_size(20);
+        headphones_icon.set_pixel_size(24);
         let headset_battery_icon = gtk::Image::from_icon_name("battery-symbolic");
-        headset_battery_icon.set_pixel_size(20);
+        headset_battery_icon.set_pixel_size(24);
         let headset_battery_label = gtk::Label::builder().label(PLACEHOLDER).build();
         headset_battery_label.add_css_class("numeric");
+        headset_battery_label.add_css_class("heading");
         headset_bat_box.append(&headphones_icon);
         headset_bat_box.append(&headset_battery_icon);
         headset_bat_box.append(&headset_battery_label);
@@ -98,15 +81,17 @@ impl ChatMixWindow {
         // Spare (right)
         let spare_bat_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
+            .spacing(10)
             .halign(gtk::Align::End)
             .build();
         let spare_label_prefix = gtk::Label::builder().label("Spare").build();
         spare_label_prefix.add_css_class("dim-label");
+        spare_label_prefix.add_css_class("heading");
         let spare_battery_icon = gtk::Image::from_icon_name("battery-symbolic");
-        spare_battery_icon.set_pixel_size(20);
+        spare_battery_icon.set_pixel_size(24);
         let spare_battery_label = gtk::Label::builder().label(PLACEHOLDER).build();
         spare_battery_label.add_css_class("numeric");
+        spare_battery_label.add_css_class("heading");
         spare_bat_box.append(&spare_label_prefix);
         spare_bat_box.append(&spare_battery_icon);
         spare_bat_box.append(&spare_battery_label);
@@ -271,8 +256,65 @@ impl ChatMixWindow {
         balance_group.add(&balance_box);
         page.add(&balance_group);
 
-        // Info group
-        let info_group = adw::PreferencesGroup::new();
+        // Settings group — autostart switch sits inline on the main page
+        let settings_group = adw::PreferencesGroup::new();
+        let autostart_row = adw::SwitchRow::builder()
+            .title("Start at Login")
+            .subtitle("Launch hidden when you log in")
+            .active(autostart::is_enabled())
+            .build();
+        autostart_row.connect_active_notify(|row| {
+            let result = if row.is_active() {
+                autostart::enable()
+            } else {
+                autostart::disable()
+            };
+            if let Err(e) = result {
+                log::warn!("Failed to toggle autostart: {e}");
+                row.set_active(!row.is_active());
+            }
+        });
+        settings_group.add(&autostart_row);
+        page.add(&settings_group);
+
+        // Bottom: Quit + Clear Config buttons (horizontal) above the info label
+        let bottom_group = adw::PreferencesGroup::new();
+
+        let buttons_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .homogeneous(true)
+            .margin_top(8)
+            .margin_bottom(4)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+
+        let clear_button = gtk::Button::builder()
+            .label("Clear Config")
+            .build();
+        clear_button.connect_clicked(|_| {
+            if let Err(e) = persistence::clear_saved() {
+                log::warn!("Failed to clear saved assignments: {e}");
+            }
+        });
+        buttons_box.append(&clear_button);
+
+        let quit_button = gtk::Button::builder()
+            .label("Quit")
+            .build();
+        quit_button.add_css_class("destructive-action");
+        {
+            let app = app.clone();
+            quit_button.connect_clicked(move |_| {
+                app.quit();
+            });
+        }
+        buttons_box.append(&quit_button);
+
+        bottom_group.add(&buttons_box);
+
+        // Info text below the buttons
         let info_label = gtk::Label::builder()
             .label(
                 "Assign apps to \"ChatMix Game\" or \"ChatMix Chat\" in your system sound settings. \
@@ -281,13 +323,14 @@ impl ChatMixWindow {
             .wrap(true)
             .justify(gtk::Justification::Center)
             .margin_top(12)
-            .margin_bottom(12)
+            .margin_bottom(8)
             .margin_start(12)
             .margin_end(12)
             .build();
         info_label.add_css_class("dim-label");
-        info_group.add(&info_label);
-        page.add(&info_group);
+        bottom_group.add(&info_label);
+
+        page.add(&bottom_group);
 
         toolbar.set_content(Some(&page));
         window.set_content(Some(&toolbar));
@@ -349,75 +392,3 @@ impl ChatMixWindow {
     }
 }
 
-fn present_settings_dialog(app: &adw::Application, parent: &adw::ApplicationWindow) {
-    let dialog = adw::PreferencesDialog::builder()
-        .title("Settings")
-        .build();
-
-    let page = adw::PreferencesPage::new();
-
-    // General section — Start at Login switch
-    let general_group = adw::PreferencesGroup::builder().title("General").build();
-    let autostart_row = adw::SwitchRow::builder()
-        .title("Start at Login")
-        .subtitle("Launch Arctis ChatMix hidden when you log in")
-        .active(autostart::is_enabled())
-        .build();
-    autostart_row.connect_active_notify(|row| {
-        let result = if row.is_active() {
-            autostart::enable()
-        } else {
-            autostart::disable()
-        };
-        if let Err(e) = result {
-            log::warn!("Failed to toggle autostart: {e}");
-            // Revert switch on error
-            row.set_active(!row.is_active());
-        }
-    });
-    general_group.add(&autostart_row);
-    page.add(&general_group);
-
-    // Actions section — Clear and Quit buttons
-    let actions_group = adw::PreferencesGroup::builder().title("Actions").build();
-
-    let clear_row = adw::ActionRow::builder()
-        .title("Clear Saved Assignments")
-        .subtitle("Forget which apps were assigned to ChatMix Game/Chat")
-        .build();
-    let clear_button = gtk::Button::builder()
-        .label("Clear")
-        .valign(gtk::Align::Center)
-        .build();
-    clear_button.add_css_class("destructive-action");
-    clear_button.connect_clicked(|_| {
-        if let Err(e) = persistence::clear_saved() {
-            log::warn!("Failed to clear saved assignments: {e}");
-        }
-    });
-    clear_row.add_suffix(&clear_button);
-    actions_group.add(&clear_row);
-
-    let quit_row = adw::ActionRow::builder()
-        .title("Quit")
-        .subtitle("Stop ChatMix and release virtual sinks")
-        .build();
-    let quit_button = gtk::Button::builder()
-        .label("Quit")
-        .valign(gtk::Align::Center)
-        .build();
-    quit_button.add_css_class("destructive-action");
-    {
-        let app = app.clone();
-        quit_button.connect_clicked(move |_| {
-            app.quit();
-        });
-    }
-    quit_row.add_suffix(&quit_button);
-    actions_group.add(&quit_row);
-
-    page.add(&actions_group);
-
-    dialog.add(&page);
-    dialog.present(Some(parent));
-}
