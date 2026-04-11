@@ -3,6 +3,8 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
+use crate::autostart;
+use crate::audio::persistence;
 use crate::hid::protocol::NoiseMode;
 
 const PLACEHOLDER: &str = "—";
@@ -45,7 +47,25 @@ impl ChatMixWindow {
             .build();
 
         let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
+        let header_bar = adw::HeaderBar::new();
+
+        // Gear button on the left opens the Settings dialog
+        let settings_button = gtk::Button::builder()
+            .icon_name("emblem-system-symbolic")
+            .tooltip_text("Settings")
+            .build();
+        {
+            let app = app.clone();
+            let window_weak = window.downgrade();
+            settings_button.connect_clicked(move |_| {
+                if let Some(parent) = window_weak.upgrade() {
+                    present_settings_dialog(&app, &parent);
+                }
+            });
+        }
+        header_bar.pack_start(&settings_button);
+
+        toolbar.add_top_bar(&header_bar);
 
         // Battery bar (right under the header)
         let battery_bar = gtk::Box::builder()
@@ -327,4 +347,77 @@ impl ChatMixWindow {
         w.spare_battery_icon
             .set_icon_name(Some(battery_icon_name(spare)));
     }
+}
+
+fn present_settings_dialog(app: &adw::Application, parent: &adw::ApplicationWindow) {
+    let dialog = adw::PreferencesDialog::builder()
+        .title("Settings")
+        .build();
+
+    let page = adw::PreferencesPage::new();
+
+    // General section — Start at Login switch
+    let general_group = adw::PreferencesGroup::builder().title("General").build();
+    let autostart_row = adw::SwitchRow::builder()
+        .title("Start at Login")
+        .subtitle("Launch Arctis ChatMix hidden when you log in")
+        .active(autostart::is_enabled())
+        .build();
+    autostart_row.connect_active_notify(|row| {
+        let result = if row.is_active() {
+            autostart::enable()
+        } else {
+            autostart::disable()
+        };
+        if let Err(e) = result {
+            log::warn!("Failed to toggle autostart: {e}");
+            // Revert switch on error
+            row.set_active(!row.is_active());
+        }
+    });
+    general_group.add(&autostart_row);
+    page.add(&general_group);
+
+    // Actions section — Clear and Quit buttons
+    let actions_group = adw::PreferencesGroup::builder().title("Actions").build();
+
+    let clear_row = adw::ActionRow::builder()
+        .title("Clear Saved Assignments")
+        .subtitle("Forget which apps were assigned to ChatMix Game/Chat")
+        .build();
+    let clear_button = gtk::Button::builder()
+        .label("Clear")
+        .valign(gtk::Align::Center)
+        .build();
+    clear_button.add_css_class("destructive-action");
+    clear_button.connect_clicked(|_| {
+        if let Err(e) = persistence::clear_saved() {
+            log::warn!("Failed to clear saved assignments: {e}");
+        }
+    });
+    clear_row.add_suffix(&clear_button);
+    actions_group.add(&clear_row);
+
+    let quit_row = adw::ActionRow::builder()
+        .title("Quit")
+        .subtitle("Stop ChatMix and release virtual sinks")
+        .build();
+    let quit_button = gtk::Button::builder()
+        .label("Quit")
+        .valign(gtk::Align::Center)
+        .build();
+    quit_button.add_css_class("destructive-action");
+    {
+        let app = app.clone();
+        quit_button.connect_clicked(move |_| {
+            app.quit();
+        });
+    }
+    quit_row.add_suffix(&quit_button);
+    actions_group.add(&quit_row);
+
+    page.add(&actions_group);
+
+    dialog.add(&page);
+    dialog.present(Some(parent));
 }

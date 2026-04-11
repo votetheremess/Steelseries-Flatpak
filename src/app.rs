@@ -1,4 +1,5 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -17,6 +18,7 @@ use crate::window::ChatMixWindow;
 
 const APP_ID: &str = "com.github.arctis_chatmix.ArctisNovaEliteChatMix";
 const BATTERY_REFRESH_SECS: u32 = 30;
+const STREAM_WATCH_SECS: u32 = 2;
 
 struct AppResources {
     _sinks: VirtualSinks,
@@ -26,10 +28,13 @@ struct AppResources {
     writer: Option<HidWriter>,
 }
 
-pub fn run() {
+pub fn run(start_hidden: bool) {
     let app = adw::Application::builder().application_id(APP_ID).build();
 
     let resources: Rc<RefCell<Option<AppResources>>> = Rc::new(RefCell::new(None));
+    let setup_done: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // Only honor --hidden on the first activate
+    let first_activate_hidden: Rc<Cell<bool>> = Rc::new(Cell::new(start_hidden));
 
     {
         let resources = resources.clone();
@@ -43,21 +48,36 @@ pub fn run() {
 
     {
         let resources = resources.clone();
+        let setup_done = setup_done.clone();
+        let first_activate_hidden = first_activate_hidden.clone();
         app.connect_activate(move |app| {
+            // If setup already ran, this is a subsequent activation (user ran
+            // `arctis-chatmix` while the first instance is still alive).
+            // Just bring the existing window forward.
+            if setup_done.get() {
+                if let Some(window) = app.active_window() {
+                    window.set_visible(true);
+                    window.present();
+                }
+                return;
+            }
+            setup_done.set(true);
+
             let window = ChatMixWindow::new(app);
 
-            // Ensure closing the window quits the application
-            let app_weak = app.downgrade();
-            window.window.connect_close_request(move |_| {
-                if let Some(app) = app_weak.upgrade() {
-                    app.quit();
-                }
-                glib::Propagation::Proceed
+            // Hide on close, keep the process running
+            window.window.connect_close_request(move |w| {
+                w.set_visible(false);
+                glib::Propagation::Stop
             });
 
-            window.window.present();
+            // Present the window unless we were launched with --hidden
+            if !first_activate_hidden.get() {
+                window.window.present();
+            }
+            first_activate_hidden.set(false);
 
-            // If startup failed, show disconnected state
+            // If startup failed, show disconnected state and stop here
             if resources.borrow().is_none() {
                 window.set_connected(false, None);
                 return;
@@ -97,17 +117,23 @@ pub fn run() {
             // Battery query: send once immediately, then refresh periodically
             if let Some(writer) = writer {
                 let writer = Rc::new(RefCell::new(writer));
-
-                // Initial query
                 query_battery(&writer);
-
-                // Periodic refresh
                 let writer_periodic = writer.clone();
                 glib::timeout_add_seconds_local(BATTERY_REFRESH_SECS, move || {
                     query_battery(&writer_periodic);
                     glib::ControlFlow::Continue
                 });
             }
+
+            // New-stream watcher: auto-route newly launched apps to saved ChatMix sinks.
+            // Seed with currently-existing IDs so the first tick doesn't re-process them
+            // (the startup restore_assignments() already handled those).
+            let seen_ids: Rc<RefCell<HashSet<u32>>> =
+                Rc::new(RefCell::new(persistence::initial_seen_ids()));
+            glib::timeout_add_seconds_local(STREAM_WATCH_SECS, move || {
+                persistence::restore_new_streams(&mut seen_ids.borrow_mut());
+                glib::ControlFlow::Continue
+            });
         });
     }
 
@@ -120,7 +146,6 @@ pub fn run() {
             persistence::save_assignments();
             if let Some(res) = resources.borrow_mut().take() {
                 res.shutdown.store(true, Ordering::Relaxed);
-                // Drop order: router first, then sinks (Drop impls run automatically)
                 drop(res);
             }
             log::info!("Cleanup complete");
@@ -162,7 +187,6 @@ fn init_pipeline() -> Result<AppResources, String> {
     }
 
     // Clone a separate file handle for queries from the GTK main thread.
-    // The listener thread keeps the original handle for reads.
     let writer = device
         .try_clone_writer()
         .map_err(|e| format!("Failed to clone HID writer: {e}"))?;
