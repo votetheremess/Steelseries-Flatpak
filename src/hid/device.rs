@@ -38,6 +38,21 @@ impl HidDevice {
     pub fn write_command(&mut self, buf: &[u8; 64]) -> io::Result<()> {
         self.file.write_all(buf)
     }
+
+    pub fn try_clone_writer(&self) -> io::Result<HidWriter> {
+        let file = fs::OpenOptions::new().write(true).open(&self.path)?;
+        Ok(HidWriter { file })
+    }
+}
+
+pub struct HidWriter {
+    file: File,
+}
+
+impl HidWriter {
+    pub fn write_command(&mut self, buf: &[u8; 64]) -> io::Result<()> {
+        self.file.write_all(buf)
+    }
 }
 
 pub fn find_and_open() -> Result<HidDevice, String> {
