@@ -16,6 +16,12 @@ const ICONS: &[(&str, &[u8])] = &[
     ("lucide-home-symbolic", include_bytes!("../data/icons/house.svg")),
     ("lucide-sidebar-symbolic", include_bytes!("../data/icons/panel-left.svg")),
     ("lucide-check-symbolic", include_bytes!("../data/icons/badge-check.svg")),
+    ("lucide-sliders-horizontal-symbolic", include_bytes!("../data/icons/sliders-horizontal.svg")),
+    ("lucide-clapperboard-symbolic", include_bytes!("../data/icons/clapperboard.svg")),
+    ("lucide-bolt-symbolic", include_bytes!("../data/icons/zap.svg")),
+    ("lucide-settings-symbolic", include_bytes!("../data/icons/settings.svg")),
+    ("lucide-plug-zap-symbolic", include_bytes!("../data/icons/plug-zap.svg")),
+    ("lucide-message-square-symbolic", include_bytes!("../data/icons/message-square.svg")),
 ];
 
 fn icon_dir() -> Option<PathBuf> {
