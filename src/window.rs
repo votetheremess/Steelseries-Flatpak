@@ -67,7 +67,7 @@ impl ChatMixWindow {
         let (dashboard_page, widgets) = build_dashboard_page();
         stack.add_named(&dashboard_page, Some("home"));
         stack.add_named(
-            &build_placeholder_page("Equalizer", "lucide-sliders-horizontal-symbolic", "Coming soon"),
+            &build_placeholder_page("Equalizer", "lucide-audio-lines-symbolic", "Coming soon"),
             Some("eq"),
         );
         stack.add_named(
@@ -75,7 +75,7 @@ impl ChatMixWindow {
             Some("clips"),
         );
         stack.add_named(
-            &build_placeholder_page("Engine", "lucide-bolt-symbolic", "Coming soon"),
+            &build_placeholder_page("Engine", "lucide-sliders-horizontal-symbolic", "Coming soon"),
             Some("engine"),
         );
         stack.add_named(&build_settings_page(app), Some("settings"));
@@ -166,7 +166,7 @@ fn build_sidebar(stack: &gtk::Stack) -> gtk::Widget {
     let home_btn = sidebar_button("lucide-home-symbolic", "Home");
     home_btn.set_active(true);
 
-    let eq_btn = sidebar_button("lucide-sliders-horizontal-symbolic", "Equalizer (coming soon)");
+    let eq_btn = sidebar_button("lucide-audio-lines-symbolic", "Equalizer (coming soon)");
     eq_btn.set_sensitive(false);
     eq_btn.set_group(Some(&home_btn));
 
@@ -174,7 +174,7 @@ fn build_sidebar(stack: &gtk::Stack) -> gtk::Widget {
     clips_btn.set_sensitive(false);
     clips_btn.set_group(Some(&home_btn));
 
-    let engine_btn = sidebar_button("lucide-bolt-symbolic", "Engine (coming soon)");
+    let engine_btn = sidebar_button("lucide-sliders-horizontal-symbolic", "Engine (coming soon)");
     engine_btn.set_sensitive(false);
     engine_btn.set_group(Some(&home_btn));
 
