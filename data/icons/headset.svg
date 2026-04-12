@@ -1,16 +1,6 @@
-<svg
-  xmlns="http://www.w3.org/2000/svg"
-  width="24"
-  height="24"
-  viewBox="0 0 24 24"
-  fill="none"
-  stroke="currentColor"
-  stroke-width="2"
-  stroke-linecap="round"
-  stroke-linejoin="round"
->
-  <rect x="3" y="11" width="5" height="7" rx="2" />
-  <rect x="16" y="11" width="5" height="7" rx="2" />
-  <path d="M3 11a9 9 0 1 1 18 0" />
-  <path d="M21 16v2a4 4 0 0 1-4 4h-5" />
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <rect class="transparent-fill foreground-stroke" stroke-width="2" x="3" y="11" width="5" height="7" rx="2" />
+  <rect class="transparent-fill foreground-stroke" stroke-width="2" x="16" y="11" width="5" height="7" rx="2" />
+  <path class="transparent-fill foreground-stroke" stroke-width="2" d="M3 11a9 9 0 1 1 18 0" />
+  <path class="transparent-fill foreground-stroke" stroke-width="2" d="M21 16v2a4 4 0 0 1-4 4h-5" />
 </svg>

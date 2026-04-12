@@ -1,17 +1,7 @@
-<svg
-  xmlns="http://www.w3.org/2000/svg"
-  width="24"
-  height="24"
-  viewBox="0 0 24 24"
-  fill="none"
-  stroke="currentColor"
-  stroke-width="2"
-  stroke-linecap="round"
-  stroke-linejoin="round"
->
-  <path d="M6.3 20.3H9.7L12 18 6 12 3.7 14.3V17.7Z" />
-  <path d="m2 22 3-3" />
-  <path d="M7.5 13.5 10 11" />
-  <path d="M10.5 16.5 13 14" />
-  <path d="m18 3-4 4h6l-4 4" />
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <rect class="transparent-fill foreground-stroke" stroke-width="2" x="2" y="14" width="8" height="6" rx="1" />
+  <path class="transparent-fill foreground-stroke" stroke-width="2" d="M6 20v2" />
+  <path class="transparent-fill foreground-stroke" stroke-width="2" d="M4 14v-4" />
+  <path class="transparent-fill foreground-stroke" stroke-width="2" d="M8 14v-4" />
+  <path class="transparent-fill foreground-stroke" stroke-width="2" d="m18 3-4 4h6l-4 4" />
 </svg>

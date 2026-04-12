@@ -39,8 +39,8 @@ impl ChatMixWindow {
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("Arctis Nova Elite ChatMix")
-            .default_width(960)
-            .default_height(580)
+            .default_width(1200)
+            .default_height(725)
             .build();
 
         // Top-level horizontal box: sidebar | content
@@ -88,6 +88,14 @@ impl ChatMixWindow {
         root.append(&content_area);
 
         window.set_content(Some(&root));
+
+        let css = gtk::CssProvider::new();
+        css.load_from_string("window { font-size: 125%; } row { padding-top: 4px; padding-bottom: 4px; }");
+        gtk::style_context_add_provider_for_display(
+            &gtk::prelude::WidgetExt::display(&window),
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
 
         let inner = Rc::new(RefCell::new(widgets));
         Self { window, inner }
@@ -146,12 +154,12 @@ fn apply_critical_class(image: &gtk::Image, critical: bool) {
 fn build_sidebar(stack: &gtk::Stack) -> gtk::Widget {
     let rail = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .width_request(56)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(4)
-        .margin_end(4)
+        .spacing(8)
+        .width_request(70)
+        .margin_top(15)
+        .margin_bottom(15)
+        .margin_start(5)
+        .margin_end(5)
         .build();
     rail.add_css_class("background");
 
@@ -173,31 +181,14 @@ fn build_sidebar(stack: &gtk::Stack) -> gtk::Widget {
     let settings_btn = sidebar_button("lucide-settings-symbolic", "Settings");
     settings_btn.set_group(Some(&home_btn));
 
-    // Feedback button opens GitHub
-    let feedback_btn = gtk::Button::builder()
-        .icon_name("lucide-message-square-symbolic")
-        .tooltip_text("Feedback")
-        .height_request(48)
-        .width_request(48)
-        .build();
-    feedback_btn.connect_clicked(|btn| {
-        let launcher = gtk::UriLauncher::new("https://github.com/votetheremess/Steelseries-Flatpak");
-        launcher.launch(
-            btn.root().and_downcast_ref::<gtk::Window>(),
-            gtk::gio::Cancellable::NONE,
-            |_| {},
-        );
-    });
-
     rail.append(&home_btn);
     rail.append(&eq_btn);
     rail.append(&clips_btn);
     rail.append(&engine_btn);
 
-    // Spacer pushes bottom buttons down
+    // Spacer pushes settings to bottom
     let spacer = gtk::Box::builder().vexpand(true).build();
     rail.append(&spacer);
-    rail.append(&feedback_btn);
     rail.append(&settings_btn);
 
     // Wire navigation
@@ -218,12 +209,15 @@ fn build_sidebar(stack: &gtk::Stack) -> gtk::Widget {
 }
 
 fn sidebar_button(icon_name: &str, tooltip: &str) -> gtk::ToggleButton {
+    let icon = gtk::Image::from_icon_name(icon_name);
+    icon.set_pixel_size(22);
     let btn = gtk::ToggleButton::builder()
-        .icon_name(icon_name)
+        .child(&icon)
         .tooltip_text(tooltip)
-        .height_request(48)
-        .width_request(48)
+        .height_request(60)
+        .width_request(60)
         .build();
+    btn.add_css_class("flat");
     btn
 }
 
@@ -248,16 +242,16 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
         .build();
 
     let clamp = adw::Clamp::builder()
-        .maximum_size(900)
-        .margin_top(20)
-        .margin_bottom(20)
-        .margin_start(20)
-        .margin_end(20)
+        .maximum_size(1125)
+        .margin_top(25)
+        .margin_bottom(25)
+        .margin_start(25)
+        .margin_end(25)
         .build();
 
     let grid = gtk::Grid::builder()
-        .column_spacing(12)
-        .row_spacing(12)
+        .column_spacing(15)
+        .row_spacing(15)
         .column_homogeneous(true)
         .build();
 
@@ -280,15 +274,12 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
     grid.attach(&status_card, 0, 0, 1, 1);
     grid.attach(&device_card, 1, 0, 1, 1);
 
-    // Row 1: Quick links card (full width)
-    let quick_links_card = build_quick_links_card();
-    grid.attach(&quick_links_card, 0, 1, 2, 1);
-
     let footer = gtk::Label::builder()
         .label("Assign apps to SteelSeries sinks in your system sound settings. Assignments are remembered between sessions.")
         .wrap(true)
         .halign(gtk::Align::Center)
-        .margin_bottom(12)
+        .margin_top(12)
+        .margin_bottom(24)
         .build();
     footer.add_css_class("dim-label");
 
@@ -336,12 +327,12 @@ fn build_status_card() -> (adw::PreferencesGroup, StatusResult) {
 
     let headset_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
+        .spacing(8)
         .build();
     let headset_icon = gtk::Image::from_icon_name("lucide-headset-symbolic");
-    headset_icon.set_pixel_size(18);
+    headset_icon.set_pixel_size(22);
     let headset_battery_icon = gtk::Image::from_icon_name("lucide-battery-symbolic");
-    headset_battery_icon.set_pixel_size(18);
+    headset_battery_icon.set_pixel_size(22);
     let headset_battery_label = gtk::Label::builder().label(PLACEHOLDER).build();
     headset_battery_label.add_css_class("numeric");
     headset_box.append(&headset_icon);
@@ -351,12 +342,12 @@ fn build_status_card() -> (adw::PreferencesGroup, StatusResult) {
 
     let spare_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
+        .spacing(8)
         .build();
-    let spare_prefix_icon = gtk::Image::from_icon_name("lucide-plug-zap-symbolic");
-    spare_prefix_icon.set_pixel_size(18);
+    let spare_prefix_icon = gtk::Image::from_icon_name("lucide-bolt-symbolic");
+    spare_prefix_icon.set_pixel_size(22);
     let spare_battery_icon = gtk::Image::from_icon_name("lucide-battery-symbolic");
-    spare_battery_icon.set_pixel_size(18);
+    spare_battery_icon.set_pixel_size(22);
     let spare_battery_label = gtk::Label::builder().label(PLACEHOLDER).build();
     spare_battery_label.add_css_class("numeric");
     spare_box.append(&spare_prefix_icon);
@@ -368,13 +359,13 @@ fn build_status_card() -> (adw::PreferencesGroup, StatusResult) {
 
     let chatmix_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(12)
-        .margin_start(12)
-        .margin_end(12)
+        .spacing(15)
+        .margin_start(15)
+        .margin_end(15)
         .build();
 
     let game_icon = gtk::Image::from_icon_name("lucide-gamepad-symbolic");
-    game_icon.set_pixel_size(18);
+    game_icon.set_pixel_size(22);
     let balance_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, -100.0, 100.0, 1.0);
     balance_scale.set_value(0.0);
     balance_scale.set_draw_value(false);
@@ -382,7 +373,7 @@ fn build_status_card() -> (adw::PreferencesGroup, StatusResult) {
     balance_scale.set_hexpand(true);
     balance_scale.set_inverted(true);
     let chat_icon = gtk::Image::from_icon_name("lucide-message-square-symbolic");
-    chat_icon.set_pixel_size(18);
+    chat_icon.set_pixel_size(22);
 
     chatmix_box.append(&game_icon);
     chatmix_box.append(&balance_scale);
@@ -417,6 +408,7 @@ fn build_device_card() -> (adw::PreferencesGroup, (adw::ActionRow, adw::ActionRo
         .subtitle("Arctis Nova Elite")
         .build();
     let device_icon = gtk::Image::from_icon_name("lucide-check-symbolic");
+    device_icon.set_pixel_size(22);
     device_icon.add_css_class("success");
     device_row.add_prefix(&device_icon);
     group.add(&device_row);
@@ -426,63 +418,12 @@ fn build_device_card() -> (adw::PreferencesGroup, (adw::ActionRow, adw::ActionRo
         .subtitle(PLACEHOLDER)
         .build();
     let noise_icon = gtk::Image::from_icon_name("lucide-headphones-symbolic");
+    noise_icon.set_pixel_size(22);
     noise_row.add_prefix(&noise_icon);
     group.add(&noise_row);
 
     (group, (device_row, noise_row))
 }
-
-// Details view (individual Game/Chat level bars with toggle switch) removed.
-// Can be restored from git history if needed.
-
-// -- Quick links card --
-
-fn build_quick_links_card() -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder().title("Features").build();
-
-    let links_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
-        .homogeneous(true)
-        .build();
-
-    links_box.append(&feature_tile("lucide-sliders-horizontal-symbolic", "EQ"));
-    links_box.append(&feature_tile("lucide-clapperboard-symbolic", "Clips"));
-    links_box.append(&feature_tile("lucide-bolt-symbolic", "Engine"));
-
-    group.add(&links_box);
-    group
-}
-
-fn feature_tile(icon_name: &str, label: &str) -> gtk::Box {
-    let tile = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .halign(gtk::Align::Center)
-        .build();
-
-    let icon = gtk::Image::from_icon_name(icon_name);
-    icon.set_pixel_size(28);
-    icon.add_css_class("dim-label");
-
-    let name = gtk::Label::new(Some(label));
-    name.add_css_class("dim-label");
-    name.add_css_class("caption");
-
-    let badge = gtk::Label::new(Some("Coming soon"));
-    badge.add_css_class("dim-label");
-    badge.add_css_class("caption");
-
-    tile.append(&icon);
-    tile.append(&name);
-    tile.append(&badge);
-    tile
-}
-
 
 // ---------------------------------------------------------------------------
 // Settings page
