@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod autostart;
 mod hid;
+mod icons;
 mod window;
 
 fn main() {

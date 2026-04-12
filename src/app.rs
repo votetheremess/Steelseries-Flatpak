@@ -14,6 +14,7 @@ use crate::audio::router::{self, AudioRouter};
 use crate::audio::sinks::{self, VirtualSinks};
 use crate::hid::device::HidWriter;
 use crate::hid::{self, protocol::HidEvent};
+use crate::icons;
 use crate::window::ChatMixWindow;
 
 const APP_ID: &str = "com.github.arctis_chatmix.ArctisNovaEliteChatMix";
@@ -62,6 +63,9 @@ pub fn run(start_hidden: bool) {
                 return;
             }
             setup_done.set(true);
+
+            // Register Lucide icon theme path (needs a gdk::Display, available here)
+            icons::install();
 
             let window = ChatMixWindow::new(app);
 

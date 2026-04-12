@@ -28,12 +28,15 @@ struct Widgets {
     chat_label: gtk::Label,
 }
 
-fn battery_icon_name(percent: u8) -> &'static str {
+/// Returns (icon name, is_critical) — is_critical means the icon should be
+/// rendered in the error (red) color.
+fn battery_icon(percent: u8) -> (&'static str, bool) {
     match percent {
-        0..=10 => "battery-empty-symbolic",
-        11..=30 => "battery-caution-symbolic",
-        31..=70 => "battery-good-symbolic",
-        _ => "battery-full-symbolic",
+        0..=9 => ("lucide-battery-symbolic", true),
+        10..=19 => ("lucide-battery-low-symbolic", true),
+        20..=39 => ("lucide-battery-low-symbolic", false),
+        40..=69 => ("lucide-battery-medium-symbolic", false),
+        _ => ("lucide-battery-full-symbolic", false),
     }
 }
 
@@ -47,7 +50,16 @@ impl ChatMixWindow {
             .build();
 
         let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
+        let header_bar = adw::HeaderBar::new();
+
+        // Sidebar toggle button on the left of the header
+        let sidebar_toggle = gtk::ToggleButton::builder()
+            .icon_name("lucide-sidebar-symbolic")
+            .tooltip_text("Toggle sidebar")
+            .build();
+        header_bar.pack_start(&sidebar_toggle);
+
+        toolbar.add_top_bar(&header_bar);
 
         // Battery bar (right under the header, with breathing room)
         let battery_bar = gtk::Box::builder()
@@ -66,9 +78,9 @@ impl ChatMixWindow {
             .halign(gtk::Align::Start)
             .hexpand(true)
             .build();
-        let headphones_icon = gtk::Image::from_icon_name("audio-headphones-symbolic");
+        let headphones_icon = gtk::Image::from_icon_name("lucide-headphones-symbolic");
         headphones_icon.set_pixel_size(24);
-        let headset_battery_icon = gtk::Image::from_icon_name("battery-symbolic");
+        let headset_battery_icon = gtk::Image::from_icon_name("lucide-battery-symbolic");
         headset_battery_icon.set_pixel_size(24);
         let headset_battery_label = gtk::Label::builder().label(PLACEHOLDER).build();
         headset_battery_label.add_css_class("numeric");
@@ -87,7 +99,7 @@ impl ChatMixWindow {
         let spare_label_prefix = gtk::Label::builder().label("Spare").build();
         spare_label_prefix.add_css_class("dim-label");
         spare_label_prefix.add_css_class("heading");
-        let spare_battery_icon = gtk::Image::from_icon_name("battery-symbolic");
+        let spare_battery_icon = gtk::Image::from_icon_name("lucide-battery-symbolic");
         spare_battery_icon.set_pixel_size(24);
         let spare_battery_label = gtk::Label::builder().label(PLACEHOLDER).build();
         spare_battery_label.add_css_class("numeric");
@@ -108,7 +120,7 @@ impl ChatMixWindow {
             .title("Connected")
             .subtitle("Arctis Nova Elite")
             .build();
-        let device_icon = gtk::Image::from_icon_name("emblem-ok-symbolic");
+        let device_icon = gtk::Image::from_icon_name("lucide-check-symbolic");
         device_icon.add_css_class("success");
         device_row.add_prefix(&device_icon);
         device_group.add(&device_row);
@@ -117,7 +129,7 @@ impl ChatMixWindow {
             .title("Noise Control")
             .subtitle(PLACEHOLDER)
             .build();
-        let noise_icon = gtk::Image::from_icon_name("audio-headphones-symbolic");
+        let noise_icon = gtk::Image::from_icon_name("lucide-headphones-symbolic");
         noise_row.add_prefix(&noise_icon);
         device_group.add(&noise_row);
 
@@ -333,7 +345,29 @@ impl ChatMixWindow {
         page.add(&bottom_group);
 
         toolbar.set_content(Some(&page));
-        window.set_content(Some(&toolbar));
+
+        // Sidebar — vertical list of page icons
+        let sidebar = build_sidebar();
+
+        // OverlaySplitView wraps everything: sidebar on the left, toolbar+content on the right
+        let split_view = adw::OverlaySplitView::builder()
+            .sidebar(&sidebar)
+            .content(&toolbar)
+            .show_sidebar(false)
+            .collapsed(true)
+            .min_sidebar_width(70.0)
+            .max_sidebar_width(70.0)
+            .sidebar_width_fraction(0.0)
+            .build();
+
+        // Bind the toggle button to the split view's show_sidebar property
+        sidebar_toggle
+            .bind_property("active", &split_view, "show-sidebar")
+            .bidirectional()
+            .sync_create()
+            .build();
+
+        window.set_content(Some(&split_view));
 
         let inner = Rc::new(RefCell::new(Widgets {
             device_row,
@@ -383,12 +417,48 @@ impl ChatMixWindow {
 
     pub fn set_battery(&self, headset: u8, spare: u8) {
         let w = self.inner.borrow();
+
+        let (headset_icon, headset_critical) = battery_icon(headset);
         w.headset_battery_label.set_label(&format!("{headset}%"));
-        w.headset_battery_icon
-            .set_icon_name(Some(battery_icon_name(headset)));
+        w.headset_battery_icon.set_icon_name(Some(headset_icon));
+        apply_critical_class(&w.headset_battery_icon, headset_critical);
+
+        let (spare_icon, spare_critical) = battery_icon(spare);
         w.spare_battery_label.set_label(&format!("{spare}%"));
-        w.spare_battery_icon
-            .set_icon_name(Some(battery_icon_name(spare)));
+        w.spare_battery_icon.set_icon_name(Some(spare_icon));
+        apply_critical_class(&w.spare_battery_icon, spare_critical);
     }
+}
+
+fn apply_critical_class(image: &gtk::Image, critical: bool) {
+    if critical {
+        image.add_css_class("error");
+    } else {
+        image.remove_css_class("error");
+    }
+}
+
+fn build_sidebar() -> gtk::Widget {
+    let sidebar_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(8)
+        .margin_end(8)
+        .build();
+    sidebar_box.add_css_class("background");
+
+    let home_button = gtk::ToggleButton::builder()
+        .icon_name("lucide-home-symbolic")
+        .tooltip_text("Home")
+        .active(true)
+        .height_request(48)
+        .width_request(48)
+        .build();
+    home_button.add_css_class("flat");
+    sidebar_box.append(&home_button);
+
+    sidebar_box.upcast()
 }
 
