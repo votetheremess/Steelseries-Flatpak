@@ -4,6 +4,7 @@ use super::sinks::ALL_SINKS;
 
 pub struct AudioRouter {
     loopback_ids: Vec<u32>,
+    mic_linked: bool,
 }
 
 impl AudioRouter {
@@ -20,10 +21,33 @@ impl AudioRouter {
             loopback_ids.push(id);
         }
 
-        Ok(AudioRouter { loopback_ids })
+        let mic_linked = match find_headset_source() {
+            Ok(source) => match link_mic_source(&source) {
+                Ok(()) => {
+                    log::info!("Linked headset mic ({source}) → SteelSeries_Mic");
+                    true
+                }
+                Err(e) => {
+                    log::warn!("Failed to link mic source: {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                log::warn!("Could not find headset mic source: {e}");
+                false
+            }
+        };
+
+        Ok(AudioRouter {
+            loopback_ids,
+            mic_linked,
+        })
     }
 
     pub fn destroy(&self) {
+        if self.mic_linked {
+            unlink_mic_source();
+        }
         for id in &self.loopback_ids {
             unload_module(*id);
         }
@@ -53,6 +77,49 @@ pub fn find_headset_sink() -> Result<String, String> {
     }
 
     Err("Arctis Nova Elite audio sink not found in PipeWire/PulseAudio".to_string())
+}
+
+pub fn find_headset_source() -> Result<String, String> {
+    let output = Command::new("pactl")
+        .args(["list", "sources", "short"])
+        .output()
+        .map_err(|e| format!("Failed to run pactl: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.contains("SteelSeries") && line.contains("Arctis_Nova_Elite") {
+            if line.contains("SteelSeries_Mic") || line.contains(".monitor") {
+                continue;
+            }
+            if let Some(name) = line.split_whitespace().nth(1) {
+                return Ok(name.to_string());
+            }
+        }
+    }
+
+    Err("Arctis Nova Elite microphone source not found".to_string())
+}
+
+fn link_mic_source(headset_source: &str) -> Result<(), String> {
+    let output = Command::new("pw-link")
+        .args([headset_source, super::sinks::MIC_SOURCE_NAME])
+        .output()
+        .map_err(|e| format!("Failed to run pw-link: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("pw-link failed: {stderr}"));
+    }
+
+    Ok(())
+}
+
+fn unlink_mic_source() {
+    if let Ok(source) = find_headset_source() {
+        let _ = Command::new("pw-link")
+            .args(["-d", &source, super::sinks::MIC_SOURCE_NAME])
+            .output();
+    }
 }
 
 fn load_loopback(source_sink: &str, target_sink: &str) -> Result<u32, String> {

@@ -61,11 +61,11 @@ impl VirtualSinks {
         cleanup_orphaned();
 
         for (name, description) in ALL_SINKS {
-            create_pw_node(name, description, "Audio/Sink")?;
+            create_pw_node(name, description, "Audio/Sink", "FL,FR")?;
             log::info!("Created sink {name}");
         }
         for (name, description) in ALL_SOURCES {
-            create_pw_node(name, description, "Audio/Source/Virtual")?;
+            create_pw_node(name, description, "Audio/Source/Virtual", "MONO")?;
             log::info!("Created source {name}");
         }
 
@@ -102,9 +102,14 @@ pub fn set_sink_volume(sink_name: &str, volume_percent: u32) -> Result<(), Strin
     Ok(())
 }
 
-fn create_pw_node(node_name: &str, description: &str, media_class: &str) -> Result<(), String> {
+fn create_pw_node(
+    node_name: &str,
+    description: &str,
+    media_class: &str,
+    audio_position: &str,
+) -> Result<(), String> {
     let props = format!(
-        "{{ factory.name=support.null-audio-sink node.name={node_name} node.description=\"{description}\" media.class={media_class} object.linger=true audio.position=[FL,FR] monitor.channel-volumes=true monitor.passthrough=true }}"
+        "{{ factory.name=support.null-audio-sink node.name={node_name} node.description=\"{description}\" media.class={media_class} object.linger=true audio.position=[{audio_position}] monitor.channel-volumes=true monitor.passthrough=true }}"
     );
 
     let output = Command::new("pw-cli")
