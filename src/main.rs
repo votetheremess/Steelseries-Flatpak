@@ -3,6 +3,7 @@ mod audio;
 mod autostart;
 mod hid;
 mod icons;
+mod tray;
 mod window;
 
 fn main() {

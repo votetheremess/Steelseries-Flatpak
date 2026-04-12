@@ -78,14 +78,14 @@ impl ChatMixWindow {
             .halign(gtk::Align::Start)
             .hexpand(true)
             .build();
-        let headphones_icon = gtk::Image::from_icon_name("lucide-headphones-symbolic");
-        headphones_icon.set_pixel_size(24);
+        let headset_prefix_icon = gtk::Image::from_icon_name("lucide-headset-symbolic");
+        headset_prefix_icon.set_pixel_size(24);
         let headset_battery_icon = gtk::Image::from_icon_name("lucide-battery-symbolic");
         headset_battery_icon.set_pixel_size(24);
         let headset_battery_label = gtk::Label::builder().label(PLACEHOLDER).build();
         headset_battery_label.add_css_class("numeric");
         headset_battery_label.add_css_class("heading");
-        headset_bat_box.append(&headphones_icon);
+        headset_bat_box.append(&headset_prefix_icon);
         headset_bat_box.append(&headset_battery_icon);
         headset_bat_box.append(&headset_battery_label);
         battery_bar.append(&headset_bat_box);

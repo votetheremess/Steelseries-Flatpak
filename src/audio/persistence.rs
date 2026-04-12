@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use super::sinks::{CHAT_SINK_NAME, GAME_SINK_NAME};
+use super::sinks::{is_managed, migrate_legacy_name};
 
 const CONFIG_DIR: &str = "arctis-chatmix";
 const CONFIG_FILE: &str = "assignments.txt";
@@ -106,11 +106,11 @@ pub fn save_assignments() {
         let Some(sink_name) = sinks.get(&input.sink_id) else {
             continue;
         };
-        if sink_name == GAME_SINK_NAME || sink_name == CHAT_SINK_NAME {
-            // Currently on a ChatMix sink → update the saved entry
+        if is_managed(sink_name) {
+            // Currently on a managed sink → update the saved entry
             assignments.insert(input.app_name, sink_name.clone());
         } else {
-            // Currently running but NOT on ChatMix → user moved it out, forget it
+            // Currently running but NOT on a managed sink → user moved it out, forget it
             assignments.remove(&input.app_name);
         }
     }
@@ -144,6 +144,14 @@ fn read_saved(path: &std::path::Path) -> HashMap<String, String> {
             let mut parts = line.splitn(2, '\t');
             let app = parts.next()?.to_string();
             let sink = parts.next()?.to_string();
+            // Translate legacy sink names (ChatMix_* → SteelSeries_*) on load
+            let sink = match migrate_legacy_name(&sink) {
+                Some(new_name) => {
+                    log::info!("Migrating legacy assignment: {app} {sink} → {new_name}");
+                    new_name.to_string()
+                }
+                None => sink,
+            };
             Some((app, sink))
         })
         .collect()

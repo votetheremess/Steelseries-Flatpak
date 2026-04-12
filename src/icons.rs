@@ -7,6 +7,8 @@ use gtk::gdk;
 /// The alias is what we reference in code via `gtk::Image::from_icon_name`.
 const ICONS: &[(&str, &[u8])] = &[
     ("lucide-headphones-symbolic", include_bytes!("../data/icons/headphones.svg")),
+    ("lucide-headset-symbolic", include_bytes!("../data/icons/headset.svg")),
+    ("lucide-gamepad-symbolic", include_bytes!("../data/icons/gamepad-2.svg")),
     ("lucide-battery-symbolic", include_bytes!("../data/icons/battery.svg")),
     ("lucide-battery-low-symbolic", include_bytes!("../data/icons/battery-low.svg")),
     ("lucide-battery-medium-symbolic", include_bytes!("../data/icons/battery-medium.svg")),

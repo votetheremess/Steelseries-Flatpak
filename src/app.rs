@@ -15,6 +15,7 @@ use crate::audio::sinks::{self, VirtualSinks};
 use crate::hid::device::HidWriter;
 use crate::hid::{self, protocol::HidEvent};
 use crate::icons;
+use crate::tray;
 use crate::window::ChatMixWindow;
 
 const APP_ID: &str = "com.github.arctis_chatmix.ArctisNovaEliteChatMix";
@@ -136,6 +137,26 @@ pub fn run(start_hidden: bool) {
                 Rc::new(RefCell::new(persistence::initial_seen_ids()));
             glib::timeout_add_seconds_local(STREAM_WATCH_SECS, move || {
                 persistence::restore_new_streams(&mut seen_ids.borrow_mut());
+                glib::ControlFlow::Continue
+            });
+
+            // Spawn the system tray icon and poll for commands on the main thread
+            let tray_rx = tray::spawn();
+            let app_for_tray = app.clone();
+            let window_for_tray = window.clone();
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                while let Ok(cmd) = tray_rx.try_recv() {
+                    match cmd {
+                        tray::TrayCommand::Show => {
+                            window_for_tray.window.set_visible(true);
+                            window_for_tray.window.present();
+                        }
+                        tray::TrayCommand::Quit => {
+                            app_for_tray.quit();
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
                 glib::ControlFlow::Continue
             });
         });

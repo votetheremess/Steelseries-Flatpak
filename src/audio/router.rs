@@ -1,29 +1,32 @@
 use std::process::Command;
 
-use super::sinks::{CHAT_SINK_NAME, GAME_SINK_NAME};
+use super::sinks::ALL_SINKS;
 
 pub struct AudioRouter {
-    game_loopback_id: u32,
-    chat_loopback_id: u32,
+    loopback_ids: Vec<u32>,
 }
 
 impl AudioRouter {
     pub fn create(headset_sink: &str) -> Result<Self, String> {
-        let game_loopback_id = load_loopback(GAME_SINK_NAME, headset_sink)?;
-        log::info!("Created Game loopback (module {game_loopback_id})");
+        // Clean up any orphaned loopback modules from a previous session (including
+        // legacy names) before creating new ones. Multiple loopbacks reading from
+        // the same monitor source cause audio feedback / staticky hum.
+        cleanup_orphaned_loopbacks();
 
-        let chat_loopback_id = load_loopback(CHAT_SINK_NAME, headset_sink)?;
-        log::info!("Created Chat loopback (module {chat_loopback_id})");
+        let mut loopback_ids = Vec::with_capacity(ALL_SINKS.len());
+        for (name, _) in ALL_SINKS {
+            let id = load_loopback(name, headset_sink)?;
+            log::info!("Created loopback for {name} (module {id})");
+            loopback_ids.push(id);
+        }
 
-        Ok(AudioRouter {
-            game_loopback_id,
-            chat_loopback_id,
-        })
+        Ok(AudioRouter { loopback_ids })
     }
 
     pub fn destroy(&self) {
-        unload_module(self.game_loopback_id);
-        unload_module(self.chat_loopback_id);
+        for id in &self.loopback_ids {
+            unload_module(*id);
+        }
         log::info!("Audio loopbacks destroyed");
     }
 }
@@ -82,5 +85,54 @@ fn unload_module(module_id: u32) {
         .output()
     {
         log::warn!("Failed to unload loopback module {module_id}: {e}");
+    }
+}
+
+/// Find any existing module-loopback instances whose source is one of our
+/// managed names (current sinks, sources, or legacy names) and unload them.
+/// Called before creating fresh loopbacks to prevent duplicates accumulating
+/// and causing audio feedback. Also catches loopbacks from previous versions
+/// where some nodes were sinks that are now sources (e.g. Mic).
+fn cleanup_orphaned_loopbacks() {
+    use super::sinks::{ALL_SOURCES, LEGACY_SINK_MIGRATIONS};
+
+    let Ok(output) = Command::new("pactl")
+        .args(["list", "modules", "short"])
+        .output()
+    else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Collect every managed name — current sinks, current sources, and legacy
+    let mut known: Vec<&str> = ALL_SINKS.iter().map(|(n, _)| *n).collect();
+    known.extend(ALL_SOURCES.iter().map(|(n, _)| *n));
+    known.extend(LEGACY_SINK_MIGRATIONS.iter().map(|(old, _)| *old));
+
+    let mut cleaned = 0;
+    for line in stdout.lines() {
+        // Lines look like: `<id>\tmodule-loopback\tsource=<name>.monitor sink=<target> ...`
+        if !line.contains("module-loopback") {
+            continue;
+        }
+        let referenced = known.iter().any(|name| {
+            line.contains(&format!("source={name}.monitor"))
+                || line.contains(&format!("source={name}"))
+        });
+        if !referenced {
+            continue;
+        }
+        let Some(id_str) = line.split_whitespace().next() else {
+            continue;
+        };
+        let Ok(id) = id_str.parse::<u32>() else {
+            continue;
+        };
+        log::warn!("Unloading orphaned loopback module {id}: {line}");
+        unload_module(id);
+        cleaned += 1;
+    }
+    if cleaned > 0 {
+        log::info!("Cleaned up {cleaned} orphaned loopback(s)");
     }
 }
