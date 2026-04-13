@@ -86,7 +86,7 @@ fn format_freq(f: f64) -> String {
     if f >= 1000.0 {
         format!("{}k", (f / 1000.0) as u32)
     } else {
-        format!("{}", f as u32)
+        format!("{}", f.round() as u32)
     }
 }
 
@@ -151,6 +151,11 @@ fn draw_eq_graph(
     let bands = &state.active_sink_eq().bands;
     let freqs = biquad::log_frequencies(CURVE_SAMPLES);
 
+    // Clip curves to the graph area so they naturally disappear behind borders
+    let _ = cr.save();
+    cr.rectangle(PAD_LEFT, PAD_TOP, gw, gh);
+    cr.clip();
+
     // Individual band curves
     for (i, band) in bands.iter().enumerate() {
         if !band.enabled {
@@ -170,7 +175,7 @@ fn draw_eq_graph(
         cr.move_to(freq_to_x(freqs[0], gw), zero_y);
         for (j, &freq) in freqs.iter().enumerate() {
             let x = freq_to_x(freq, gw);
-            let y = db_to_y(responses[j].clamp(GAIN_MIN, GAIN_MAX), gh);
+            let y = db_to_y(responses[j], gh);
             cr.line_to(x, y);
         }
         cr.line_to(freq_to_x(freqs[CURVE_SAMPLES - 1], gw), zero_y);
@@ -182,7 +187,7 @@ fn draw_eq_graph(
         cr.set_line_width(if is_active { 2.0 } else { 1.5 });
         for (j, &freq) in freqs.iter().enumerate() {
             let x = freq_to_x(freq, gw);
-            let y = db_to_y(responses[j].clamp(GAIN_MIN, GAIN_MAX), gh);
+            let y = db_to_y(responses[j], gh);
             if j == 0 { cr.move_to(x, y); } else { cr.line_to(x, y); }
         }
         let _ = cr.stroke();
@@ -197,10 +202,13 @@ fn draw_eq_graph(
     cr.set_line_width(2.0);
     for (j, &freq) in freqs.iter().enumerate() {
         let x = freq_to_x(freq, gw);
-        let y = db_to_y(combined[j].clamp(GAIN_MIN, GAIN_MAX), gh);
+        let y = db_to_y(combined[j], gh);
         if j == 0 { cr.move_to(x, y); } else { cr.line_to(x, y); }
     }
     let _ = cr.stroke();
+
+    // End curve clipping — control points should draw outside the graph area too
+    let _ = cr.restore();
 
     // Control points
     for (i, band) in bands.iter().enumerate() {

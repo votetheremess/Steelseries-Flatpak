@@ -3,11 +3,12 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
+use gtk::gdk;
 
 use super::model::*;
 
-/// Build a compact controls bar: [Freq: 125 Hz] [Gain: +3.0 dB] [Q: 1.00] [Type ▾] [On/Off]
-/// Each pill has a dim label prefix and a content-hugging entry.
+/// Build the controls bar with Blender-style scrub entries.
+/// Hover shows a left-right cursor. Drag to adjust. Click to type.
 pub fn build_floating_panel(
     state: SharedEqState,
     on_changed: Rc<dyn Fn()>,
@@ -22,97 +23,101 @@ pub fn build_floating_panel(
 
     let updating = Rc::new(Cell::new(false));
 
-    // Frequency
-    let freq_entry = gtk::Entry::builder()
-        .tooltip_text("Frequency — press Enter to apply")
-        .xalign(0.5)
-        .hexpand(false)
-        .build();
-    freq_entry.add_css_class("eq-spin");
+    // --- Scrub entries ---
 
-    freq_entry.connect_activate({
+    let freq_entry = scrub_entry();
+    let gain_entry = scrub_entry();
+    let q_entry = scrub_entry();
+
+    // Freq: logarithmic drag — each pixel multiplies by ~1.005
+    wire_scrub_drag(&freq_entry, state.clone(), on_changed.clone(), updating.clone(), {
         let state = state.clone();
-        let on_changed = on_changed.clone();
-        let updating = updating.clone();
-        move |entry| {
-            if updating.get() { return; }
-            let text = entry.text();
+        move |dx| {
+            let mut st = state.borrow_mut();
+            if let Some(band) = st.selected_band_mut() {
+                band.frequency = (band.frequency * 1.005_f64.powf(dx)).clamp(FREQ_MIN, FREQ_MAX);
+                st.active_sink_eq_mut().preset_name = None;
+            }
+        }
+    });
+
+    // Gain: linear drag — 0.05 dB per pixel
+    wire_scrub_drag(&gain_entry, state.clone(), on_changed.clone(), updating.clone(), {
+        let state = state.clone();
+        move |dx| {
+            let mut st = state.borrow_mut();
+            if let Some(band) = st.selected_band_mut() {
+                band.gain_db = (band.gain_db + dx * 0.05).clamp(GAIN_MIN, GAIN_MAX);
+                st.active_sink_eq_mut().preset_name = None;
+            }
+        }
+    });
+
+    // Q: logarithmic drag
+    wire_scrub_drag(&q_entry, state.clone(), on_changed.clone(), updating.clone(), {
+        let state = state.clone();
+        move |dx| {
+            let mut st = state.borrow_mut();
+            if let Some(band) = st.selected_band_mut() {
+                band.q = (band.q * 1.01_f64.powf(dx)).clamp(Q_MIN, Q_MAX);
+                st.active_sink_eq_mut().preset_name = None;
+            }
+        }
+    });
+
+    // Wire Enter key to commit typed values
+    wire_entry_commit(&freq_entry, state.clone(), on_changed.clone(), updating.clone(),
+        |text| {
             let text = text.trim();
-            let val = if let Some(khz) = text.strip_suffix("kHz").or_else(|| text.strip_suffix("khz")) {
-                khz.trim().parse::<f64>().map(|v| v * 1000.0).ok()
-            } else if let Some(hz) = text.strip_suffix("Hz").or_else(|| text.strip_suffix("hz")) {
-                hz.trim().parse::<f64>().ok()
-            } else {
-                text.parse::<f64>().ok()
-            };
-            if let Some(v) = val {
+            if let Some(khz) = text.strip_suffix("kHz").or_else(|| text.strip_suffix("khz")) {
+                return khz.trim().parse::<f64>().map(|v| v * 1000.0).ok();
+            }
+            if let Some(hz) = text.strip_suffix("Hz").or_else(|| text.strip_suffix("hz")) {
+                return hz.trim().parse::<f64>().ok();
+            }
+            text.parse::<f64>().ok()
+        },
+        {
+            let state = state.clone();
+            move |val| {
                 let mut st = state.borrow_mut();
                 if let Some(band) = st.selected_band_mut() {
-                    band.frequency = v.clamp(FREQ_MIN, FREQ_MAX);
+                    band.frequency = val.clamp(FREQ_MIN, FREQ_MAX);
                     st.active_sink_eq_mut().preset_name = None;
                 }
-                drop(st);
-                on_changed();
             }
-        }
-    });
+        },
+    );
 
-    // Gain
-    let gain_entry = gtk::Entry::builder()
-        .tooltip_text("Gain — press Enter to apply")
-        .xalign(0.5)
-        .hexpand(false)
-        .build();
-    gain_entry.add_css_class("eq-spin");
-
-    gain_entry.connect_activate({
-        let state = state.clone();
-        let on_changed = on_changed.clone();
-        let updating = updating.clone();
-        move |entry| {
-            if updating.get() { return; }
-            let text = entry.text();
-            let text = text.trim().trim_end_matches("dB").trim_end_matches("db").trim();
-            if let Ok(v) = text.parse::<f64>() {
+    wire_entry_commit(&gain_entry, state.clone(), on_changed.clone(), updating.clone(),
+        |text| text.trim().trim_end_matches("dB").trim_end_matches("db").trim().parse::<f64>().ok(),
+        {
+            let state = state.clone();
+            move |val| {
                 let mut st = state.borrow_mut();
                 if let Some(band) = st.selected_band_mut() {
-                    band.gain_db = v.clamp(GAIN_MIN, GAIN_MAX);
+                    band.gain_db = val.clamp(GAIN_MIN, GAIN_MAX);
                     st.active_sink_eq_mut().preset_name = None;
                 }
-                drop(st);
-                on_changed();
             }
-        }
-    });
+        },
+    );
 
-    // Q
-    let q_entry = gtk::Entry::builder()
-        .tooltip_text("Q factor — press Enter to apply")
-        .xalign(0.5)
-        .hexpand(false)
-        .build();
-    q_entry.add_css_class("eq-spin");
-
-    q_entry.connect_activate({
-        let state = state.clone();
-        let on_changed = on_changed.clone();
-        let updating = updating.clone();
-        move |entry| {
-            if updating.get() { return; }
-            let text = entry.text();
-            if let Ok(v) = text.trim().parse::<f64>() {
+    wire_entry_commit(&q_entry, state.clone(), on_changed.clone(), updating.clone(),
+        |text| text.trim().parse::<f64>().ok(),
+        {
+            let state = state.clone();
+            move |val| {
                 let mut st = state.borrow_mut();
                 if let Some(band) = st.selected_band_mut() {
-                    band.q = v.clamp(Q_MIN, Q_MAX);
+                    band.q = val.clamp(Q_MIN, Q_MAX);
                     st.active_sink_eq_mut().preset_name = None;
                 }
-                drop(st);
-                on_changed();
             }
-        }
-    });
+        },
+    );
 
-    // Filter type dropdown
+    // --- Filter type dropdown ---
     let filter_labels: Vec<&str> = FilterType::ALL.iter().map(|ft| ft.label()).collect();
     let filter_model = gtk::StringList::new(&filter_labels);
     let filter_dropdown = gtk::DropDown::builder()
@@ -143,7 +148,7 @@ pub fn build_floating_panel(
         }
     });
 
-    // Enable switch
+    // --- Enable switch ---
     let enable_switch = gtk::Switch::builder()
         .tooltip_text("Enable/disable band")
         .valign(gtk::Align::Center)
@@ -167,14 +172,14 @@ pub fn build_floating_panel(
         }
     });
 
-    // Assemble: labeled pills
-    panel.append(&labeled_pill("Freq", &freq_entry));
-    panel.append(&labeled_pill("Gain", &gain_entry));
-    panel.append(&labeled_pill("Q", &q_entry));
-    panel.append(&labeled_pill("Type", &filter_dropdown));
-    panel.append(&labeled_pill("On", &enable_switch));
+    // Assemble labeled pills
+    panel.append(&labeled_pill("Freq", &freq_entry, true));
+    panel.append(&labeled_pill("Gain", &gain_entry, true));
+    panel.append(&labeled_pill("Q", &q_entry, true));
+    panel.append(&labeled_pill("Type", &filter_dropdown, false));
+    panel.append(&labeled_pill("On", &enable_switch, false));
 
-    // Update function — populates when a band is selected, clears when none
+    // --- Update function ---
     let update_fn: Rc<dyn Fn()> = {
         let state = state.clone();
         let updating = updating.clone();
@@ -239,13 +244,135 @@ pub fn build_floating_panel(
         })
     };
 
-    // Start in empty state
     update_fn();
 
     (panel, update_fn)
 }
 
-fn labeled_pill(label: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {
+// ---------------------------------------------------------------------------
+// Scrub entry: non-editable by default, drag to adjust, click to type
+// ---------------------------------------------------------------------------
+
+fn set_scrub_cursor(widget: &impl IsA<gtk::Widget>) {
+    let cursor = gdk::Cursor::from_name("ew-resize", None);
+    if let Some(ref c) = cursor {
+        widget.set_cursor(Some(c));
+        let mut child = widget.as_ref().first_child();
+        while let Some(ch) = child {
+            ch.set_cursor(Some(c));
+            child = ch.next_sibling();
+        }
+    }
+}
+
+fn scrub_entry() -> gtk::Entry {
+    let entry = gtk::Entry::builder()
+        .xalign(0.5)
+        .hexpand(false)
+        .editable(false)
+        .can_focus(false)
+        .build();
+    entry.add_css_class("eq-spin");
+
+    // Force scrub cursor on every mouse movement when not in edit mode.
+    // GTK's Entry continuously resets its cursor internally, so we must
+    // continuously override it.
+    let motion = gtk::EventControllerMotion::new();
+    {
+        let entry = entry.clone();
+        motion.connect_motion(move |_ctrl, _x, _y| {
+            if !entry.is_editable() {
+                set_scrub_cursor(&entry);
+            }
+        });
+    }
+    entry.add_controller(motion);
+
+    entry
+}
+
+/// Wire drag-to-adjust on a scrub entry. `apply_delta` receives the horizontal pixel delta.
+fn wire_scrub_drag(
+    entry: &gtk::Entry,
+    _state: SharedEqState,
+    on_changed: Rc<dyn Fn()>,
+    updating: Rc<Cell<bool>>,
+    apply_delta: impl Fn(f64) + 'static,
+) {
+    let did_move = Rc::new(Cell::new(false));
+
+    let drag = gtk::GestureDrag::new();
+    // Capture phase: intercept events BEFORE the Entry's internal text handling
+    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+
+    {
+        let did_move = did_move.clone();
+        drag.connect_drag_begin(move |_gesture, _x, _y| {
+            did_move.set(false);
+        });
+    }
+
+    {
+        let did_move = did_move.clone();
+        let on_changed = on_changed.clone();
+        let updating = updating.clone();
+        let entry = entry.clone();
+        let prev_x = Rc::new(Cell::new(0.0_f64));
+        drag.connect_drag_update(move |_gesture, offset_x, _offset_y| {
+            if updating.get() { return; }
+            // Keep scrub cursor during drag
+            set_scrub_cursor(&entry);
+            let dx = offset_x - prev_x.get();
+            prev_x.set(offset_x);
+            if dx.abs() > 0.5 {
+                did_move.set(true);
+                apply_delta(dx);
+                on_changed();
+            }
+        });
+    }
+
+    {
+        let did_move = did_move.clone();
+        let entry = entry.clone();
+        drag.connect_drag_end(move |_gesture, _x, _y| {
+            if !did_move.get() {
+                // Click without drag → enter edit mode
+                entry.set_can_focus(true);
+                entry.set_editable(true);
+                entry.grab_focus();
+                entry.select_region(0, -1);
+            }
+        });
+    }
+
+    entry.add_controller(drag);
+}
+
+/// Wire Enter key to commit a typed value, then return to non-editable scrub mode.
+fn wire_entry_commit(
+    entry: &gtk::Entry,
+    _state: SharedEqState,
+    on_changed: Rc<dyn Fn()>,
+    updating: Rc<Cell<bool>>,
+    parse: impl Fn(&str) -> Option<f64> + 'static,
+    apply: impl Fn(f64) + 'static,
+) {
+    let entry_ref = entry.clone();
+    entry.connect_activate(move |entry| {
+        if updating.get() { return; }
+        let text = entry.text();
+        if let Some(val) = parse(&text) {
+            apply(val);
+            on_changed();
+        }
+        // Return to scrub mode (notify::editable handler restores cursor automatically)
+        entry_ref.set_editable(false);
+        entry_ref.set_can_focus(false);
+    });
+}
+
+fn labeled_pill(label: &str, widget: &impl IsA<gtk::Widget>, scrub: bool) -> gtk::Box {
     let pill = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -256,5 +383,16 @@ fn labeled_pill(label: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {
     lbl.add_css_class("caption");
     pill.append(&lbl);
     pill.append(widget);
+
+    if scrub {
+        let widget_clone = widget.as_ref().clone();
+        let lbl_clone = lbl.clone();
+        pill.connect_realize(move |pill| {
+            set_scrub_cursor(pill);
+            set_scrub_cursor(&lbl_clone);
+            set_scrub_cursor(&widget_clone);
+        });
+    }
+
     pill
 }
