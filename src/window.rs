@@ -66,10 +66,7 @@ impl ChatMixWindow {
         // Build all pages
         let (dashboard_page, widgets) = build_dashboard_page();
         stack.add_named(&dashboard_page, Some("home"));
-        stack.add_named(
-            &build_placeholder_page("Equalizer", "lucide-audio-lines-symbolic", "Coming soon"),
-            Some("eq"),
-        );
+        stack.add_named(&crate::eq::build_eq_page(), Some("eq"));
         stack.add_named(
             &build_placeholder_page("Clips", "lucide-clapperboard-symbolic", "Coming soon"),
             Some("clips"),
@@ -90,7 +87,13 @@ impl ChatMixWindow {
         window.set_content(Some(&root));
 
         let css = gtk::CssProvider::new();
-        css.load_from_string("window { font-size: 125%; } row { padding-top: 4px; padding-bottom: 4px; }");
+        css.load_from_string(
+            "window { font-size: 125%; } \
+             row { padding-top: 4px; padding-bottom: 4px; } \
+             .eq-graph-frame { background-color: rgba(0,0,0,0.05); border-radius: 8px; } \
+             .eq-spin { font-size: 75%; font-weight: bold; } \
+             .eq-filter-dropdown > button { font-size: 75%; min-height: 0; padding-top: 4px; padding-bottom: 4px; }"
+        );
         gtk::style_context_add_provider_for_display(
             &gtk::prelude::WidgetExt::display(&window),
             &css,
@@ -166,8 +169,7 @@ fn build_sidebar(stack: &gtk::Stack) -> gtk::Widget {
     let home_btn = sidebar_button("lucide-home-symbolic", "Home");
     home_btn.set_active(true);
 
-    let eq_btn = sidebar_button("lucide-audio-lines-symbolic", "Equalizer (coming soon)");
-    eq_btn.set_sensitive(false);
+    let eq_btn = sidebar_button("lucide-audio-lines-symbolic", "Equalizer");
     eq_btn.set_group(Some(&home_btn));
 
     let clips_btn = sidebar_button("lucide-clapperboard-symbolic", "Clips (coming soon)");

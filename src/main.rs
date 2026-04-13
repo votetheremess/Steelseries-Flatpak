@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod autostart;
+mod eq;
 mod hid;
 mod icons;
 mod tray;
