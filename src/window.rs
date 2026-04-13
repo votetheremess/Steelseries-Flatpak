@@ -92,7 +92,10 @@ impl ChatMixWindow {
              row { padding-top: 4px; padding-bottom: 4px; } \
              .eq-graph-frame { background-color: rgba(0,0,0,0.05); border-radius: 8px; } \
              .eq-spin { font-size: 75%; font-weight: bold; } \
-             .eq-filter-dropdown > button { font-size: 75%; min-height: 0; padding-top: 4px; padding-bottom: 4px; }"
+             .eq-filter-dropdown > button { font-size: 75%; min-height: 0; padding-top: 4px; padding-bottom: 4px; } \
+             .eq-floating-panel { background-color: alpha(@window_bg_color, 0.92); border-radius: 8px; \
+               padding: 4px 8px; border: 1px solid alpha(white, 0.12); } \
+             .eq-enable-switch { min-width: 36px; min-height: 18px; }"
         );
         gtk::style_context_add_provider_for_display(
             &gtk::prelude::WidgetExt::display(&window),

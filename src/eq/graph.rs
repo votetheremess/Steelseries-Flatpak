@@ -19,12 +19,10 @@ const HIT_RADIUS: f64 = 18.0;
 
 const CURVE_SAMPLES: usize = 300;
 
-// Grid frequencies for vertical lines
 const GRID_FREQS: &[f64] = &[
     20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0,
 ];
 
-// Grid dB values for horizontal lines
 const GRID_DBS: &[f64] = &[-12.0, -9.0, -6.0, -3.0, 0.0, 3.0, 6.0, 9.0, 12.0];
 
 // ---------------------------------------------------------------------------
@@ -63,13 +61,7 @@ fn graph_dims(width: f64, height: f64) -> (f64, f64) {
 // Hit testing
 // ---------------------------------------------------------------------------
 
-fn hit_test(
-    x: f64,
-    y: f64,
-    state: &EqState,
-    width: f64,
-    height: f64,
-) -> Option<usize> {
+fn hit_test(x: f64, y: f64, state: &EqState, width: f64, height: f64) -> Option<usize> {
     let (gw, gh) = graph_dims(width, height);
     let bands = &state.active_sink_eq().bands;
     let mut best = None;
@@ -109,6 +101,7 @@ fn draw_eq_graph(
     let w = width as f64;
     let h = height as f64;
     let (gw, gh) = graph_dims(w, h);
+    let selected = state.selected_band;
 
     // Background
     cr.set_source_rgba(0.10, 0.10, 0.12, 1.0);
@@ -118,7 +111,6 @@ fn draw_eq_graph(
     // Grid lines
     cr.set_line_width(1.0);
 
-    // Vertical frequency grid
     for &freq in GRID_FREQS {
         let x = freq_to_x(freq, gw);
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.08);
@@ -126,7 +118,6 @@ fn draw_eq_graph(
         cr.line_to(x, PAD_TOP + gh);
         let _ = cr.stroke();
 
-        // Label
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.45);
         cr.set_font_size(10.0);
         let label = format_freq(freq);
@@ -135,7 +126,6 @@ fn draw_eq_graph(
         let _ = cr.show_text(&label);
     }
 
-    // Horizontal dB grid
     for &db in GRID_DBS {
         let y = db_to_y(db, gh);
         let alpha = if db == 0.0 { 0.25 } else { 0.08 };
@@ -146,7 +136,6 @@ fn draw_eq_graph(
         cr.line_to(PAD_LEFT + gw, y);
         let _ = cr.stroke();
 
-        // Label
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.45);
         cr.set_font_size(10.0);
         let label = if db == 0.0 {
@@ -161,27 +150,21 @@ fn draw_eq_graph(
 
     let bands = &state.active_sink_eq().bands;
     let freqs = biquad::log_frequencies(CURVE_SAMPLES);
-    let selected = state.selected_band;
 
-    // Individual band curves (filled area + line)
+    // Individual band curves
     for (i, band) in bands.iter().enumerate() {
         if !band.enabled {
             continue;
         }
-
-        let is_active = i == selected;
-
-        // In non-show-all mode, only draw the active band's individual curve
+        let is_active = selected == Some(i);
         if !show_all && !is_active {
             continue;
         }
 
         let (r, g, b) = BAND_COLORS[i];
         let responses: Vec<f64> = freqs.iter().map(|&f| biquad::magnitude_db(band, f)).collect();
-
         let zero_y = db_to_y(0.0, gh);
 
-        // Filled area from 0dB to curve
         let fill_alpha = if is_active { 0.18 } else { 0.08 };
         cr.set_source_rgba(r, g, b, fill_alpha);
         cr.move_to(freq_to_x(freqs[0], gw), zero_y);
@@ -194,18 +177,13 @@ fn draw_eq_graph(
         cr.close_path();
         let _ = cr.fill();
 
-        // Curve line
         let line_alpha = if is_active { 0.75 } else { 0.35 };
         cr.set_source_rgba(r, g, b, line_alpha);
         cr.set_line_width(if is_active { 2.0 } else { 1.5 });
         for (j, &freq) in freqs.iter().enumerate() {
             let x = freq_to_x(freq, gw);
             let y = db_to_y(responses[j].clamp(GAIN_MIN, GAIN_MAX), gh);
-            if j == 0 {
-                cr.move_to(x, y);
-            } else {
-                cr.line_to(x, y);
-            }
+            if j == 0 { cr.move_to(x, y); } else { cr.line_to(x, y); }
         }
         let _ = cr.stroke();
     }
@@ -215,17 +193,12 @@ fn draw_eq_graph(
         .iter()
         .map(|&f| biquad::combined_magnitude_db(bands, f))
         .collect();
-
     cr.set_source_rgba(1.0, 1.0, 1.0, 0.9);
     cr.set_line_width(2.0);
     for (j, &freq) in freqs.iter().enumerate() {
         let x = freq_to_x(freq, gw);
         let y = db_to_y(combined[j].clamp(GAIN_MIN, GAIN_MAX), gh);
-        if j == 0 {
-            cr.move_to(x, y);
-        } else {
-            cr.line_to(x, y);
-        }
+        if j == 0 { cr.move_to(x, y); } else { cr.line_to(x, y); }
     }
     let _ = cr.stroke();
 
@@ -235,7 +208,7 @@ fn draw_eq_graph(
         let x = freq_to_x(band.frequency, gw);
         let y = db_to_y(band.gain_db, gh);
 
-        let is_selected = i == selected;
+        let is_selected = selected == Some(i);
         let is_hovered = hovered_band == Some(i);
         let radius = if is_selected {
             POINT_RADIUS_SELECTED
@@ -245,7 +218,6 @@ fn draw_eq_graph(
             POINT_RADIUS
         };
 
-        // Distinct alpha so enabled-inactive vs disabled is obvious
         let alpha = if !band.enabled {
             0.20
         } else if is_selected {
@@ -256,12 +228,10 @@ fn draw_eq_graph(
             0.55
         };
 
-        // Filled circle
         cr.arc(x, y, radius, 0.0, 2.0 * std::f64::consts::PI);
         cr.set_source_rgba(r, g, b, alpha);
         let _ = cr.fill();
 
-        // Disabled band: draw a diagonal strike-through line
         if !band.enabled {
             cr.set_source_rgba(1.0, 1.0, 1.0, 0.5);
             cr.set_line_width(1.5);
@@ -270,7 +240,6 @@ fn draw_eq_graph(
             let _ = cr.stroke();
         }
 
-        // Selection ring
         if is_selected {
             cr.arc(x, y, radius + 2.0, 0.0, 2.0 * std::f64::consts::PI);
             cr.set_source_rgba(1.0, 1.0, 1.0, 0.8);
@@ -278,13 +247,11 @@ fn draw_eq_graph(
             let _ = cr.stroke();
         }
 
-        // Band number label inside point (properly centered)
         let text_alpha = if !band.enabled { 0.3 } else { alpha.min(0.95) };
         cr.set_source_rgba(1.0, 1.0, 1.0, text_alpha);
         cr.set_font_size(10.0);
         let label = format!("{}", i + 1);
         let extents = cr.text_extents(&label).unwrap();
-        // Center using x_bearing and y_bearing for true centering
         cr.move_to(
             x - (extents.width() / 2.0 + extents.x_bearing()),
             y - (extents.height() / 2.0 + extents.y_bearing()),
@@ -292,7 +259,6 @@ fn draw_eq_graph(
         let _ = cr.show_text(&label);
     }
 
-    // Border around graph area
     cr.set_source_rgba(1.0, 1.0, 1.0, 0.15);
     cr.set_line_width(1.0);
     cr.rectangle(PAD_LEFT, PAD_TOP, gw, gh);
@@ -300,7 +266,7 @@ fn draw_eq_graph(
 }
 
 // ---------------------------------------------------------------------------
-// Public: build the interactive DrawingArea
+// Public
 // ---------------------------------------------------------------------------
 
 pub struct EqGraph {
@@ -317,10 +283,13 @@ impl EqGraph {
         area.set_hexpand(true);
 
         let hovered_band: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
-        let dragging_band: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
         let show_all: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
-        // Draw function
+        // Track drag state: which dot was hit on mouse-down, whether actual movement happened
+        let drag_hit: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+        let drag_moved: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
+        // Draw
         {
             let state = state.clone();
             let hovered = hovered_band.clone();
@@ -330,55 +299,28 @@ impl EqGraph {
             });
         }
 
-        // Click — select band (must click first before dragging)
+        // Single GestureDrag handles both clicks and drags — no GestureClick.
+        // - drag_begin: record which dot was hit
+        // - drag_update: move the dot if it's the selected one
+        // - drag_end: if no movement, handle as a click (select/deselect)
         {
             let state = state.clone();
             let area_ref = area.clone();
             let on_changed = on_changed.clone();
-            let click = gtk::GestureClick::new();
-            click.connect_pressed(move |_gesture, _n, x, y| {
-                let w = area_ref.width() as f64;
-                let h = area_ref.height() as f64;
-                let st = state.borrow();
-                if let Some(idx) = hit_test(x, y, &st, w, h) {
-                    drop(st);
-                    state.borrow_mut().selected_band = idx;
-                    on_changed();
-                    area_ref.queue_draw();
-                }
-            });
-            area.add_controller(click);
-        }
-
-        // Drag — only moves the ALREADY-SELECTED band (click first to select)
-        {
-            let state = state.clone();
-            let area_ref = area.clone();
-            let on_changed = on_changed.clone();
-            let drag_band = dragging_band.clone();
 
             let drag = gtk::GestureDrag::new();
 
             {
                 let state = state.clone();
                 let area_ref = area_ref.clone();
-                let drag_band = drag_band.clone();
+                let drag_hit = drag_hit.clone();
+                let drag_moved = drag_moved.clone();
                 drag.connect_drag_begin(move |_gesture, x, y| {
+                    drag_moved.set(false);
                     let w = area_ref.width() as f64;
                     let h = area_ref.height() as f64;
                     let st = state.borrow();
-                    // Only allow dragging the currently selected band
-                    let selected = st.selected_band;
-                    if let Some(idx) = hit_test(x, y, &st, w, h) {
-                        if idx == selected {
-                            drag_band.set(Some(idx));
-                        } else {
-                            // Clicked a different band — just select it, don't drag
-                            drag_band.set(None);
-                        }
-                    } else {
-                        drag_band.set(None);
-                    }
+                    drag_hit.set(hit_test(x, y, &st, w, h));
                 });
             }
 
@@ -386,8 +328,17 @@ impl EqGraph {
                 let state = state.clone();
                 let area_ref = area_ref.clone();
                 let on_changed = on_changed.clone();
+                let drag_hit = drag_hit.clone();
+                let drag_moved = drag_moved.clone();
                 drag.connect_drag_update(move |gesture, offset_x, offset_y| {
-                    let Some(idx) = drag_band.get() else { return };
+                    // Only drag the dot if it's already selected
+                    let Some(hit_idx) = drag_hit.get() else { return };
+                    let st = state.borrow();
+                    let is_selected = st.selected_band == Some(hit_idx);
+                    drop(st);
+                    if !is_selected { return; }
+
+                    drag_moved.set(true);
                     let (start_x, start_y) = gesture.start_point().unwrap();
                     let cur_x = start_x + offset_x;
                     let cur_y = start_y + offset_y;
@@ -400,7 +351,7 @@ impl EqGraph {
                     let new_gain = y_to_db(cur_y, gh);
 
                     let mut st = state.borrow_mut();
-                    let band = &mut st.active_sink_eq_mut().bands[idx];
+                    let band = &mut st.active_sink_eq_mut().bands[hit_idx];
                     band.frequency = new_freq;
                     if band.filter_type.uses_gain() {
                         band.gain_db = new_gain;
@@ -413,10 +364,44 @@ impl EqGraph {
                 });
             }
 
+            {
+                let state = state.clone();
+                let area_ref = area_ref.clone();
+                let on_changed = on_changed.clone();
+                let drag_hit = drag_hit.clone();
+                let drag_moved = drag_moved.clone();
+                drag.connect_drag_end(move |_gesture, _x, _y| {
+                    if drag_moved.get() {
+                        // Real drag happened — dot stays selected, do nothing
+                        drag_hit.set(None);
+                        return;
+                    }
+
+                    // No movement — treat as a click
+                    let hit = drag_hit.get();
+                    drag_hit.set(None);
+
+                    let current = state.borrow().selected_band;
+
+                    if hit == current && hit.is_some() {
+                        // Click on already-selected dot → deselect
+                        state.borrow_mut().selected_band = None;
+                    } else if let Some(idx) = hit {
+                        // Click on a different dot → select it
+                        state.borrow_mut().selected_band = Some(idx);
+                    } else {
+                        // Click on empty space → deselect
+                        state.borrow_mut().selected_band = None;
+                    }
+                    on_changed();
+                    area_ref.queue_draw();
+                });
+            }
+
             area.add_controller(drag);
         }
 
-        // Scroll — adjust Q
+        // Scroll — adjust Q on selected band
         {
             let state = state.clone();
             let area_ref = area.clone();
@@ -425,12 +410,11 @@ impl EqGraph {
                 gtk::EventControllerScrollFlags::VERTICAL,
             );
             scroll.connect_scroll(move |_controller, _dx, dy| {
-                // Adjust Q on the currently selected band
                 let mut st = state.borrow_mut();
-                let idx = st.selected_band;
+                let Some(idx) = st.selected_band else {
+                    return glib::Propagation::Proceed;
+                };
                 let band = &mut st.active_sink_eq_mut().bands[idx];
-
-                // Scroll up = increase Q (narrower), scroll down = decrease Q (wider)
                 let factor = 1.15_f64.powf(-dy);
                 band.q = (band.q * factor).clamp(Q_MIN, Q_MAX);
                 st.active_sink_eq_mut().preset_name = None;
@@ -443,10 +427,9 @@ impl EqGraph {
             area.add_controller(scroll);
         }
 
-        // Motion — hover effect + leave
+        // Motion — hover
         {
             let motion = gtk::EventControllerMotion::new();
-
             {
                 let state = state.clone();
                 let area_ref = area.clone();
@@ -463,7 +446,6 @@ impl EqGraph {
                     }
                 });
             }
-
             {
                 let area_ref = area.clone();
                 let hovered = hovered_band.clone();
@@ -474,7 +456,6 @@ impl EqGraph {
                     }
                 });
             }
-
             area.add_controller(motion);
         }
 
@@ -483,5 +464,15 @@ impl EqGraph {
 
     pub fn queue_draw(&self) {
         self.drawing_area.queue_draw();
+    }
+
+    /// Returns the pixel (x, y) of the selected band's dot, or None.
+    pub fn dot_position(&self, state: &EqState) -> Option<(f64, f64)> {
+        let idx = state.selected_band?;
+        let w = self.drawing_area.width() as f64;
+        let h = self.drawing_area.height() as f64;
+        let (gw, gh) = graph_dims(w, h);
+        let band = &state.active_sink_eq().bands[idx];
+        Some((freq_to_x(band.frequency, gw), db_to_y(band.gain_db, gh)))
     }
 }

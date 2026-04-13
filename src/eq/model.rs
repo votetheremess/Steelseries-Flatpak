@@ -102,7 +102,7 @@ pub const BAND_COLORS: [(f64, f64, f64); NUM_BANDS] = [
     (0.45, 0.40, 0.90), // indigo
     (0.70, 0.40, 0.90), // violet
     (0.90, 0.40, 0.70), // pink
-    (0.65, 0.65, 0.65), // gray
+    (0.60, 0.35, 0.15), // brown
 ];
 
 pub fn default_bands() -> [Band; NUM_BANDS] {
@@ -166,7 +166,7 @@ impl SinkEq {
 pub struct EqState {
     pub sinks: HashMap<EqTarget, SinkEq>,
     pub active_target: EqTarget,
-    pub selected_band: usize,
+    pub selected_band: Option<usize>,
 }
 
 impl EqState {
@@ -178,7 +178,7 @@ impl EqState {
         EqState {
             sinks,
             active_target: EqTarget::Game,
-            selected_band: 0,
+            selected_band: None,
         }
     }
 
@@ -190,13 +190,9 @@ impl EqState {
         self.sinks.get_mut(&self.active_target).unwrap()
     }
 
-    pub fn selected_band(&self) -> &Band {
-        &self.active_sink_eq().bands[self.selected_band]
-    }
-
-    pub fn selected_band_mut(&mut self) -> &mut Band {
-        let idx = self.selected_band;
-        &mut self.active_sink_eq_mut().bands[idx]
+    pub fn selected_band_mut(&mut self) -> Option<&mut Band> {
+        let idx = self.selected_band?;
+        Some(&mut self.active_sink_eq_mut().bands[idx])
     }
 }
 

@@ -34,7 +34,7 @@ pub fn build_eq_page() -> gtk::Widget {
         .margin_end(12)
         .build();
 
-    // We need forward declarations for the callbacks that cross-reference widgets
+    // Forward-declared refs
     let graph_ref: Rc<std::cell::RefCell<Option<graph::EqGraph>>> =
         Rc::new(std::cell::RefCell::new(None));
     let controls_update_ref: Rc<std::cell::RefCell<Option<Rc<dyn Fn()>>>> =
@@ -44,7 +44,7 @@ pub fn build_eq_page() -> gtk::Widget {
     let preset_updating: Rc<std::cell::Cell<bool>> =
         Rc::new(std::cell::Cell::new(false));
 
-    // Shared on_changed callback: redraws graph, updates controls, saves state
+    // Shared on_changed callback
     let on_changed: Rc<dyn Fn()> = {
         let graph_ref = graph_ref.clone();
         let controls_update_ref = controls_update_ref.clone();
@@ -55,13 +55,10 @@ pub fn build_eq_page() -> gtk::Widget {
             if let Some(ref g) = *graph_ref.borrow() {
                 g.queue_draw();
             }
+            // Controls bar is always visible; update fn handles empty state
             if let Some(ref update) = *controls_update_ref.borrow() {
                 update();
             }
-            // Update preset dropdown — must guard with preset_updating to prevent
-            // the dropdown's selected_notify handler from re-borrowing state.
-            // Extract preset name while borrowing, then drop the borrow before
-            // calling set_selected (which fires signals synchronously).
             if !preset_updating.get() {
                 let preset_name = state.borrow().active_sink_eq().preset_name.clone();
                 if let Some(ref dd) = *preset_dropdown_ref.borrow() {
@@ -70,13 +67,12 @@ pub fn build_eq_page() -> gtk::Widget {
                     preset_updating.set(false);
                 }
             }
-            // Persist state
             presets::save_eq_state(&state.borrow().sinks);
         })
     };
 
     // -----------------------------------------------------------------------
-    // Top bar: sink tabs + preset dropdown
+    // Top bar: sink tabs + show all + reset + preset
     // -----------------------------------------------------------------------
     let top_bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -84,7 +80,6 @@ pub fn build_eq_page() -> gtk::Widget {
         .margin_bottom(8)
         .build();
 
-    // Sink tab buttons
     let tab_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
@@ -120,7 +115,6 @@ pub fn build_eq_page() -> gtk::Widget {
 
     top_bar.append(&tab_box);
 
-    // Spacer
     let spacer = gtk::Box::builder().hexpand(true).build();
     top_bar.append(&spacer);
 
@@ -155,7 +149,7 @@ pub fn build_eq_page() -> gtk::Widget {
             let sink_eq = st.active_sink_eq_mut();
             sink_eq.bands = model::default_bands();
             sink_eq.preset_name = Some("Flat".to_string());
-            st.selected_band = 0;
+            st.selected_band = None;
             drop(st);
             on_changed();
         });
@@ -165,13 +159,12 @@ pub fn build_eq_page() -> gtk::Widget {
     // Preset dropdown
     let preset_dropdown = build_preset_dropdown(state.clone(), on_changed.clone(), preset_updating.clone());
     top_bar.append(&preset_dropdown);
-
     *preset_dropdown_ref.borrow_mut() = Some(preset_dropdown);
 
     page.append(&top_bar);
 
     // -----------------------------------------------------------------------
-    // EQ Graph
+    // EQ Graph (no overlay, just a frame)
     // -----------------------------------------------------------------------
     let eq_graph = graph::EqGraph::new(state.clone(), on_changed.clone());
     let frame = gtk::Frame::builder()
@@ -180,7 +173,7 @@ pub fn build_eq_page() -> gtk::Widget {
     frame.add_css_class("eq-graph-frame");
     page.append(&frame);
 
-    // Wire "Show All" switch to the graph
+    // Wire "Show All" switch
     {
         let show_all = eq_graph.show_all.clone();
         let graph_area = eq_graph.drawing_area.clone();
@@ -194,16 +187,13 @@ pub fn build_eq_page() -> gtk::Widget {
     *graph_ref.borrow_mut() = Some(eq_graph);
 
     // -----------------------------------------------------------------------
-    // Detail controls
+    // Controls bar — fixed below the graph, hidden when no dot is selected
     // -----------------------------------------------------------------------
-    let (controls_widget, controls_update) = controls::build_controls(state.clone(), on_changed.clone());
-
-    let clamp = adw::Clamp::builder()
-        .maximum_size(950)
-        .child(&controls_widget)
-        .margin_top(4)
-        .build();
-    page.append(&clamp);
+    let (controls_panel, controls_update) =
+        controls::build_floating_panel(state.clone(), on_changed.clone());
+    controls_panel.set_halign(gtk::Align::Center);
+    controls_panel.set_margin_top(6);
+    page.append(&controls_panel);
 
     *controls_update_ref.borrow_mut() = Some(controls_update);
 
@@ -220,8 +210,6 @@ fn build_preset_dropdown(
     preset_updating: Rc<std::cell::Cell<bool>>,
 ) -> gtk::DropDown {
     let model = gtk::StringList::new(&[]);
-
-    // Populate: built-in presets + "Custom"
     refresh_preset_list(&model);
 
     let dropdown = gtk::DropDown::builder()
@@ -229,7 +217,6 @@ fn build_preset_dropdown(
         .tooltip_text("EQ Preset")
         .build();
 
-    // Set initial selection
     {
         let st = state.borrow();
         let preset_name = st.active_sink_eq().preset_name.as_deref();
@@ -253,11 +240,8 @@ fn build_preset_dropdown(
                 .map(|s| s.to_string())
                 .unwrap_or_default();
 
-            if name == "Custom" {
-                return; // Don't do anything when "Custom" is re-selected
-            }
+            if name == "Custom" { return; }
 
-            // Try loading as built-in preset
             if let Some(bands) = presets::load_built_in(&name) {
                 let mut st = state.borrow_mut();
                 let sink_eq = st.active_sink_eq_mut();
@@ -268,7 +252,6 @@ fn build_preset_dropdown(
                 return;
             }
 
-            // Try loading as custom preset
             if let Some(bands) = presets::load_custom_preset(&name) {
                 let mut st = state.borrow_mut();
                 let sink_eq = st.active_sink_eq_mut();
@@ -284,25 +267,16 @@ fn build_preset_dropdown(
 }
 
 fn refresh_preset_list(model: &gtk::StringList) {
-    // Clear
     while model.n_items() > 0 {
         model.remove(0);
     }
-
-    // Built-in presets
     for name in presets::built_in_names() {
         model.append(name);
     }
-
-    // Custom presets
     let custom = presets::list_custom_presets();
-    if !custom.is_empty() {
-        for name in &custom {
-            model.append(name);
-        }
+    for name in &custom {
+        model.append(name);
     }
-
-    // "Custom" entry (for when user modifies bands manually)
     model.append("Custom");
 }
 
@@ -318,7 +292,6 @@ fn update_preset_selection(dropdown: &gtk::DropDown, preset_name: Option<&str>) 
             return;
         }
     }
-    // If not found, select "Custom"
     let n = model.n_items();
     if n > 0 {
         dropdown.set_selected(n - 1);
