@@ -177,7 +177,7 @@ pub fn run(start_hidden: bool) {
         });
     }
 
-    app.run();
+    app.run_with_args(&[] as &[&str]);
 }
 
 fn init_pipeline() -> Result<AppResources, String> {
