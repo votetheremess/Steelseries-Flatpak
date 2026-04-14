@@ -13,7 +13,10 @@ use model::*;
 
 pub fn build_eq_page(
     on_eq_apply: Option<Rc<dyn Fn(EqTarget, [Band; NUM_BANDS])>>,
-) -> gtk::Widget {
+    on_reroute: Option<Rc<dyn Fn(&str, &str)>>,
+    on_mic_reroute: Option<Rc<dyn Fn(&str)>>,
+    headset_sink: Option<String>,
+) -> (gtk::Widget, Option<crate::mixer::MixerWidgets>) {
     let state = new_shared_state();
 
     // Load persisted EQ state if available
@@ -45,6 +48,10 @@ pub fn build_eq_page(
         Rc::new(std::cell::RefCell::new(None));
     let preset_updating: Rc<std::cell::Cell<bool>> =
         Rc::new(std::cell::Cell::new(false));
+    let content_stack_ref: Rc<std::cell::RefCell<Option<gtk::Stack>>> =
+        Rc::new(std::cell::RefCell::new(None));
+    let eq_controls_ref: Rc<std::cell::RefCell<Option<gtk::Box>>> =
+        Rc::new(std::cell::RefCell::new(None));
 
     // Shared on_changed callback
     let on_changed: Rc<dyn Fn()> = {
@@ -90,32 +97,45 @@ pub fn build_eq_page(
         .build();
     top_bar.add_css_class("eq-top-bar");
 
+    // Mixer button — separate pill, same radio group but not visually linked
+    let mixer_btn = gtk::ToggleButton::builder()
+        .label("Mixer")
+        .build();
+
     let tab_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
         .build();
     tab_box.add_css_class("linked");
 
-    let mut first_btn: Option<gtk::ToggleButton> = None;
+    let mut first_sink_tab = true;
     for &target in EqTarget::ALL {
         let btn = gtk::ToggleButton::builder()
             .label(target.label())
             .build();
 
-        if let Some(ref first) = first_btn {
-            btn.set_group(Some(first));
-        } else {
+        btn.set_group(Some(&mixer_btn));
+        if first_sink_tab {
             btn.set_active(true);
-            first_btn = Some(btn.clone());
+            first_sink_tab = false;
         }
 
         {
             let state = state.clone();
             let on_changed = on_changed.clone();
+            let content_stack_ref = content_stack_ref.clone();
+            let eq_controls_ref = eq_controls_ref.clone();
             btn.connect_toggled(move |b| {
                 if b.is_active() {
                     state.borrow_mut().active_target = target;
                     on_changed();
+                    // Switch back to EQ view
+                    if let Some(ref stack) = *content_stack_ref.borrow() {
+                        stack.set_visible_child_name("eq");
+                    }
+                    if let Some(ref controls) = *eq_controls_ref.borrow() {
+                        controls.set_visible(true);
+                    }
                 }
             });
         }
@@ -123,10 +143,33 @@ pub fn build_eq_page(
         tab_box.append(&btn);
     }
 
+    // Wire mixer button to switch to mixer view
+    {
+        let content_stack_ref = content_stack_ref.clone();
+        let eq_controls_ref = eq_controls_ref.clone();
+        mixer_btn.connect_toggled(move |b| {
+            if b.is_active() {
+                if let Some(ref stack) = *content_stack_ref.borrow() {
+                    stack.set_visible_child_name("mixer");
+                }
+                if let Some(ref controls) = *eq_controls_ref.borrow() {
+                    controls.set_visible(false);
+                }
+            }
+        });
+    }
+
+    top_bar.append(&mixer_btn);
     top_bar.append(&tab_box);
 
     let spacer = gtk::Box::builder().hexpand(true).build();
     top_bar.append(&spacer);
+
+    // EQ-only controls — hidden when mixer view is active
+    let eq_controls_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
 
     // "Show All" toggle
     let show_all_box = gtk::Box::builder()
@@ -143,7 +186,7 @@ pub fn build_eq_page(
         .build();
     show_all_box.append(&show_all_label);
     show_all_box.append(&show_all_switch);
-    top_bar.append(&show_all_box);
+    eq_controls_box.append(&show_all_box);
 
     // Reset button
     let reset_btn = gtk::Button::builder()
@@ -164,24 +207,39 @@ pub fn build_eq_page(
             on_changed();
         });
     }
-    top_bar.append(&reset_btn);
+    eq_controls_box.append(&reset_btn);
 
     // Preset dropdown
     let preset_dropdown = build_preset_dropdown(state.clone(), on_changed.clone(), preset_updating.clone());
-    top_bar.append(&preset_dropdown);
+    eq_controls_box.append(&preset_dropdown);
     *preset_dropdown_ref.borrow_mut() = Some(preset_dropdown);
+
+    top_bar.append(&eq_controls_box);
+    *eq_controls_ref.borrow_mut() = Some(eq_controls_box);
 
     page.append(&top_bar);
 
     // -----------------------------------------------------------------------
-    // EQ Graph (no overlay, just a frame)
+    // Content stack: EQ view and Mixer view
     // -----------------------------------------------------------------------
+    let content_stack = gtk::Stack::builder()
+        .vexpand(true)
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .transition_duration(150)
+        .build();
+
+    // -- EQ view --
+    let eq_view = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(0)
+        .build();
+
     let eq_graph = graph::EqGraph::new(state.clone(), on_changed.clone());
     let frame = gtk::Frame::builder()
         .child(&eq_graph.drawing_area)
         .build();
     frame.add_css_class("eq-graph-frame");
-    page.append(&frame);
+    eq_view.append(&frame);
 
     // Wire "Show All" switch
     {
@@ -196,18 +254,29 @@ pub fn build_eq_page(
 
     *graph_ref.borrow_mut() = Some(eq_graph);
 
-    // -----------------------------------------------------------------------
-    // Controls bar — fixed below the graph, hidden when no dot is selected
-    // -----------------------------------------------------------------------
     let (controls_panel, controls_update) =
         controls::build_floating_panel(state.clone(), on_changed.clone());
     controls_panel.set_halign(gtk::Align::Center);
     controls_panel.set_margin_top(6);
-    page.append(&controls_panel);
+    eq_view.append(&controls_panel);
 
     *controls_update_ref.borrow_mut() = Some(controls_update);
 
-    page.upcast()
+    content_stack.add_named(&eq_view, Some("eq"));
+
+    // -- Mixer view --
+    let (mixer_widget, mixer_widgets) = crate::mixer::build_mixer_content(
+        on_reroute,
+        on_mic_reroute,
+        headset_sink,
+    );
+    content_stack.add_named(&mixer_widget, Some("mixer"));
+
+    *content_stack_ref.borrow_mut() = Some(content_stack.clone());
+
+    page.append(&content_stack);
+
+    (page.upcast(), Some(mixer_widgets))
 }
 
 // ---------------------------------------------------------------------------

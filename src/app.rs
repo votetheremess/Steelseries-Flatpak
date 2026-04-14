@@ -29,6 +29,7 @@ struct AppResources {
     shutdown: Arc<AtomicBool>,
     rx: Option<Receiver<HidEvent>>,
     writer: Option<HidWriter>,
+    headset_sink: String,
 }
 
 pub fn run(start_hidden: bool) {
@@ -104,7 +105,43 @@ pub fn run(start_hidden: bool) {
                 })
             };
 
-            let window = ChatMixWindow::new(app, on_eq_apply);
+            // Mixer reroute callbacks
+            let on_reroute: Option<Rc<dyn Fn(&str, &str)>> = {
+                let router_ref = resources
+                    .borrow()
+                    .as_ref()
+                    .map(|r| r.router.clone());
+                router_ref.map(|router| {
+                    Rc::new(move |sink_name: &str, new_target: &str| {
+                        if let Some(ref r) = *router.borrow() {
+                            r.reroute_sink(sink_name, new_target);
+                        }
+                    }) as Rc<dyn Fn(&str, &str)>
+                })
+            };
+
+            let on_mic_reroute: Option<Rc<dyn Fn(&str)>> = {
+                let router_ref = resources
+                    .borrow()
+                    .as_ref()
+                    .map(|r| r.router.clone());
+                router_ref.map(|router| {
+                    Rc::new(move |new_source: &str| {
+                        if let Some(ref mut r) = *router.borrow_mut() {
+                            r.reroute_mic(new_source);
+                        }
+                    }) as Rc<dyn Fn(&str)>
+                })
+            };
+
+            let headset_sink = resources
+                .borrow()
+                .as_ref()
+                .map(|r| r.headset_sink.clone());
+
+            let window = ChatMixWindow::new(
+                app, on_eq_apply, on_reroute, on_mic_reroute, headset_sink,
+            );
 
             // Hide on close, keep the process running
             window.window.connect_close_request(move |w| {
@@ -266,6 +303,7 @@ fn init_pipeline() -> Result<AppResources, String> {
         shutdown,
         rx: Some(rx),
         writer: Some(writer),
+        headset_sink,
     })
 }
 
@@ -291,6 +329,8 @@ fn handle_event(event: &HidEvent, window: &ChatMixWindow) {
             }
 
             window.set_chatmix(*game, *chat);
+            window.set_sink_volume(sinks::GAME_SINK_NAME, *game);
+            window.set_sink_volume(sinks::CHAT_SINK_NAME, *chat);
         }
         HidEvent::DialPosition(pos) => {
             log::debug!("Dial position: {pos} (volume mode — ignored)");

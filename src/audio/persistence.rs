@@ -278,3 +278,59 @@ pub fn clear_saved() -> Result<(), String> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Mixer routing persistence (channel → device)
+// ---------------------------------------------------------------------------
+
+const MIXER_ROUTING_FILE: &str = "mixer_routing.txt";
+
+fn mixer_routing_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join(CONFIG_DIR).join(MIXER_ROUTING_FILE))
+}
+
+/// Load saved mixer routing: channel_name → device_name.
+pub fn load_mixer_routing() -> HashMap<String, String> {
+    let Some(path) = mixer_routing_path() else {
+        return HashMap::new();
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let channel = parts.next()?.to_string();
+            let device = parts.next()?.to_string();
+            Some((channel, device))
+        })
+        .collect()
+}
+
+/// Save a single mixer routing entry (merge with existing file).
+pub fn save_mixer_routing_entry(channel: &str, device: &str) {
+    let Some(path) = mixer_routing_path() else {
+        log::warn!("Could not determine mixer routing path");
+        return;
+    };
+
+    let mut routing = load_mixer_routing();
+    routing.insert(channel.to_string(), device.to_string());
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let content: String = routing
+        .iter()
+        .map(|(ch, dev)| format!("{ch}\t{dev}\n"))
+        .collect();
+
+    if let Err(e) = fs::write(&path, content) {
+        log::warn!("Failed to save mixer routing: {e}");
+    }
+}

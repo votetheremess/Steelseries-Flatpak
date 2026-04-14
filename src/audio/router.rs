@@ -24,16 +24,33 @@ impl AudioRouter {
         // Load saved EQ state so filter-chains start with the right settings
         let saved_eq = crate::eq::presets::load_eq_state();
 
+        // Load saved mixer routing for per-sink output targets
+        let saved_routing = super::persistence::load_mixer_routing();
+        let mut initial_targets = HashMap::new();
+        for (name, _, _) in ALL_SINKS {
+            let target = saved_routing
+                .get(*name)
+                .cloned()
+                .unwrap_or_else(|| headset_sink.to_string());
+            initial_targets.insert(name.to_string(), target);
+        }
+
         // Start the EQ pipeline — filter-chains for output sinks
-        let eq_pipeline = EqPipeline::start(headset_sink.to_string(), &saved_eq)?;
+        let eq_pipeline =
+            EqPipeline::start(headset_sink.to_string(), &saved_eq, initial_targets)?;
 
         // Mic uses pw-link to connect the headset mic source to the virtual
         // Audio/Source/Virtual node. This makes it appear as a proper input
         // device in apps like Discord (unlike sink monitors which are hidden).
-        let mic_linked = match find_headset_source() {
-            Ok(source) => match link_mic_source(&source) {
+        let mic_source = saved_routing
+            .get("mic")
+            .cloned()
+            .or_else(|| find_headset_source().ok());
+
+        let mic_linked = match mic_source {
+            Some(source) => match link_mic_source(&source) {
                 Ok(()) => {
-                    log::info!("Linked headset mic ({source}) → SteelSeries_Mic");
+                    log::info!("Linked mic ({source}) → SteelSeries_Mic");
                     true
                 }
                 Err(e) => {
@@ -41,11 +58,18 @@ impl AudioRouter {
                     false
                 }
             },
-            Err(e) => {
-                log::warn!("Could not find headset mic source: {e}");
+            None => {
+                log::warn!("Could not find mic source");
                 false
             }
         };
+
+        // Set our virtual devices as system defaults so WirePlumber routes
+        // new streams through our pipeline instead of directly to hardware.
+        // Game is the default output — unassigned apps go here.
+        // Mic is the default input — capture streams go through our virtual source.
+        set_default_sink(super::sinks::GAME_SINK_NAME);
+        set_default_source(super::sinks::MIC_SOURCE_NAME);
 
         Ok(AudioRouter {
             eq_pipeline,
@@ -57,6 +81,32 @@ impl AudioRouter {
     pub fn update_eq(&self, sink_name: &str, bands: &[Band; NUM_BANDS]) {
         log::info!("EQ update requested for {sink_name}");
         self.eq_pipeline.apply(sink_name, *bands);
+    }
+
+    /// Change which physical device an output sink routes to.
+    /// Tears down and rebuilds the EQ filter-chain with the new target.
+    pub fn reroute_sink(&self, sink_name: &str, new_target: &str) {
+        log::info!("Rerouting {sink_name} → {new_target}");
+        self.eq_pipeline.reroute(sink_name, new_target);
+        super::persistence::save_mixer_routing_entry(sink_name, new_target);
+    }
+
+    /// Change which physical source the mic routes from.
+    pub fn reroute_mic(&mut self, new_source: &str) {
+        log::info!("Rerouting mic → {new_source}");
+        if self.mic_linked {
+            unlink_mic_source();
+        }
+        match link_mic_source(new_source) {
+            Ok(()) => {
+                self.mic_linked = true;
+                log::info!("Mic rerouted to {new_source}");
+                super::persistence::save_mixer_routing_entry("mic", new_source);
+            }
+            Err(e) => {
+                log::error!("Failed to reroute mic to {new_source}: {e}");
+            }
+        }
     }
 
     pub fn destroy(&mut self) {
@@ -83,6 +133,10 @@ enum EqCommand {
         sink_name: String,
         bands: [Band; NUM_BANDS],
     },
+    Reroute {
+        sink_name: String,
+        new_target: String,
+    },
     Shutdown,
 }
 
@@ -95,6 +149,7 @@ impl EqPipeline {
     fn start(
         headset_sink: String,
         saved_eq: &HashMap<EqTarget, SinkEq>,
+        initial_targets: HashMap<String, String>,
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
 
@@ -117,7 +172,7 @@ impl EqPipeline {
         let headset = headset_sink.clone();
         let handle = std::thread::Builder::new()
             .name("eq-pipeline".into())
-            .spawn(move || eq_thread(rx, headset, initial))
+            .spawn(move || eq_thread(rx, headset, initial, initial_targets))
             .map_err(|e| format!("Failed to spawn EQ thread: {e}"))?;
 
         Ok(EqPipeline {
@@ -130,6 +185,13 @@ impl EqPipeline {
         let _ = self.tx.send(EqCommand::Apply {
             sink_name: sink_name.to_string(),
             bands,
+        });
+    }
+
+    fn reroute(&self, sink_name: &str, new_target: &str) {
+        let _ = self.tx.send(EqCommand::Reroute {
+            sink_name: sink_name.to_string(),
+            new_target: new_target.to_string(),
         });
     }
 }
@@ -184,6 +246,7 @@ fn eq_thread(
     rx: mpsc::Receiver<EqCommand>,
     headset_sink: String,
     initial: Vec<(String, [Band; NUM_BANDS])>,
+    initial_targets: HashMap<String, String>,
 ) {
     let Ok(mut session) = PwCliSession::start() else {
         log::error!("Failed to start pw-cli session — EQ disabled");
@@ -193,10 +256,15 @@ fn eq_thread(
 
     let mut chains: HashMap<String, FilterChainInfo> = HashMap::new();
     let mut current_bands: HashMap<String, [Band; NUM_BANDS]> = HashMap::new();
+    // Per-sink output target — initialized from saved routing, defaults to headset
+    let mut targets: HashMap<String, String> = initial_targets;
 
     // Load initial filter-chains for each output sink
     for (sink_name, bands) in &initial {
-        match session.load_filter_chain(sink_name, &headset_sink, bands) {
+        let target = targets
+            .entry(sink_name.clone())
+            .or_insert_with(|| headset_sink.clone());
+        match session.load_filter_chain(sink_name, target, bands) {
             Ok(info) => {
                 log::info!(
                     "EQ filter-chain for {sink_name} loaded (module {}, capture node {:?})",
@@ -211,10 +279,42 @@ fn eq_thread(
         }
     }
 
+    // Helper: destroy + rebuild a filter-chain for a sink
+    let rebuild_chain = |session: &mut PwCliSession,
+                         chains: &mut HashMap<String, FilterChainInfo>,
+                         sink_name: &str,
+                         target: &str,
+                         bands: &[Band; NUM_BANDS]|
+     -> bool {
+        if let Some(info) = chains.remove(sink_name) {
+            session.destroy_module(info.module_proxy_id);
+        }
+        session.destroy_by_name(&format!("eq_cap_{sink_name}"));
+        session.destroy_by_name(&format!("eq_out_{sink_name}"));
+
+        match session.load_filter_chain(sink_name, target, bands) {
+            Ok(info) => {
+                chains.insert(sink_name.to_string(), info);
+                true
+            }
+            Err(e) => {
+                log::error!("Filter-chain rebuild FAILED for {sink_name}: {e}");
+                false
+            }
+        }
+    };
+
     // Process commands from the GTK main thread
     while let Ok(cmd) = rx.recv() {
         match cmd {
             EqCommand::Apply { sink_name, bands } => {
+                // Mic has no EQ filter-chain — it uses pw-link, not a filter-chain.
+                // Creating one would route mic audio to the headset speaker and
+                // cause WirePlumber to rewire the mic source connections.
+                if sink_name == super::sinks::MIC_SOURCE_NAME {
+                    continue;
+                }
+
                 // Skip if bands are identical to what's loaded
                 if current_bands.get(&sink_name).is_some_and(|cur| {
                     cur.iter().zip(bands.iter()).all(|(a, b)| {
@@ -228,6 +328,11 @@ fn eq_thread(
                     continue; // nothing changed (e.g. tab switch)
                 }
 
+                let target = targets
+                    .get(&sink_name)
+                    .cloned()
+                    .unwrap_or_else(|| headset_sink.clone());
+
                 let has_chain = chains.contains_key(&sink_name);
                 let rebuild = !has_chain
                     || current_bands
@@ -235,27 +340,17 @@ fn eq_thread(
                         .is_some_and(|cur| needs_rebuild(cur, &bands));
 
                 if rebuild {
-                    // Full rebuild: filter types changed, need new graph
                     log::info!("EQ rebuild: {sink_name}");
-                    if let Some(info) = chains.remove(&sink_name) {
-                        session.destroy_module(info.module_proxy_id);
-                    }
-                    session.destroy_by_name(&format!("eq_cap_{sink_name}"));
-                    session.destroy_by_name(&format!("eq_out_{sink_name}"));
-
-                    match session.load_filter_chain(&sink_name, &headset_sink, &bands) {
-                        Ok(info) => {
-                            log::info!(
-                                "EQ rebuild: {sink_name} loaded (module {}, node {:?})",
-                                info.module_proxy_id, info.capture_node_id
-                            );
-                            chains.insert(sink_name.clone(), info);
-                            current_bands.insert(sink_name, bands);
-                        }
-                        Err(e) => {
-                            log::error!("EQ rebuild FAILED for {sink_name}: {e}");
-                            current_bands.remove(&sink_name);
-                        }
+                    if rebuild_chain(
+                        &mut session,
+                        &mut chains,
+                        &sink_name,
+                        &target,
+                        &bands,
+                    ) {
+                        current_bands.insert(sink_name, bands);
+                    } else {
+                        current_bands.remove(&sink_name);
                     }
                 } else if let Some(node_id) = chains[&sink_name].capture_node_id {
                     // In-place update: only Freq/Q/Gain changed — no audio gap
@@ -267,18 +362,32 @@ fn eq_thread(
                 } else {
                     // No capture node ID — fall back to rebuild
                     log::warn!("EQ: no capture node ID for {sink_name}, rebuilding");
-                    if let Some(info) = chains.remove(&sink_name) {
-                        session.destroy_module(info.module_proxy_id);
+                    if rebuild_chain(
+                        &mut session,
+                        &mut chains,
+                        &sink_name,
+                        &target,
+                        &bands,
+                    ) {
+                        current_bands.insert(sink_name, bands);
                     }
-                    match session.load_filter_chain(&sink_name, &headset_sink, &bands) {
-                        Ok(info) => {
-                            chains.insert(sink_name.clone(), info);
-                            current_bands.insert(sink_name, bands);
-                        }
-                        Err(e) => {
-                            log::error!("EQ fallback rebuild FAILED for {sink_name}: {e}");
-                        }
-                    }
+                }
+            }
+            EqCommand::Reroute { sink_name, new_target } => {
+                log::info!("Rerouting {sink_name} → {new_target}");
+                targets.insert(sink_name.clone(), new_target.clone());
+                let bands = current_bands
+                    .get(&sink_name)
+                    .copied()
+                    .unwrap_or_else(crate::eq::model::default_bands);
+                if rebuild_chain(
+                    &mut session,
+                    &mut chains,
+                    &sink_name,
+                    &new_target,
+                    &bands,
+                ) {
+                    current_bands.insert(sink_name, bands);
                 }
             }
             EqCommand::Shutdown => {
@@ -692,9 +801,10 @@ pub fn find_headset_source() -> Result<String, String> {
 // Mic pw-link (direct port connection to Audio/Source/Virtual)
 // ---------------------------------------------------------------------------
 
-fn link_mic_source(headset_source: &str) -> Result<(), String> {
+fn link_mic_source(source: &str) -> Result<(), String> {
+    log::info!("pw-link: connecting {source} → {}", super::sinks::MIC_SOURCE_NAME);
     let output = Command::new("pw-link")
-        .args([headset_source, super::sinks::MIC_SOURCE_NAME])
+        .args([source, super::sinks::MIC_SOURCE_NAME])
         .output()
         .map_err(|e| format!("Failed to run pw-link: {e}"))?;
 
@@ -702,14 +812,69 @@ fn link_mic_source(headset_source: &str) -> Result<(), String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("pw-link failed: {stderr}"));
     }
+    log::info!("pw-link: connected {source} → {}", super::sinks::MIC_SOURCE_NAME);
     Ok(())
 }
 
+/// Disconnect ALL sources currently linked to SteelSeries_Mic's input port.
+/// Uses `pw-link -l` to find current connections rather than assuming only the
+/// headset is linked — the user may have rerouted to a different mic.
 fn unlink_mic_source() {
-    if let Ok(source) = find_headset_source() {
-        let _ = Command::new("pw-link")
-            .args(["-d", &source, super::sinks::MIC_SOURCE_NAME])
-            .output();
+    let mic_input = format!("{}:input_MONO", super::sinks::MIC_SOURCE_NAME);
+    let Ok(output) = Command::new("pw-link").args(["-l"]).output() else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Look for lines showing connections TO our mic input port:
+    //   SteelSeries_Mic:input_MONO
+    //     |<- some_source:capture_MONO
+    let mut in_mic_block = false;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            in_mic_block = trimmed == mic_input;
+            continue;
+        }
+        if in_mic_block {
+            if let Some(source_port) = trimmed.strip_prefix("|<- ") {
+                log::info!("Unlinking {source_port} from {mic_input}");
+                let _ = Command::new("pw-link")
+                    .args(["-d", source_port, &mic_input])
+                    .output();
+            }
+        }
+    }
+}
+
+fn set_default_sink(sink_name: &str) {
+    match Command::new("pactl")
+        .args(["set-default-sink", sink_name])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            log::info!("Set default sink to {sink_name}");
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::warn!("Failed to set default sink: {stderr}");
+        }
+        Err(e) => log::warn!("Failed to run pactl set-default-sink: {e}"),
+    }
+}
+
+fn set_default_source(source_name: &str) {
+    match Command::new("pactl")
+        .args(["set-default-source", source_name])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            log::info!("Set default source to {source_name}");
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::warn!("Failed to set default source: {stderr}");
+        }
+        Err(e) => log::warn!("Failed to run pactl set-default-source: {e}"),
     }
 }
 

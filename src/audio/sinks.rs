@@ -104,6 +104,129 @@ pub fn set_sink_volume(sink_name: &str, volume_percent: u32) -> Result<(), Strin
     Ok(())
 }
 
+pub fn set_source_volume(source_name: &str, volume_percent: u32) -> Result<(), String> {
+    let output = Command::new("pactl")
+        .args(["set-source-volume", source_name, &format!("{volume_percent}%")])
+        .output()
+        .map_err(|e| format!("Failed to run pactl: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("pactl set-source-volume failed: {stderr}"));
+    }
+    Ok(())
+}
+
+pub fn get_sink_volume(sink_name: &str) -> Result<u32, String> {
+    let output = Command::new("pactl")
+        .args(["get-sink-volume", sink_name])
+        .output()
+        .map_err(|e| format!("Failed to run pactl: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("pactl get-sink-volume failed: {stderr}"));
+    }
+
+    parse_volume_percent(&String::from_utf8_lossy(&output.stdout))
+}
+
+pub fn get_source_volume(source_name: &str) -> Result<u32, String> {
+    let output = Command::new("pactl")
+        .args(["get-source-volume", source_name])
+        .output()
+        .map_err(|e| format!("Failed to run pactl: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("pactl get-source-volume failed: {stderr}"));
+    }
+
+    parse_volume_percent(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Extract the first `NNN%` value from pactl volume output.
+/// Format: `Volume: front-left: 65536 / 100% / 0.00 dB, ...`
+fn parse_volume_percent(output: &str) -> Result<u32, String> {
+    for word in output.split_whitespace() {
+        if let Some(pct) = word.strip_suffix('%') {
+            if let Ok(val) = pct.parse::<u32>() {
+                return Ok(val);
+            }
+        }
+    }
+    Err("Could not parse volume percentage from pactl output".to_string())
+}
+
+/// List physical output sinks (excludes our virtual sinks and EQ filter-chain nodes).
+/// Returns `(node_name, description)` pairs.
+pub fn list_physical_sinks() -> Vec<(String, String)> {
+    parse_device_list("sinks", |name| {
+        ALL_SINKS.iter().any(|(n, _, _)| *n == name)
+            || ALL_SOURCES.iter().any(|(n, _, _)| *n == name)
+            || name.starts_with("eq_")
+    })
+}
+
+/// List physical input sources (excludes our virtual source, monitors, and EQ nodes).
+/// Returns `(node_name, description)` pairs.
+pub fn list_physical_sources() -> Vec<(String, String)> {
+    parse_device_list("sources", |name| {
+        name == MIC_SOURCE_NAME
+            || name.ends_with(".monitor")
+            || name.starts_with("eq_")
+            || ALL_SINKS.iter().any(|(n, _, _)| name == format!("{n}.monitor"))
+    })
+}
+
+/// Parse `pactl list <kind>` output to extract (Name, Description) pairs,
+/// filtering out entries where `exclude(name)` returns true.
+fn parse_device_list<F: Fn(&str) -> bool>(kind: &str, exclude: F) -> Vec<(String, String)> {
+    let Ok(output) = Command::new("pactl")
+        .args(["list", kind])
+        .output()
+    else {
+        return Vec::new();
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut results = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_desc: Option<String> = None;
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+
+        // New block starts with "Sink #" or "Source #"
+        if trimmed.starts_with("Sink #") || trimmed.starts_with("Source #") {
+            // Flush previous entry
+            if let (Some(name), Some(desc)) = (current_name.take(), current_desc.take()) {
+                if !exclude(&name) {
+                    results.push((name, desc));
+                }
+            }
+            current_name = None;
+            current_desc = None;
+            continue;
+        }
+
+        if let Some(val) = trimmed.strip_prefix("Name: ") {
+            current_name = Some(val.to_string());
+        } else if let Some(val) = trimmed.strip_prefix("Description: ") {
+            current_desc = Some(val.to_string());
+        }
+    }
+
+    // Flush last entry
+    if let (Some(name), Some(desc)) = (current_name, current_desc) {
+        if !exclude(&name) {
+            results.push((name, desc));
+        }
+    }
+
+    results
+}
+
 fn create_pw_node(
     node_name: &str,
     description: &str,

@@ -4,6 +4,7 @@ mod autostart;
 mod eq;
 mod hid;
 mod icons;
+mod mixer;
 mod tray;
 mod window;
 

@@ -3,10 +3,11 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
+use crate::audio::{persistence, sinks};
 use crate::autostart;
-use crate::audio::persistence;
 use crate::eq::model::{Band, EqTarget, NUM_BANDS};
 use crate::hid::protocol::NoiseMode;
+use crate::mixer::MixerWidgets;
 
 const PLACEHOLDER: &str = "—";
 
@@ -23,6 +24,7 @@ struct Widgets {
     spare_battery_label: gtk::Label,
     spare_battery_icon: gtk::Image,
     balance_scale: gtk::Scale,
+    mixer: Option<MixerWidgets>,
 }
 
 fn battery_icon(percent: u8) -> (&'static str, bool) {
@@ -39,6 +41,9 @@ impl ChatMixWindow {
     pub fn new(
         app: &adw::Application,
         on_eq_apply: Option<Rc<dyn Fn(EqTarget, [Band; NUM_BANDS])>>,
+        on_reroute: Option<Rc<dyn Fn(&str, &str)>>,
+        on_mic_reroute: Option<Rc<dyn Fn(&str)>>,
+        headset_sink: Option<String>,
     ) -> Self {
         let window = adw::ApplicationWindow::builder()
             .application(app)
@@ -68,9 +73,13 @@ impl ChatMixWindow {
             .build();
 
         // Build all pages
-        let (dashboard_page, widgets) = build_dashboard_page();
+        let (dashboard_page, mut widgets) = build_dashboard_page();
         stack.add_named(&dashboard_page, Some("home"));
-        stack.add_named(&crate::eq::build_eq_page(on_eq_apply), Some("eq"));
+        let (eq_page, mixer_widgets) = crate::eq::build_eq_page(
+            on_eq_apply, on_reroute, on_mic_reroute, headset_sink,
+        );
+        widgets.mixer = mixer_widgets;
+        stack.add_named(&eq_page, Some("eq"));
         stack.add_named(
             &build_placeholder_page("Clips", "lucide-clapperboard-symbolic", "Coming soon"),
             Some("clips"),
@@ -100,7 +109,9 @@ impl ChatMixWindow {
              .eq-filter-dropdown > button { font-size: 75%; min-height: 0; padding-top: 4px; padding-bottom: 4px; } \
              .eq-floating-panel { background-color: alpha(@window_bg_color, 0.92); border-radius: 8px; \
                padding: 8px 12px; margin-top: 4px; margin-bottom: 4px; border: 1px solid alpha(white, 0.12); } \
-             .eq-enable-switch { min-width: 36px; min-height: 18px; }"
+             .eq-enable-switch { min-width: 36px; min-height: 18px; } \
+             .mixer-device-dropdown { font-size: 75%; } \
+             .mixer-device-dropdown > button { min-height: 0; padding-top: 4px; padding-bottom: 4px; }"
         );
         gtk::style_context_add_provider_for_display(
             &gtk::prelude::WidgetExt::display(&window),
@@ -133,6 +144,26 @@ impl ChatMixWindow {
         let w = self.inner.borrow();
         let balance = game as f64 - chat as f64;
         w.balance_scale.set_value(balance);
+    }
+
+    pub fn set_sink_volume(&self, sink_name: &str, pct: u8) {
+        let w = self.inner.borrow();
+        if let Some(ref m) = w.mixer {
+            m.updating.set(true);
+            let scale = match sink_name {
+                sinks::GAME_SINK_NAME => &m.game_scale,
+                sinks::CHAT_SINK_NAME => &m.chat_scale,
+                sinks::MUSIC_SINK_NAME => &m.music_scale,
+                sinks::AUX_SINK_NAME => &m.aux_scale,
+                sinks::MIC_SOURCE_NAME => &m.mic_scale,
+                _ => {
+                    m.updating.set(false);
+                    return;
+                }
+            };
+            scale.set_value(pct as f64);
+            m.updating.set(false);
+        }
     }
 
     pub fn set_battery(&self, headset: u8, spare: u8) {
@@ -312,6 +343,7 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
         spare_battery_label: status_result.spare_battery_label,
         spare_battery_icon: status_result.spare_battery_icon,
         balance_scale: status_result.balance_scale,
+        mixer: None,
     };
 
     (scroll.upcast(), widgets)
