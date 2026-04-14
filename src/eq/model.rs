@@ -58,7 +58,7 @@ impl FilterType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Band {
     pub frequency: f64,
     pub gain_db: f64,

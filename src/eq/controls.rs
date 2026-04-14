@@ -274,6 +274,20 @@ fn scrub_entry() -> gtk::Entry {
         .build();
     entry.add_css_class("eq-spin");
 
+    // Remove GTK's built-in text DragSource. Our GestureDrag (Capture phase)
+    // intercepts drags for scrub-to-adjust, but GTK's internal DnD controller
+    // can still fire and crash with:
+    //   gtk_text_util_create_drag_icon: assertion 'text != NULL' failed
+    let controllers = entry.observe_controllers();
+    for i in (0..controllers.n_items()).rev() {
+        if let Some(obj) = controllers.item(i) {
+            if obj.is::<gtk::DragSource>() {
+                let ctrl = obj.downcast::<gtk::EventController>().unwrap();
+                entry.remove_controller(&ctrl);
+            }
+        }
+    }
+
     // Force scrub cursor on every mouse movement when not in edit mode.
     // GTK's Entry continuously resets its cursor internally, so we must
     // continuously override it.

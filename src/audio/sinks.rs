@@ -8,20 +8,23 @@ pub const CHAT_SINK_NAME: &str = "SteelSeries_Chat";
 pub const MUSIC_SINK_NAME: &str = "SteelSeries_Music";
 pub const AUX_SINK_NAME: &str = "SteelSeries_Aux";
 
-// Virtual source (microphone) — appears as an input device
+// Virtual source (microphone) — created as Audio/Source/Virtual so it appears
+// as a selectable input device in apps (Discord, OBS, etc.)
 pub const MIC_SOURCE_NAME: &str = "SteelSeries_Mic";
 
-/// Every virtual sink this app manages, with internal node.name and display description.
-pub const ALL_SINKS: &[(&str, &str)] = &[
-    (GAME_SINK_NAME, "SteelSeries Game"),
-    (CHAT_SINK_NAME, "SteelSeries Chat"),
-    (MUSIC_SINK_NAME, "SteelSeries Music"),
-    (AUX_SINK_NAME, "SteelSeries Aux"),
+/// Output sinks: internal node.name, display description, audio position.
+pub const ALL_SINKS: &[(&str, &str, &str)] = &[
+    (GAME_SINK_NAME, "SteelSeries Game", "FL,FR"),
+    (CHAT_SINK_NAME, "SteelSeries Chat", "FL,FR"),
+    (MUSIC_SINK_NAME, "SteelSeries Music", "FL,FR"),
+    (AUX_SINK_NAME, "SteelSeries Aux", "FL,FR"),
 ];
 
-/// Every virtual source (input) this app manages.
-pub const ALL_SOURCES: &[(&str, &str)] = &[
-    (MIC_SOURCE_NAME, "SteelSeries Mic"),
+/// Virtual source for the microphone. Created separately as Audio/Source/Virtual
+/// (not Audio/Sink) because apps like Discord only discover proper Source nodes,
+/// not sink monitors. Connected to the hardware mic via pw-link.
+pub const ALL_SOURCES: &[(&str, &str, &str)] = &[
+    (MIC_SOURCE_NAME, "SteelSeries Mic", "MONO"),
 ];
 
 /// Legacy sink names from previous app versions. Still cleaned up on startup
@@ -37,10 +40,10 @@ pub const LEGACY_SINK_MIGRATIONS: &[(&str, &str)] = &[
     ("ChatMix_Mic", MIC_SOURCE_NAME),
 ];
 
-/// True if the given sink name is one the app manages as a sink (not a source).
+/// True if the given sink name is one the app manages as an output sink.
 /// Used by persistence to decide whether a sink-input assignment belongs to us.
 pub fn is_managed(sink_name: &str) -> bool {
-    ALL_SINKS.iter().any(|(name, _)| *name == sink_name)
+    ALL_SINKS.iter().any(|(name, _, _)| *name == sink_name)
 }
 
 /// If `old_name` is a legacy sink name, return the current name. Otherwise None.
@@ -57,15 +60,14 @@ pub struct VirtualSinks {
 
 impl VirtualSinks {
     pub fn create() -> Result<Self, String> {
-        // Destroy any orphans from a previous crash BEFORE creating fresh ones
         cleanup_orphaned();
 
-        for (name, description) in ALL_SINKS {
-            create_pw_node(name, description, "Audio/Sink", "FL,FR")?;
+        for (name, description, position) in ALL_SINKS {
+            create_pw_node(name, description, "Audio/Sink", position)?;
             log::info!("Created sink {name}");
         }
-        for (name, description) in ALL_SOURCES {
-            create_pw_node(name, description, "Audio/Source/Virtual", "MONO")?;
+        for (name, description, position) in ALL_SOURCES {
+            create_pw_node(name, description, "Audio/Source/Virtual", position)?;
             log::info!("Created source {name}");
         }
 
@@ -73,10 +75,10 @@ impl VirtualSinks {
     }
 
     pub fn destroy(&self) {
-        for (name, _) in ALL_SINKS {
+        for (name, _, _) in ALL_SINKS {
             destroy_pw_node(name);
         }
-        for (name, _) in ALL_SOURCES {
+        for (name, _, _) in ALL_SOURCES {
             destroy_pw_node(name);
         }
         log::info!("Virtual sinks + sources destroyed");
@@ -135,14 +137,12 @@ fn destroy_pw_node(node_name: &str) {
 }
 
 fn cleanup_orphaned() {
-    // Destroy anything we manage now
-    for (name, _) in ALL_SINKS {
+    for (name, _, _) in ALL_SINKS {
         destroy_pw_node(name);
     }
-    for (name, _) in ALL_SOURCES {
+    for (name, _, _) in ALL_SOURCES {
         destroy_pw_node(name);
     }
-    // Destroy legacy names from previous app versions so they don't linger
     for (old_name, _) in LEGACY_SINK_MIGRATIONS {
         destroy_pw_node(old_name);
     }

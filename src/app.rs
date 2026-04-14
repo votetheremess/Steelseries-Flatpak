@@ -12,6 +12,7 @@ use gtk::glib;
 use crate::audio::persistence;
 use crate::audio::router::{self, AudioRouter};
 use crate::audio::sinks::{self, VirtualSinks};
+use crate::eq::model::{Band, EqTarget, NUM_BANDS};
 use crate::hid::device::HidWriter;
 use crate::hid::{self, protocol::HidEvent};
 use crate::icons;
@@ -24,7 +25,7 @@ const STREAM_WATCH_SECS: u32 = 2;
 
 struct AppResources {
     _sinks: VirtualSinks,
-    _router: AudioRouter,
+    router: Rc<RefCell<Option<AudioRouter>>>,
     shutdown: Arc<AtomicBool>,
     rx: Option<Receiver<HidEvent>>,
     writer: Option<HidWriter>,
@@ -68,7 +69,42 @@ pub fn run(start_hidden: bool) {
             // Register Lucide icon theme path (needs a gdk::Display, available here)
             icons::install();
 
-            let window = ChatMixWindow::new(app);
+            // Build the debounced EQ apply callback.
+            // When the EQ UI changes, this schedules a 16ms debounced update
+            // (one frame) that sends the new band settings to the EQ pipeline
+            // thread. Short debounce for live responsiveness — the EQ thread
+            // uses in-place set-param for Freq/Q/Gain changes (no audio gap).
+            let on_eq_apply: Option<Rc<dyn Fn(EqTarget, [Band; NUM_BANDS])>> = {
+                let router_ref = resources
+                    .borrow()
+                    .as_ref()
+                    .map(|r| r.router.clone());
+
+                router_ref.map(|router| {
+                    let debounce: Rc<RefCell<Option<glib::SourceId>>> =
+                        Rc::new(RefCell::new(None));
+                    Rc::new(move |target: EqTarget, bands: [Band; NUM_BANDS]| {
+                        // Cancel any pending debounce
+                        if let Some(id) = debounce.borrow_mut().take() {
+                            id.remove();
+                        }
+                        let router = router.clone();
+                        let debounce_ref = debounce.clone();
+                        let id = glib::timeout_add_local_once(
+                            Duration::from_millis(16),
+                            move || {
+                                if let Some(ref r) = *router.borrow() {
+                                    r.update_eq(target.sink_name(), &bands);
+                                }
+                                *debounce_ref.borrow_mut() = None;
+                            },
+                        );
+                        *debounce.borrow_mut() = Some(id);
+                    }) as Rc<dyn Fn(EqTarget, [Band; NUM_BANDS])>
+                })
+            };
+
+            let window = ChatMixWindow::new(app, on_eq_apply);
 
             // Hide on close, keep the process running
             window.window.connect_close_request(move |w| {
@@ -171,6 +207,9 @@ pub fn run(start_hidden: bool) {
             persistence::save_assignments();
             if let Some(res) = resources.borrow_mut().take() {
                 res.shutdown.store(true, Ordering::Relaxed);
+                // Drop the router before sinks so filter-chains/loopbacks are
+                // unloaded while the sinks still exist.
+                res.router.borrow_mut().take();
                 drop(res);
             }
             log::info!("Cleanup complete");
@@ -223,7 +262,7 @@ fn init_pipeline() -> Result<AppResources, String> {
 
     Ok(AppResources {
         _sinks: sinks,
-        _router: router,
+        router: Rc::new(RefCell::new(Some(router))),
         shutdown,
         rx: Some(rx),
         writer: Some(writer),

@@ -237,6 +237,12 @@ pub fn restore_new_streams(seen_ids: &mut HashSet<u32>) {
             continue;
         }
 
+        // Never touch our own EQ filter-chain streams — moving them would
+        // create a feedback loop (sink → filter → sink → filter → …).
+        if input.app_name == "pw-cli" {
+            continue;
+        }
+
         let Some(target_sink) = saved.get(&input.app_name) else {
             continue;
         };

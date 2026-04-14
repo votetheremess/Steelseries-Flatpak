@@ -2,7 +2,7 @@ mod biquad;
 mod controls;
 mod graph;
 pub mod model;
-mod presets;
+pub mod presets;
 
 use std::rc::Rc;
 
@@ -11,7 +11,9 @@ use gtk::glib;
 
 use model::*;
 
-pub fn build_eq_page() -> gtk::Widget {
+pub fn build_eq_page(
+    on_eq_apply: Option<Rc<dyn Fn(EqTarget, [Band; NUM_BANDS])>>,
+) -> gtk::Widget {
     let state = new_shared_state();
 
     // Load persisted EQ state if available
@@ -51,6 +53,7 @@ pub fn build_eq_page() -> gtk::Widget {
         let preset_dropdown_ref = preset_dropdown_ref.clone();
         let preset_updating = preset_updating.clone();
         let state = state.clone();
+        let on_eq_apply = on_eq_apply.clone();
         Rc::new(move || {
             if let Some(ref g) = *graph_ref.borrow() {
                 g.queue_draw();
@@ -68,6 +71,12 @@ pub fn build_eq_page() -> gtk::Widget {
                 }
             }
             presets::save_eq_state(&state.borrow().sinks);
+
+            // Notify the audio pipeline (debounced by the caller)
+            if let Some(ref apply) = on_eq_apply {
+                let s = state.borrow();
+                apply(s.active_target, s.active_sink_eq().bands);
+            }
         })
     };
 
@@ -79,6 +88,7 @@ pub fn build_eq_page() -> gtk::Widget {
         .spacing(8)
         .margin_bottom(8)
         .build();
+    top_bar.add_css_class("eq-top-bar");
 
     let tab_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)

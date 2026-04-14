@@ -5,6 +5,7 @@ use adw::prelude::*;
 
 use crate::autostart;
 use crate::audio::persistence;
+use crate::eq::model::{Band, EqTarget, NUM_BANDS};
 use crate::hid::protocol::NoiseMode;
 
 const PLACEHOLDER: &str = "—";
@@ -35,7 +36,10 @@ fn battery_icon(percent: u8) -> (&'static str, bool) {
 }
 
 impl ChatMixWindow {
-    pub fn new(app: &adw::Application) -> Self {
+    pub fn new(
+        app: &adw::Application,
+        on_eq_apply: Option<Rc<dyn Fn(EqTarget, [Band; NUM_BANDS])>>,
+    ) -> Self {
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("Arctis Nova Elite ChatMix")
@@ -66,7 +70,7 @@ impl ChatMixWindow {
         // Build all pages
         let (dashboard_page, widgets) = build_dashboard_page();
         stack.add_named(&dashboard_page, Some("home"));
-        stack.add_named(&crate::eq::build_eq_page(), Some("eq"));
+        stack.add_named(&crate::eq::build_eq_page(on_eq_apply), Some("eq"));
         stack.add_named(
             &build_placeholder_page("Clips", "lucide-clapperboard-symbolic", "Coming soon"),
             Some("clips"),
@@ -91,10 +95,11 @@ impl ChatMixWindow {
             "window { font-size: 125%; } \
              row { padding-top: 4px; padding-bottom: 4px; } \
              .eq-graph-frame { background-color: rgba(0,0,0,0.05); border-radius: 8px; } \
+             .eq-top-bar button { font-size: 80%; } \
              .eq-spin { font-size: 75%; font-weight: bold; } \
              .eq-filter-dropdown > button { font-size: 75%; min-height: 0; padding-top: 4px; padding-bottom: 4px; } \
              .eq-floating-panel { background-color: alpha(@window_bg_color, 0.92); border-radius: 8px; \
-               padding: 4px 8px; border: 1px solid alpha(white, 0.12); } \
+               padding: 8px 12px; margin-top: 4px; margin-bottom: 4px; border: 1px solid alpha(white, 0.12); } \
              .eq-enable-switch { min-width: 36px; min-height: 18px; }"
         );
         gtk::style_context_add_provider_for_display(
