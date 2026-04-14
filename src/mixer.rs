@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::pango;
 
 use crate::audio::sinks;
 
@@ -43,10 +44,11 @@ pub fn build_mixer_content(
     headset_sink: Option<String>,
 ) -> (gtk::Widget, MixerWidgets) {
     let updating = Rc::new(Cell::new(false));
+    let dropdown_sg = gtk::SizeGroup::new(gtk::SizeGroupMode::Vertical);
 
     let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+        .spacing(12)
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Fill)
         .vexpand(true)
@@ -63,13 +65,11 @@ pub fn build_mixer_content(
         headset_sink.as_deref(),
         false,
         &updating,
-        None, // no device dropdown for master
         None,
+        "master",
+        &dropdown_sg,
     );
     root.append(&master_strip);
-
-    // Separator between master and output sinks
-    root.append(&gtk::Separator::new(gtk::Orientation::Vertical));
 
     // Output sink channels
     let mut game_scale = None;
@@ -90,7 +90,8 @@ pub fn build_mixer_content(
             ch.is_source,
             &updating,
             Some(device_dropdown),
-            None,
+            &ch.label.to_ascii_lowercase(),
+            &dropdown_sg,
         );
         root.append(&strip);
 
@@ -102,9 +103,6 @@ pub fn build_mixer_content(
             _ => {}
         }
     }
-
-    // Separator between output sinks and mic
-    root.append(&gtk::Separator::new(gtk::Orientation::Vertical));
 
     // Mic channel
     let mic_dropdown = build_source_dropdown(
@@ -118,7 +116,8 @@ pub fn build_mixer_content(
         MIC_CHANNEL.is_source,
         &updating,
         Some(mic_dropdown),
-        None,
+        "mic",
+        &dropdown_sg,
     );
     root.append(&mic_strip);
 
@@ -142,18 +141,23 @@ fn build_channel_strip(
     is_source: bool,
     updating: &Rc<Cell<bool>>,
     device_dropdown: Option<gtk::DropDown>,
-    _headset_sink: Option<&str>,
+    channel_css_suffix: &str,
+    dropdown_size_group: &gtk::SizeGroup,
 ) -> (gtk::Box, gtk::Scale) {
     let strip = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
-        .width_request(90)
-        .halign(gtk::Align::Center)
+        .width_request(150)
+        .halign(gtk::Align::Fill)
+        .hexpand(false)
         .build();
+    strip.add_css_class("mixer-channel");
+    strip.add_css_class(&format!("mixer-ch-{channel_css_suffix}"));
 
     // Channel name
     let name_label = gtk::Label::builder()
         .label(label)
+        .halign(gtk::Align::Center)
         .build();
     name_label.add_css_class("heading");
     strip.append(&name_label);
@@ -161,6 +165,7 @@ fn build_channel_strip(
     // Icon
     let icon = gtk::Image::from_icon_name(icon_name);
     icon.set_pixel_size(22);
+    icon.set_halign(gtk::Align::Center);
     strip.append(&icon);
 
     // Volume scale (vertical, inverted so 100% is at top)
@@ -169,12 +174,14 @@ fn build_channel_strip(
     scale.set_draw_value(false);
     scale.set_vexpand(true);
     scale.set_height_request(250);
+    scale.set_halign(gtk::Align::Center);
     scale.set_value(read_initial_volume(sink_name, is_source));
     strip.append(&scale);
 
     // Percentage label
     let pct_label = gtk::Label::builder()
         .label(&format!("{}%", scale.value() as u32))
+        .halign(gtk::Align::Center)
         .build();
     pct_label.add_css_class("numeric");
     strip.append(&pct_label);
@@ -200,10 +207,21 @@ fn build_channel_strip(
         });
     }
 
-    // Device dropdown (if provided)
+    // Dropdown wrapper (or placeholder for Master) — kept in a SizeGroup for equal height
+    let dropdown_wrapper = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .margin_start(8)
+        .margin_end(8)
+        .build();
+
     if let Some(dropdown) = device_dropdown {
-        strip.append(&dropdown);
+        dropdown.set_hexpand(true);
+        dropdown_wrapper.append(&dropdown);
     }
+    // If no dropdown (Master), the wrapper stays empty as a height placeholder
+
+    dropdown_size_group.add_widget(&dropdown_wrapper);
+    strip.append(&dropdown_wrapper);
 
     (strip, scale)
 }
@@ -221,6 +239,50 @@ fn read_initial_volume(sink_name: Option<&str>, is_source: bool) -> f64 {
     result.unwrap_or(100) as f64
 }
 
+/// Factory for the dropdown button label: truncates long device names with ellipsis.
+fn truncating_label_factory() -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_factory, list_item| {
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+        let label = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(pango::EllipsizeMode::End)
+            .max_width_chars(1)
+            .hexpand(true)
+            .build();
+        list_item.set_child(Some(&label));
+    });
+    factory.connect_bind(|_factory, list_item| {
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+        let item = list_item.item().and_downcast::<gtk::StringObject>().unwrap();
+        let label = list_item.child().and_downcast::<gtk::Label>().unwrap();
+        label.set_label(&item.string());
+        label.set_tooltip_text(Some(&item.string()));
+    });
+    factory
+}
+
+/// Factory for the dropdown popup list: wraps long device names so they're fully readable.
+fn popup_label_factory() -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_factory, list_item| {
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+        let label = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(pango::WrapMode::WordChar)
+            .build();
+        list_item.set_child(Some(&label));
+    });
+    factory.connect_bind(|_factory, list_item| {
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+        let item = list_item.item().and_downcast::<gtk::StringObject>().unwrap();
+        let label = list_item.child().and_downcast::<gtk::Label>().unwrap();
+        label.set_label(&item.string());
+    });
+    factory
+}
+
 /// Build device dropdown for an output sink, populated with physical sinks.
 fn build_sink_dropdown(
     sink_name: &str,
@@ -232,6 +294,8 @@ fn build_sink_dropdown(
     let model = gtk::StringList::new(&display_names);
     let dropdown = gtk::DropDown::builder()
         .model(&model)
+        .factory(&truncating_label_factory())
+        .list_factory(&popup_label_factory())
         .build();
     dropdown.add_css_class("mixer-device-dropdown");
 
@@ -274,6 +338,8 @@ fn build_source_dropdown(
     let model = gtk::StringList::new(&display_names);
     let dropdown = gtk::DropDown::builder()
         .model(&model)
+        .factory(&truncating_label_factory())
+        .list_factory(&popup_label_factory())
         .build();
     dropdown.add_css_class("mixer-device-dropdown");
 

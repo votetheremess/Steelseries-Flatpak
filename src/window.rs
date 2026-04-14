@@ -110,6 +110,26 @@ impl ChatMixWindow {
              .eq-floating-panel { background-color: alpha(@window_bg_color, 0.92); border-radius: 8px; \
                padding: 8px 12px; margin-top: 4px; margin-bottom: 4px; border: 1px solid alpha(white, 0.12); } \
              .eq-enable-switch { min-width: 36px; min-height: 18px; } \
+             .mixer-channel { background-color: alpha(@window_bg_color, 0.92); border-radius: 8px; \
+               padding: 8px 6px; border: 1px solid alpha(white, 0.12); } \
+             .mixer-ch-master { box-shadow: inset 0 2px 0 rgba(255,255,255,0.35); } \
+             .mixer-ch-game   { box-shadow: inset 0 2px 0 rgba(230,77,77,0.6); } \
+             .mixer-ch-chat   { box-shadow: inset 0 2px 0 rgba(77,153,230,0.6); } \
+             .mixer-ch-music  { box-shadow: inset 0 2px 0 rgba(77,204,179,0.6); } \
+             .mixer-ch-aux    { box-shadow: inset 0 2px 0 rgba(242,140,64,0.6); } \
+             .mixer-ch-mic    { box-shadow: inset 0 2px 0 rgba(179,102,230,0.6); } \
+             .mixer-ch-master image { color: rgba(255,255,255,0.7); } \
+             .mixer-ch-game image   { color: rgb(230,77,77); } \
+             .mixer-ch-chat image   { color: rgb(77,153,230); } \
+             .mixer-ch-music image  { color: rgb(77,204,179); } \
+             .mixer-ch-aux image    { color: rgb(242,140,64); } \
+             .mixer-ch-mic image    { color: rgb(179,102,230); } \
+             .mixer-ch-master scale trough highlight { background-color: rgba(255,255,255,0.65); } \
+             .mixer-ch-game scale trough highlight   { background-color: rgba(230,77,77,0.85); } \
+             .mixer-ch-chat scale trough highlight   { background-color: rgba(77,153,230,0.85); } \
+             .mixer-ch-music scale trough highlight  { background-color: rgba(77,204,179,0.85); } \
+             .mixer-ch-aux scale trough highlight    { background-color: rgba(242,140,64,0.85); } \
+             .mixer-ch-mic scale trough highlight    { background-color: rgba(179,102,230,0.85); } \
              .mixer-device-dropdown { font-size: 75%; } \
              .mixer-device-dropdown > button { min-height: 0; padding-top: 4px; padding-bottom: 4px; }"
         );
