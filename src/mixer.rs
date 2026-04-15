@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -329,13 +329,20 @@ fn build_sink_dropdown(
 }
 
 /// Build device dropdown for the mic, populated with physical sources.
+/// Re-queries the source list on click so devices that come online after app startup appear.
 fn build_source_dropdown(
     _headset_sink: Option<&str>,
     on_mic_reroute: Option<Rc<dyn Fn(&str)>>,
 ) -> gtk::DropDown {
-    let devices = sinks::list_physical_sources();
-    let display_names: Vec<&str> = devices.iter().map(|(_, desc)| desc.as_str()).collect();
-    let model = gtk::StringList::new(&display_names);
+    let devices: Rc<RefCell<Vec<(String, String)>>> =
+        Rc::new(RefCell::new(sinks::list_physical_sources()));
+    let model = gtk::StringList::new(&[]);
+    for (_, desc) in devices.borrow().iter() {
+        model.append(desc);
+    }
+
+    let updating = Rc::new(Cell::new(false));
+
     let dropdown = gtk::DropDown::builder()
         .model(&model)
         .factory(&truncating_label_factory())
@@ -343,20 +350,62 @@ fn build_source_dropdown(
         .build();
     dropdown.add_css_class("mixer-device-dropdown");
 
-    // Select the first source by default (headset mic is typically first)
-    // Will be overridden by saved routing later
+    // Refresh on press (Capture phase fires before the popup opens)
+    {
+        let devices = devices.clone();
+        let model = model.clone();
+        let dropdown_weak = dropdown.downgrade();
+        let updating = updating.clone();
+        let click = gtk::GestureClick::new();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.connect_pressed(move |_, _, _, _| {
+            let Some(dd) = dropdown_weak.upgrade() else { return };
+
+            // Save currently selected internal name so we can restore it after refresh
+            let prev_name = {
+                let idx = dd.selected() as usize;
+                devices.borrow().get(idx).map(|(n, _)| n.clone())
+            };
+
+            let new_devices = sinks::list_physical_sources();
+
+            updating.set(true);
+            while model.n_items() > 0 {
+                model.remove(0);
+            }
+            for (_, desc) in &new_devices {
+                model.append(desc);
+            }
+            if let Some(prev) = prev_name {
+                for (i, (name, _)) in new_devices.iter().enumerate() {
+                    if *name == prev {
+                        dd.set_selected(i as u32);
+                        break;
+                    }
+                }
+            }
+            *devices.borrow_mut() = new_devices;
+            updating.set(false);
+        });
+        dropdown.add_controller(click);
+    }
 
     // Wire change handler
     {
         let devices = devices.clone();
+        let updating = updating.clone();
         dropdown.connect_selected_notify(move |dd| {
-            let idx = dd.selected() as usize;
-            log::info!("Mic dropdown selected index {idx}");
-            if idx >= devices.len() {
-                log::warn!("Mic dropdown index {idx} out of range ({})", devices.len());
+            if updating.get() {
                 return;
             }
-            let (ref source_name, ref desc) = devices[idx];
+            let idx = dd.selected() as usize;
+            let devs = devices.borrow();
+            log::info!("Mic dropdown selected index {idx}");
+            if idx >= devs.len() {
+                log::warn!("Mic dropdown index {idx} out of range ({})", devs.len());
+                return;
+            }
+            let (ref source_name, ref desc) = devs[idx];
             log::info!("Mic dropdown selected: {desc} ({source_name})");
             if let Some(ref cb) = on_mic_reroute {
                 cb(source_name);
