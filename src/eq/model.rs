@@ -9,6 +9,7 @@ pub enum FilterType {
     HighShelf,
     LowPass,
     HighPass,
+    Notch,
 }
 
 impl FilterType {
@@ -18,6 +19,7 @@ impl FilterType {
         FilterType::HighShelf,
         FilterType::LowPass,
         FilterType::HighPass,
+        FilterType::Notch,
     ];
 
     pub fn label(self) -> &'static str {
@@ -27,6 +29,7 @@ impl FilterType {
             FilterType::HighShelf => "High Shelf",
             FilterType::LowPass => "Low Pass",
             FilterType::HighPass => "High Pass",
+            FilterType::Notch => "Notch",
         }
     }
 
@@ -37,6 +40,7 @@ impl FilterType {
             "high_shelf" => Some(FilterType::HighShelf),
             "low_pass" => Some(FilterType::LowPass),
             "high_pass" => Some(FilterType::HighPass),
+            "notch" => Some(FilterType::Notch),
             _ => None,
         }
     }
@@ -48,11 +52,12 @@ impl FilterType {
             FilterType::HighShelf => "high_shelf",
             FilterType::LowPass => "low_pass",
             FilterType::HighPass => "high_pass",
+            FilterType::Notch => "notch",
         }
     }
 
     /// Whether this filter type uses the gain parameter.
-    /// LowPass and HighPass are gain-independent.
+    /// LowPass, HighPass, and Notch are gain-independent.
     pub fn uses_gain(self) -> bool {
         matches!(self, FilterType::Peaking | FilterType::LowShelf | FilterType::HighShelf)
     }

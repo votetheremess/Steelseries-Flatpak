@@ -1,0 +1,105 @@
+name: Sonar preset watcher
+
+# Scrapes https://techblog.steelseries.com/ once a day for new GG release
+# notes that mention "Added new EQ Presets" or "Updated EQ Presets" and
+# opens a tracking issue so we know to refresh our preset library.
+#
+# State is persisted in the workflow artifact `sonar-preset-state` across
+# runs so we only file issues for genuinely new posts.
+
+on:
+  schedule:
+    - cron: "17 7 * * *"   # daily at 07:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  actions: read            # read prior artifact
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore previous state
+        id: restore
+        uses: actions/download-artifact@v4
+        with:
+          name: sonar-preset-state
+          path: state
+        continue-on-error: true
+
+      - name: Scan techblog for new preset announcements
+        id: scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p state
+          seen_file="state/seen.txt"
+          touch "$seen_file"
+
+          index_html=$(curl -sSLf https://techblog.steelseries.com/)
+          # Post URLs look like /YYYY/MM/DD/GG-notes-<version>.html
+          mapfile -t post_paths < <(printf '%s' "$index_html" \
+            | grep -oE 'href="/[0-9]{4}/[0-9]{2}/[0-9]{2}/GG-notes-[^"]+\.html"' \
+            | sed -E 's/href="//; s/"$//' \
+            | sort -u)
+
+          new_posts=()
+          new_preset_lines=()
+          for path in "${post_paths[@]}"; do
+            if grep -Fxq "$path" "$seen_file"; then
+              continue
+            fi
+            url="https://techblog.steelseries.com$path"
+            body=$(curl -sSLf "$url" || true)
+            if [ -z "$body" ]; then
+              continue
+            fi
+            preset_snippet=$(printf '%s' "$body" \
+              | grep -oE '(Added|Updated) new EQ Presets[^<]*' \
+              | head -n 5 || true)
+            if [ -n "$preset_snippet" ]; then
+              new_posts+=("$url")
+              new_preset_lines+=("$url — $preset_snippet")
+            fi
+            echo "$path" >> "$seen_file"
+          done
+
+          sort -u -o "$seen_file" "$seen_file"
+
+          {
+            echo "## Sonar presets update candidates"
+            echo
+            if [ ${#new_preset_lines[@]} -eq 0 ]; then
+              echo "_No new preset announcements found._"
+            else
+              for line in "${new_preset_lines[@]}"; do
+                echo "- $line"
+              done
+            fi
+          } > state/summary.md
+
+          echo "found=${#new_preset_lines[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Open tracking issue
+        if: steps.scan.outputs.found != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('state/summary.md', 'utf8');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `New SteelSeries Sonar presets available (${new Date().toISOString().slice(0,10)})`,
+              body,
+              labels: ['new-presets'],
+            });
+
+      - name: Save state
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonar-preset-state
+          path: state
+          retention-days: 90

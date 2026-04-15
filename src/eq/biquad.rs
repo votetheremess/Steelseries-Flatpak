@@ -89,6 +89,20 @@ fn high_pass_coeffs(freq: f64, q: f64) -> Coeffs {
     }
 }
 
+fn notch_coeffs(freq: f64, q: f64) -> Coeffs {
+    let w0 = 2.0 * PI * freq / SAMPLE_RATE;
+    let alpha = w0.sin() / (2.0 * q);
+    let cos_w0 = w0.cos();
+    Coeffs {
+        b0: 1.0,
+        b1: -2.0 * cos_w0,
+        b2: 1.0,
+        a0: 1.0 + alpha,
+        a1: -2.0 * cos_w0,
+        a2: 1.0 - alpha,
+    }
+}
+
 fn band_coeffs(band: &Band) -> Coeffs {
     match band.filter_type {
         FilterType::Peaking => peaking_coeffs(band.frequency, band.gain_db, band.q),
@@ -96,6 +110,7 @@ fn band_coeffs(band: &Band) -> Coeffs {
         FilterType::HighShelf => high_shelf_coeffs(band.frequency, band.gain_db, band.q),
         FilterType::LowPass => low_pass_coeffs(band.frequency, band.q),
         FilterType::HighPass => high_pass_coeffs(band.frequency, band.q),
+        FilterType::Notch => notch_coeffs(band.frequency, band.q),
     }
 }
 
@@ -248,6 +263,23 @@ mod tests {
         let db_high = magnitude_db(&band, 10000.0);
         assert!(db_low < -10.0, "high pass should attenuate lows, got {db_low} dB at 50 Hz");
         assert!(db_high.abs() < 1.0, "high pass should pass highs, got {db_high} dB at 10kHz");
+    }
+
+    #[test]
+    fn notch_attenuates_at_center_and_passes_away() {
+        let band = Band {
+            frequency: 1000.0,
+            gain_db: 0.0,
+            q: 5.0,
+            filter_type: FilterType::Notch,
+            enabled: true,
+        };
+        let db_center = magnitude_db(&band, 1000.0);
+        let db_low = magnitude_db(&band, 100.0);
+        let db_high = magnitude_db(&band, 10000.0);
+        assert!(db_center < -30.0, "notch should attenuate at center, got {db_center} dB");
+        assert!(db_low.abs() < 0.5, "notch should be flat far below, got {db_low} dB at 100 Hz");
+        assert!(db_high.abs() < 0.5, "notch should be flat far above, got {db_high} dB at 10kHz");
     }
 
     #[test]

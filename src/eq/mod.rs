@@ -3,6 +3,7 @@ mod controls;
 mod graph;
 pub mod model;
 pub mod presets;
+pub mod sonar_import;
 
 use std::rc::Rc;
 
@@ -212,7 +213,25 @@ pub fn build_eq_page(
     // Preset dropdown
     let preset_dropdown = build_preset_dropdown(state.clone(), on_changed.clone(), preset_updating.clone());
     eq_controls_box.append(&preset_dropdown);
-    *preset_dropdown_ref.borrow_mut() = Some(preset_dropdown);
+    *preset_dropdown_ref.borrow_mut() = Some(preset_dropdown.clone());
+
+    // Import from Sonar button — paste a share URL to pull a Sonar preset
+    let import_btn = gtk::Button::builder()
+        .label("Import Sonar")
+        .tooltip_text("Import a preset from a SteelSeries Sonar share URL")
+        .build();
+    {
+        let state = state.clone();
+        let on_changed = on_changed.clone();
+        let preset_dropdown = preset_dropdown.clone();
+        import_btn.connect_clicked(move |btn| {
+            let window = btn
+                .root()
+                .and_then(|r| r.downcast::<gtk::Window>().ok());
+            show_import_dialog(window.as_ref(), state.clone(), on_changed.clone(), preset_dropdown.clone());
+        });
+    }
+    eq_controls_box.append(&import_btn);
 
     top_bar.append(&eq_controls_box);
     *eq_controls_ref.borrow_mut() = Some(eq_controls_box);
@@ -375,4 +394,170 @@ fn update_preset_selection(dropdown: &gtk::DropDown, preset_name: Option<&str>) 
     if n > 0 {
         dropdown.set_selected(n - 1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Import from Sonar share URL
+// ---------------------------------------------------------------------------
+
+fn show_import_dialog(
+    parent: Option<&gtk::Window>,
+    state: SharedEqState,
+    on_changed: Rc<dyn Fn()>,
+    preset_dropdown: gtk::DropDown,
+) {
+    let dialog = adw::Window::builder()
+        .title("Import from SteelSeries Sonar")
+        .modal(true)
+        .resizable(false)
+        .default_width(480)
+        .build();
+    if let Some(p) = parent {
+        dialog.set_transient_for(Some(p));
+    }
+
+    let root = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(0)
+        .build();
+
+    let header = adw::HeaderBar::new();
+    root.append(&header);
+
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(16)
+        .margin_bottom(16)
+        .margin_start(16)
+        .margin_end(16)
+        .build();
+
+    let hint = gtk::Label::builder()
+        .label("Paste a Sonar share URL (steelseries.com/deeplink/...) or a community-configs CDN link.")
+        .wrap(true)
+        .xalign(0.0)
+        .build();
+    hint.add_css_class("dim-label");
+    body.append(&hint);
+
+    let entry = gtk::Entry::builder()
+        .placeholder_text("https://www.steelseries.com/deeplink/gg/sonar/config/v1/import?url=...")
+        .hexpand(true)
+        .build();
+    body.append(&entry);
+
+    let status = gtk::Label::builder()
+        .label("")
+        .wrap(true)
+        .xalign(0.0)
+        .visible(false)
+        .build();
+    body.append(&status);
+
+    let button_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .margin_top(8)
+        .build();
+    let cancel_btn = gtk::Button::with_label("Cancel");
+    let import_btn = gtk::Button::with_label("Import");
+    import_btn.add_css_class("suggested-action");
+    button_row.append(&cancel_btn);
+    button_row.append(&import_btn);
+    body.append(&button_row);
+
+    root.append(&body);
+    dialog.set_content(Some(&root));
+
+    {
+        let dialog = dialog.clone();
+        cancel_btn.connect_clicked(move |_| dialog.close());
+    }
+
+    {
+        let dialog = dialog.clone();
+        let entry = entry.clone();
+        let status = status.clone();
+        let import_btn_inner = import_btn.clone();
+        let cancel_btn = cancel_btn.clone();
+        let state = state.clone();
+        let on_changed = on_changed.clone();
+        let preset_dropdown = preset_dropdown.clone();
+        import_btn.connect_clicked(move |_| {
+            let url = entry.text().to_string();
+            if url.trim().is_empty() {
+                status.set_label("Please paste a URL.");
+                status.set_visible(true);
+                return;
+            }
+
+            entry.set_sensitive(false);
+            import_btn_inner.set_sensitive(false);
+            cancel_btn.set_sensitive(false);
+            status.set_label("Fetching preset...");
+            status.set_visible(true);
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("sonar-import".into())
+                .spawn(move || {
+                    let _ = tx.send(sonar_import::import_from_url(&url));
+                })
+                .expect("spawn sonar-import thread");
+
+            let dialog = dialog.clone();
+            let entry = entry.clone();
+            let import_btn = import_btn_inner.clone();
+            let cancel_btn = cancel_btn.clone();
+            let status = status.clone();
+            let state = state.clone();
+            let on_changed = on_changed.clone();
+            let preset_dropdown = preset_dropdown.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                match rx.try_recv() {
+                    Ok(result) => {
+                        match result {
+                            Ok(preset) => {
+                                presets::save_custom_preset(&preset.name, &preset.bands);
+                                {
+                                    let mut st = state.borrow_mut();
+                                    let sink_eq = st.active_sink_eq_mut();
+                                    sink_eq.bands = preset.bands;
+                                    sink_eq.preset_name = Some(preset.name.clone());
+                                }
+                                if let Some(model) = preset_dropdown
+                                    .model()
+                                    .and_downcast::<gtk::StringList>()
+                                {
+                                    refresh_preset_list(&model);
+                                    update_preset_selection(&preset_dropdown, Some(&preset.name));
+                                }
+                                on_changed();
+                                dialog.close();
+                            }
+                            Err(e) => {
+                                status.set_label(&format!("Import failed: {e}"));
+                                entry.set_sensitive(true);
+                                import_btn.set_sensitive(true);
+                                cancel_btn.set_sensitive(true);
+                            }
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        status.set_label("Import failed: worker disconnected");
+                        entry.set_sensitive(true);
+                        import_btn.set_sensitive(true);
+                        cancel_btn.set_sensitive(true);
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        });
+    }
+
+    dialog.present();
 }

@@ -221,6 +221,7 @@ fn effective_label(band: &Band) -> &'static str {
             FilterType::HighShelf => "bq_highshelf",
             FilterType::LowPass => "bq_lowpass",
             FilterType::HighPass => "bq_highpass",
+            FilterType::Notch => "bq_notch",
         }
     }
 }
@@ -492,7 +493,7 @@ impl PwCliSession {
                 entries.push(' ');
             }
             let label = effective_label(band);
-            if label == "bq_lowpass" || label == "bq_highpass" {
+            if label == "bq_lowpass" || label == "bq_highpass" || label == "bq_notch" {
                 entries.push_str(&format!(
                     "\"eq{i}:Freq\" {freq:.1} \"eq{i}:Q\" {q:.2}"
                 ));
@@ -645,6 +646,7 @@ fn build_filter_chain_cmd(
                 FilterType::HighShelf => "bq_highshelf",
                 FilterType::LowPass => "bq_lowpass",
                 FilterType::HighPass => "bq_highpass",
+                FilterType::Notch => "bq_notch",
             };
             let control = if band.filter_type.uses_gain() {
                 format!(
