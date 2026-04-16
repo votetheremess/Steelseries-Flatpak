@@ -321,7 +321,7 @@ pub fn build_eq_page(
     // Spatial audio panel — hidden on Chat/Mic tabs
     let (spatial_panel, spatial_refresh) =
         build_spatial_panel(state.clone(), on_spatial_changed.clone());
-    spatial_panel.set_margin_top(10);
+    spatial_panel.set_margin_top(6);
     {
         let s = state.borrow();
         spatial_panel.set_visible(s.active_target.supports_spatial());
@@ -748,9 +748,16 @@ fn show_edit_dialog(
     if is_built_in {
         delete_btn.set_tooltip_text(Some("Built-in presets can't be deleted"));
     }
+    let save_btn = gtk::Button::with_label("Save");
+    save_btn.add_css_class("suggested-action");
+    save_btn.set_sensitive(!is_built_in);
+    if is_built_in {
+        save_btn.set_tooltip_text(Some("Built-in presets can't be renamed"));
+    }
     button_row.append(&cancel_btn);
     button_row.append(&reset_btn);
     button_row.append(&delete_btn);
+    button_row.append(&save_btn);
     body.append(&button_row);
 
     root.append(&body);
@@ -801,15 +808,33 @@ fn show_edit_dialog(
 
     {
         let dialog = dialog.clone();
-        let commit_rename = commit_rename.clone();
-        let on_changed = on_changed.clone();
         cancel_btn.connect_clicked(move |_| {
-            // Cancel still commits any pending rename — user typed it
-            if commit_rename().is_ok() {
-                on_changed();
-            }
+            // Cancel discards any unsaved name change — explicit Save commits.
             dialog.close();
         });
+    }
+
+    // Save: commits the rename if non-empty/valid; on failure stays open with
+    // the status label showing the error.
+    let save_action: Rc<dyn Fn()> = {
+        let dialog = dialog.clone();
+        let commit_rename = commit_rename.clone();
+        let on_changed = on_changed.clone();
+        Rc::new(move || {
+            if commit_rename().is_ok() {
+                on_changed();
+                dialog.close();
+            }
+        })
+    };
+    {
+        let save_action = save_action.clone();
+        save_btn.connect_clicked(move |_| save_action());
+    }
+    // Pressing Enter in the name entry triggers Save too.
+    {
+        let save_action = save_action.clone();
+        name_entry.connect_activate(move |_| save_action());
     }
 
     {
@@ -905,25 +930,35 @@ fn build_spatial_panel(
         .build();
 
     // Dry/Wet mix slider. Lets the user dial back HeSuVi's room reverb
-    // without disabling spatial entirely.
-    let mix_label = gtk::Label::builder()
-        .label("Dry")
-        .build();
-    mix_label.add_css_class("caption");
-    mix_label.add_css_class("dim-label");
-    let mix_label_wet = gtk::Label::builder()
-        .label("Wet")
-        .build();
-    mix_label_wet.add_css_class("caption");
-    mix_label_wet.add_css_class("dim-label");
+    // without disabling spatial entirely. Labels use default text color
+    // (no dim-label / caption) so they match the dropdown's typography.
+    let mix_label = gtk::Label::builder().label("Dry").build();
+    let mix_label_wet = gtk::Label::builder().label("Wet").build();
     let mix_scale = gtk::Scale::builder()
         .orientation(gtk::Orientation::Horizontal)
         .draw_value(false)
-        .hexpand(true)
+        .width_request(180)
+        .hexpand(false)
         .tooltip_text("Blend between unprocessed stereo (Dry) and full HeSuVi processing (Wet)")
         .build();
     mix_scale.set_range(WET_MIN, WET_MAX);
     mix_scale.set_increments(0.02, 0.10);
+
+    // Wrap [Dry, slider, Wet] in a rounded pill matching other inline boxes
+    // in the app (border-radius + subtle background tint).
+    let mix_pill = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .valign(gtk::Align::Center)
+        .build();
+    mix_pill.add_css_class("spatial-mix-pill");
+    mix_pill.append(&mix_label);
+    mix_pill.append(&mix_scale);
+    mix_pill.append(&mix_label_wet);
+
+    // Spacer that consumes the remaining horizontal slack so the enable
+    // switch sits flush against the right edge while the pill stays left.
+    let spacer = gtk::Box::builder().hexpand(true).build();
 
     let enable_switch = gtk::Switch::builder()
         .valign(gtk::Align::Center)
@@ -942,9 +977,8 @@ fn build_spatial_panel(
 
     panel.append(&title);
     panel.append(&profile_dropdown);
-    panel.append(&mix_label);
-    panel.append(&mix_scale);
-    panel.append(&mix_label_wet);
+    panel.append(&mix_pill);
+    panel.append(&spacer);
     panel.append(&enable_switch);
 
     // Initial sync from state

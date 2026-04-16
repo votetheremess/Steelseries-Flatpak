@@ -110,6 +110,9 @@ impl ChatMixWindow {
              .eq-filter-dropdown > button { font-size: 75%; min-height: 0; padding-top: 4px; padding-bottom: 4px; } \
              .eq-floating-panel { background-color: alpha(@window_bg_color, 0.92); border-radius: 8px; \
                padding: 8px 12px; margin-top: 4px; margin-bottom: 4px; border: 1px solid alpha(white, 0.12); } \
+             .spatial-mix-pill { background-color: alpha(currentColor, 0.1); border-radius: 8px; \
+               padding: 4px 12px; min-height: 30px; } \
+             .spatial-mix-pill label { font-weight: bold; } \
              .eq-enable-switch { min-width: 36px; min-height: 18px; } \
              .mixer-channel { background-color: alpha(@window_bg_color, 0.92); border-radius: 8px; \
                padding: 8px 6px; border: 1px solid alpha(white, 0.12); } \
