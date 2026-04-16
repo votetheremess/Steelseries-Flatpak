@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use base64::Engine;
-use serde::Deserialize;
+use serde_json::Value;
 
 use super::model::{Band, FilterType, NUM_BANDS, FREQ_MIN, FREQ_MAX, GAIN_MIN, GAIN_MAX, Q_MIN, Q_MAX};
 
@@ -36,15 +36,60 @@ pub fn import_from_url(url: &str) -> Result<ImportedPreset, String> {
 /// Parse a Sonar preset JSON (as stored in the `configs.data` DB column or
 /// returned by the CDN) into our Band model. Exposed for tests and for
 /// loading files produced by `tools/dump-sonar-presets.ps1`.
+///
+/// Sonar ships several wrapping shapes:
+///   - CDN shared preset: `{ "data": { "data": { "parametricEQ": ... } }, "metadata": { "name": ... } }`
+///   - Direct DB row: `{ "parametricEQ": ..., "name": ... }`
+///   - Some CDN variants: `{ "data": { "parametricEQ": ... }, "name": ... }`
+///
+/// We walk the tree generically rather than hard-coding a path, so shape drift
+/// doesn't break us.
 pub fn parse_sonar_json(json: &str) -> Result<ImportedPreset, String> {
-    let doc: SonarDoc = serde_json::from_str(json)
+    let root: Value = serde_json::from_str(json)
         .map_err(|e| format!("Sonar JSON parse failed: {e}"))?;
-    let name = doc.name.unwrap_or_else(|| "Imported".to_string());
-    let Some(eq) = doc.parametric_eq.or(doc.data.and_then(|d| d.parametric_eq)) else {
-        return Err("Sonar JSON has no parametricEQ block".into());
-    };
-    let bands = bands_from_sonar(&eq)?;
+
+    let eq = find_parametric_eq(&root)
+        .ok_or("Sonar JSON has no parametricEQ block")?;
+    let bands = bands_from_value(eq)?;
+    let name = find_preset_name(&root).unwrap_or_else(|| "Imported".to_string());
     Ok(ImportedPreset { name, bands })
+}
+
+/// Depth-first search for the first object under a `"parametricEQ"` key.
+fn find_parametric_eq(value: &Value) -> Option<&Value> {
+    match value {
+        Value::Object(map) => {
+            if let Some(v) = map.get("parametricEQ") {
+                if v.is_object() {
+                    return Some(v);
+                }
+            }
+            for (_, v) in map {
+                if let Some(found) = find_parametric_eq(v) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(find_parametric_eq),
+        _ => None,
+    }
+}
+
+/// Sonar's user-visible name lives in different places depending on the wrap:
+///   - CDN shared: `metadata.name` (what the sharer typed)
+///   - DB row:     top-level `name`
+/// Prefer `metadata.name` if present, fall back to any top-level `name`.
+fn find_preset_name(value: &Value) -> Option<String> {
+    if let Some(md) = value.get("metadata")
+        && let Some(Value::String(s)) = md.get("name")
+    {
+        return Some(s.clone());
+    }
+    if let Some(Value::String(s)) = value.get("name") {
+        return Some(s.clone());
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -111,84 +156,41 @@ fn http_get(url: &str) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
-// JSON model
+// JSON walking
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct SonarDoc {
-    name: Option<String>,
-    /// The CDN sometimes serves the config object directly, sometimes wrapped
-    /// in `{ "data": { ... } }` (the shape stored in the DB's `configs.data`
-    /// column). Accept both.
-    #[serde(rename = "parametricEQ")]
-    parametric_eq: Option<SonarParametricEq>,
-    data: Option<SonarDataWrapper>,
-}
-
-#[derive(Deserialize)]
-struct SonarDataWrapper {
-    #[serde(rename = "parametricEQ")]
-    parametric_eq: Option<SonarParametricEq>,
-}
-
-#[derive(Deserialize)]
-struct SonarParametricEq {
-    #[serde(default)]
-    filter1: Option<SonarFilter>,
-    #[serde(default)]
-    filter2: Option<SonarFilter>,
-    #[serde(default)]
-    filter3: Option<SonarFilter>,
-    #[serde(default)]
-    filter4: Option<SonarFilter>,
-    #[serde(default)]
-    filter5: Option<SonarFilter>,
-    #[serde(default)]
-    filter6: Option<SonarFilter>,
-    #[serde(default)]
-    filter7: Option<SonarFilter>,
-    #[serde(default)]
-    filter8: Option<SonarFilter>,
-    #[serde(default)]
-    filter9: Option<SonarFilter>,
-    #[serde(default)]
-    filter10: Option<SonarFilter>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SonarFilter {
-    enabled: Option<bool>,
-    frequency: Option<f64>,
-    gain: Option<f64>,
-    q_factor: Option<f64>,
-    #[serde(rename = "type")]
-    filter_type: Option<String>,
-}
-
-fn bands_from_sonar(eq: &SonarParametricEq) -> Result<[Band; NUM_BANDS], String> {
-    let filters = [
-        &eq.filter1, &eq.filter2, &eq.filter3, &eq.filter4, &eq.filter5,
-        &eq.filter6, &eq.filter7, &eq.filter8, &eq.filter9, &eq.filter10,
-    ];
+fn bands_from_value(eq: &Value) -> Result<[Band; NUM_BANDS], String> {
     let mut bands = super::model::default_bands();
-    for (i, slot) in filters.iter().enumerate() {
-        if let Some(f) = slot {
-            bands[i] = band_from_sonar(f, bands[i].frequency)?;
+    for i in 0..NUM_BANDS {
+        let key = format!("filter{}", i + 1);
+        if let Some(filter) = eq.get(&key) {
+            bands[i] = band_from_value(filter, bands[i].frequency)?;
         }
     }
     Ok(bands)
 }
 
-fn band_from_sonar(f: &SonarFilter, default_freq: f64) -> Result<Band, String> {
-    let filter_type = match f.filter_type.as_deref() {
+fn band_from_value(f: &Value, default_freq: f64) -> Result<Band, String> {
+    let filter_type = match f.get("type").and_then(|v| v.as_str()) {
         Some(s) => parse_filter_type(s)?,
         None => FilterType::Peaking,
     };
-    let frequency = f.frequency.unwrap_or(default_freq).clamp(FREQ_MIN, FREQ_MAX);
-    let gain_db = f.gain.unwrap_or(0.0).clamp(GAIN_MIN, GAIN_MAX);
-    let q = f.q_factor.unwrap_or(1.0).clamp(Q_MIN, Q_MAX);
-    let enabled = f.enabled.unwrap_or(true);
+    let frequency = f
+        .get("frequency")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(default_freq)
+        .clamp(FREQ_MIN, FREQ_MAX);
+    let gain_db = f
+        .get("gain")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+        .clamp(GAIN_MIN, GAIN_MAX);
+    let q = f
+        .get("qFactor")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0)
+        .clamp(Q_MIN, Q_MAX);
+    let enabled = f.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
     Ok(Band { frequency, gain_db, q, filter_type, enabled })
 }
 
@@ -255,6 +257,35 @@ mod tests {
         assert_eq!(preset.name, "Wrapped");
         assert_eq!(preset.bands[0].frequency, 100.0);
         assert_eq!(preset.bands[0].gain_db, 3.0);
+    }
+
+    #[test]
+    fn accepts_cdn_double_wrapped_shape() {
+        // Real shape returned by community-configs.steelseriescdn.com/v1/<uuid>
+        let cdn = r#"{
+            "data": {
+                "data": {
+                    "parametricEQ": {
+                        "enabled": true,
+                        "filter1": {"enabled": true, "qFactor": 0.7, "frequency": 80.0, "gain": 1.8, "type": "lowShelving"},
+                        "filter4": {"enabled": true, "qFactor": 1.0, "frequency": 1750.0, "gain": 3.5, "type": "peakingEQ"}
+                    },
+                    "virtualSurroundState": true
+                },
+                "schemaVersion": 5,
+                "virtualAudioDevice": "game"
+            },
+            "metadata": {
+                "name": "Arc Raiders",
+                "author": "OutcastCrow#4441"
+            }
+        }"#;
+        let preset = parse_sonar_json(cdn).unwrap();
+        assert_eq!(preset.name, "Arc Raiders");
+        assert_eq!(preset.bands[0].frequency, 80.0);
+        assert_eq!(preset.bands[0].filter_type, FilterType::LowShelf);
+        assert_eq!(preset.bands[3].frequency, 1750.0);
+        assert_eq!(preset.bands[3].gain_db, 3.5);
     }
 
     #[test]

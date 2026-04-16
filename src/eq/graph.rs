@@ -364,7 +364,6 @@ impl EqGraph {
                     if band.filter_type.uses_gain() {
                         band.gain_db = new_gain;
                     }
-                    st.active_sink_eq_mut().preset_name = None;
                     drop(st);
 
                     on_changed();
@@ -425,7 +424,6 @@ impl EqGraph {
                 let band = &mut st.active_sink_eq_mut().bands[idx];
                 let factor = 1.15_f64.powf(-dy);
                 band.q = (band.q * factor).clamp(Q_MIN, Q_MAX);
-                st.active_sink_eq_mut().preset_name = None;
                 drop(st);
 
                 on_changed();

@@ -5,7 +5,7 @@ use adw::prelude::*;
 
 use crate::audio::{persistence, sinks};
 use crate::autostart;
-use crate::eq::model::{Band, EqTarget, NUM_BANDS};
+use crate::eq::model::{Band, EqTarget, SpatialState, NUM_BANDS};
 use crate::hid::protocol::NoiseMode;
 use crate::mixer::MixerWidgets;
 
@@ -41,6 +41,7 @@ impl ChatMixWindow {
     pub fn new(
         app: &adw::Application,
         on_eq_apply: Option<Rc<dyn Fn(EqTarget, [Band; NUM_BANDS])>>,
+        on_spatial_apply: Option<Rc<dyn Fn(EqTarget, SpatialState)>>,
         on_reroute: Option<Rc<dyn Fn(&str, &str)>>,
         on_mic_reroute: Option<Rc<dyn Fn(&str)>>,
         headset_sink: Option<String>,
@@ -76,7 +77,7 @@ impl ChatMixWindow {
         let (dashboard_page, mut widgets) = build_dashboard_page();
         stack.add_named(&dashboard_page, Some("home"));
         let (eq_page, mixer_widgets) = crate::eq::build_eq_page(
-            on_eq_apply, on_reroute, on_mic_reroute, headset_sink,
+            on_eq_apply, on_spatial_apply, on_reroute, on_mic_reroute, headset_sink,
         );
         widgets.mixer = mixer_widgets;
         stack.add_named(&eq_page, Some("eq"));

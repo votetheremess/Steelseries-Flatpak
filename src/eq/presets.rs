@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use super::model::{Band, FilterType, SinkEq, EqTarget, NUM_BANDS};
+use super::model::{Band, FilterType, SinkEq, SpatialState, EqTarget, NUM_BANDS};
+use super::spatial;
 
 fn config_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -250,10 +251,11 @@ pub fn save_eq_state(sinks: &std::collections::HashMap<EqTarget, SinkEq>) {
                 .as_deref()
                 .unwrap_or("custom");
             content.push_str(&format!(
-                "{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\n",
                 target.sink_name(),
                 preset_or_custom,
                 inline_bands(&sink_eq.bands),
+                spatial::serialize(&sink_eq.spatial),
             ));
         }
     }
@@ -268,13 +270,15 @@ pub fn load_eq_state() -> std::collections::HashMap<EqTarget, SinkEq> {
     let Ok(text) = fs::read_to_string(&path) else { return result };
 
     for line in text.lines() {
-        let parts: Vec<&str> = line.splitn(3, '\t').collect();
+        let parts: Vec<&str> = line.splitn(4, '\t').collect();
         if parts.len() < 3 {
             continue;
         }
         let sink_name = parts[0];
         let preset_name_str = parts[1];
         let band_data = parts[2];
+        // 4th field (spatial blob) is optional — older state files won't have it.
+        let spatial_blob = parts.get(3).copied().unwrap_or("");
 
         let target = EqTarget::ALL
             .iter()
@@ -293,7 +297,13 @@ pub fn load_eq_state() -> std::collections::HashMap<EqTarget, SinkEq> {
             Some(preset_name_str.to_string())
         };
 
-        result.insert(target, SinkEq { bands, preset_name });
+        let spatial = if spatial_blob.is_empty() {
+            SpatialState::default()
+        } else {
+            spatial::parse(spatial_blob)
+        };
+
+        result.insert(target, SinkEq { bands, preset_name, spatial });
     }
 
     result

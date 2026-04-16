@@ -4,7 +4,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::pango;
 
-use crate::audio::sinks;
+use crate::audio::{persistence, router, sinks};
 
 pub struct MixerWidgets {
     pub updating: Rc<Cell<bool>>,
@@ -284,6 +284,8 @@ fn popup_label_factory() -> gtk::SignalListItemFactory {
 }
 
 /// Build device dropdown for an output sink, populated with physical sinks.
+/// Pre-selects the currently-routed device (from saved mixer routing, or the
+/// headset sink if none saved).
 fn build_sink_dropdown(
     sink_name: &str,
     headset_sink: Option<&str>,
@@ -299,10 +301,16 @@ fn build_sink_dropdown(
         .build();
     dropdown.add_css_class("mixer-device-dropdown");
 
-    // Select the headset sink by default
-    if let Some(hs) = headset_sink {
+    // Pre-select whatever device is actually routed for this sink.
+    // Mirrors the init logic in AudioRouter::create so the UI reflects reality.
+    let routing = persistence::load_mixer_routing();
+    let current = routing
+        .get(sink_name)
+        .cloned()
+        .or_else(|| headset_sink.map(|s| s.to_string()));
+    if let Some(ref target) = current {
         for (i, (name, _)) in devices.iter().enumerate() {
-            if name == hs {
+            if name == target {
                 dropdown.set_selected(i as u32);
                 break;
             }
@@ -330,6 +338,7 @@ fn build_sink_dropdown(
 
 /// Build device dropdown for the mic, populated with physical sources.
 /// Re-queries the source list on click so devices that come online after app startup appear.
+/// Pre-selects whichever source is actually linked to SteelSeries_Mic right now.
 fn build_source_dropdown(
     _headset_sink: Option<&str>,
     on_mic_reroute: Option<Rc<dyn Fn(&str)>>,
@@ -349,6 +358,23 @@ fn build_source_dropdown(
         .list_factory(&popup_label_factory())
         .build();
     dropdown.add_css_class("mixer-device-dropdown");
+
+    // Pre-select the currently-linked mic. Mirror AudioRouter::create's logic:
+    // saved routing wins, otherwise fall back to the headset mic.
+    let current_mic = persistence::load_mixer_routing()
+        .get("mic")
+        .cloned()
+        .or_else(|| router::find_headset_source().ok());
+    if let Some(ref target) = current_mic {
+        updating.set(true);
+        for (i, (name, _)) in devices.borrow().iter().enumerate() {
+            if name == target {
+                dropdown.set_selected(i as u32);
+                break;
+            }
+        }
+        updating.set(false);
+    }
 
     // Refresh on press (Capture phase fires before the popup opens)
     {

@@ -36,7 +36,6 @@ pub fn build_floating_panel(
             let mut st = state.borrow_mut();
             if let Some(band) = st.selected_band_mut() {
                 band.frequency = (band.frequency * 1.005_f64.powf(dx)).clamp(FREQ_MIN, FREQ_MAX);
-                st.active_sink_eq_mut().preset_name = None;
             }
         }
     });
@@ -48,7 +47,6 @@ pub fn build_floating_panel(
             let mut st = state.borrow_mut();
             if let Some(band) = st.selected_band_mut() {
                 band.gain_db = (band.gain_db + dx * 0.05).clamp(GAIN_MIN, GAIN_MAX);
-                st.active_sink_eq_mut().preset_name = None;
             }
         }
     });
@@ -60,7 +58,6 @@ pub fn build_floating_panel(
             let mut st = state.borrow_mut();
             if let Some(band) = st.selected_band_mut() {
                 band.q = (band.q * 1.01_f64.powf(dx)).clamp(Q_MIN, Q_MAX);
-                st.active_sink_eq_mut().preset_name = None;
             }
         }
     });
@@ -83,8 +80,7 @@ pub fn build_floating_panel(
                 let mut st = state.borrow_mut();
                 if let Some(band) = st.selected_band_mut() {
                     band.frequency = val.clamp(FREQ_MIN, FREQ_MAX);
-                    st.active_sink_eq_mut().preset_name = None;
-                }
+                    }
             }
         },
     );
@@ -97,8 +93,7 @@ pub fn build_floating_panel(
                 let mut st = state.borrow_mut();
                 if let Some(band) = st.selected_band_mut() {
                     band.gain_db = val.clamp(GAIN_MIN, GAIN_MAX);
-                    st.active_sink_eq_mut().preset_name = None;
-                }
+                    }
             }
         },
     );
@@ -111,8 +106,7 @@ pub fn build_floating_panel(
                 let mut st = state.borrow_mut();
                 if let Some(band) = st.selected_band_mut() {
                     band.q = val.clamp(Q_MIN, Q_MAX);
-                    st.active_sink_eq_mut().preset_name = None;
-                }
+                    }
             }
         },
     );
@@ -140,8 +134,7 @@ pub fn build_floating_panel(
                 if let Some(band) = st.selected_band_mut() {
                     band.filter_type = ft;
                     gain_entry_ref.set_sensitive(ft.uses_gain());
-                    st.active_sink_eq_mut().preset_name = None;
-                }
+                    }
                 drop(st);
                 on_changed();
             }
@@ -164,7 +157,6 @@ pub fn build_floating_panel(
             let mut st = state.borrow_mut();
             if let Some(band) = st.selected_band_mut() {
                 band.enabled = active;
-                st.active_sink_eq_mut().preset_name = None;
             }
             drop(st);
             on_changed();

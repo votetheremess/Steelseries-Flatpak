@@ -151,12 +151,90 @@ impl EqTarget {
             EqTarget::Mic => "SteelSeries_Mic",
         }
     }
+
+    pub fn supports_spatial(self) -> bool {
+        matches!(self, EqTarget::Game | EqTarget::Music | EqTarget::Aux)
+    }
+}
+
+/// Which HeSuVi HRIR file drives the spatial audio stage. Each profile is a
+/// different "virtual room + speaker layout" recipe — the IR does all the
+/// heavy lifting. User picks via a dropdown in the spatial panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpatialProfile {
+    /// SteelSeries GameDAC style — closest to what Sonar produces.
+    #[default]
+    Gsx,
+    /// Dolby Headphone Room 2 — most popular neutral all-rounder.
+    Dh2,
+    /// DTS Headphone:X style — tighter, drier, FPS-tuned.
+    DtsHpx,
+}
+
+impl SpatialProfile {
+    pub const ALL: &[SpatialProfile] = &[
+        SpatialProfile::Gsx,
+        SpatialProfile::Dh2,
+        SpatialProfile::DtsHpx,
+    ];
+
+    /// Persistence key — stable across releases. Never change these strings.
+    pub fn key(self) -> &'static str {
+        match self {
+            SpatialProfile::Gsx => "gsx",
+            SpatialProfile::Dh2 => "dh2",
+            SpatialProfile::DtsHpx => "dts",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<SpatialProfile> {
+        match s {
+            "gsx" => Some(SpatialProfile::Gsx),
+            "dh2" => Some(SpatialProfile::Dh2),
+            "dts" => Some(SpatialProfile::DtsHpx),
+            _ => None,
+        }
+    }
+
+    /// Label shown in the dropdown.
+    pub fn display_label(self) -> &'static str {
+        match self {
+            SpatialProfile::Gsx => "GSX (SteelSeries GameDAC: Native)",
+            SpatialProfile::Dh2 => "DH2 (Dolby Headphone: Immersive)",
+            SpatialProfile::DtsHpx => "DTS (Competitive FPS: Performance)",
+        }
+    }
+}
+
+pub const WET_MIN: f64 = 0.0;
+pub const WET_MAX: f64 = 1.0;
+pub const WET_DEFAULT: f64 = 0.7;
+
+/// Gaming-focused spatial audio state. `enabled` toggles the HRIR-convolution
+/// graph; `profile` picks the HeSuVi IR file; `wet_mix` blends between dry
+/// pass-through (0.0) and full HRIR processing (1.0).
+#[derive(Debug, Clone, Copy)]
+pub struct SpatialState {
+    pub enabled: bool,
+    pub profile: SpatialProfile,
+    pub wet_mix: f64,
+}
+
+impl Default for SpatialState {
+    fn default() -> Self {
+        SpatialState {
+            enabled: false,
+            profile: SpatialProfile::default(),
+            wet_mix: WET_DEFAULT,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct SinkEq {
     pub bands: [Band; NUM_BANDS],
     pub preset_name: Option<String>,
+    pub spatial: SpatialState,
 }
 
 impl SinkEq {
@@ -164,6 +242,7 @@ impl SinkEq {
         SinkEq {
             bands: default_bands(),
             preset_name: Some("Flat".to_string()),
+            spatial: SpatialState::default(),
         }
     }
 }

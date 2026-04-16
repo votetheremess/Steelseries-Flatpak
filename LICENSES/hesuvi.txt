@@ -1,0 +1,39 @@
+HeSuVi HRIR Files
+=================
+
+Files:
+  data/hrtf/gsx.wav       (from HeSuVi's hrir/gsx.wav)
+  data/hrtf/dh2.wav       (from HeSuVi's hrir/dh++.wav)
+  data/hrtf/dts-hpx.wav   (from HeSuVi's hrir/dtshx.wav)
+
+All three are 14-channel 48 kHz IEEE-float WAV impulse-response files
+extracted from HeSuVi 2.0.0.1 (SourceForge installer, 27 MB).
+
+Source project:
+  HeSuVi — Headphone Surround Virtualization
+  Author: jaakkopasanen (Jaakko Pasanen)
+  Homepage: https://sourceforge.net/projects/hesuvi/
+
+License:
+  HeSuVi is distributed as an open-source project. Its HRIR files are
+  redistributions of measured, recorded, or reverse-engineered impulse
+  responses. Individual IRs have various provenances (community contributions,
+  reverse-engineering of commercial virtual-surround implementations,
+  direct measurements of hardware). No unified license statement is
+  provided with the installer; redistribution follows the community
+  convention established by HeSuVi itself.
+
+Attribution:
+  - gsx.wav: approximation of the SteelSeries GameDAC / Sennheiser GSX
+    headphone virtualization.
+  - dh++.wav ("DH2"): approximation of Dolby Headphone Room 2.
+  - dtshx.wav: approximation of DTS Headphone:X.
+
+  These are NOT bit-exact copies of the commercial products they reference;
+  they are approximations produced by HeSuVi's community. The "GSX", "Dolby",
+  and "DTS" names are trademarks of their respective owners and are used here
+  only to identify which headphone-surround flavor each IR is meant to sound
+  like, for the end user's benefit.
+
+If you redistribute this application or modifications thereof, preserve this
+attribution note alongside the three .wav files.
