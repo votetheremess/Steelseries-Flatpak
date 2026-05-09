@@ -286,3 +286,134 @@ mod matcher_tests {
         assert!(match_game(42, "firefox", "firefox", &env).is_none());
     }
 }
+
+/// Output event from the detector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetectorEvent {
+    GameStarted(DetectedGame),
+    GameStopped { pid: u32 },
+}
+
+/// Stateful detector — call `tick` every 2 seconds with the current process snapshot;
+/// returns events.
+pub struct GameDetector {
+    /// Maps PID → consecutive scans seen.
+    seen: std::collections::HashMap<u32, (DetectedGame, u32)>,
+    /// Maps PID → consecutive scans missed.
+    pending_remove: std::collections::HashMap<u32, u32>,
+    /// PIDs we've already announced as started.
+    announced: std::collections::HashSet<u32>,
+}
+
+impl GameDetector {
+    pub fn new() -> Self {
+        Self {
+            seen: Default::default(),
+            pending_remove: Default::default(),
+            announced: Default::default(),
+        }
+    }
+
+    /// Process a snapshot of currently-detected games. Returns events for any
+    /// state transitions (new games announced after 2 consecutive scans; removals
+    /// announced after 2 consecutive misses).
+    pub fn tick(&mut self, current: &[DetectedGame]) -> Vec<DetectorEvent> {
+        let mut events = Vec::new();
+        let current_pids: std::collections::HashSet<u32> =
+            current.iter().map(|g| g.pid).collect();
+
+        // Bump persistence count for each currently-visible game.
+        for game in current {
+            let entry = self.seen.entry(game.pid).or_insert((game.clone(), 0));
+            entry.1 += 1;
+            if entry.1 >= 2 && !self.announced.contains(&game.pid) {
+                events.push(DetectorEvent::GameStarted(game.clone()));
+                self.announced.insert(game.pid);
+            }
+            self.pending_remove.remove(&game.pid);
+        }
+
+        // Bump miss count for any seen but absent.
+        let absent: Vec<u32> = self
+            .seen
+            .keys()
+            .copied()
+            .filter(|p| !current_pids.contains(p))
+            .collect();
+        for pid in &absent {
+            let count = self.pending_remove.entry(*pid).or_insert(0);
+            *count += 1;
+            if *count >= 2 {
+                if self.announced.remove(pid) {
+                    events.push(DetectorEvent::GameStopped { pid: *pid });
+                }
+                self.seen.remove(pid);
+                self.pending_remove.remove(pid);
+            }
+        }
+
+        events
+    }
+}
+
+impl Default for GameDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod detector_tests {
+    use super::*;
+
+    fn g(pid: u32) -> DetectedGame {
+        DetectedGame {
+            pid,
+            name: "Test Game".into(),
+        }
+    }
+
+    #[test]
+    fn detects_after_two_consecutive_scans() {
+        let mut d = GameDetector::new();
+        assert!(d.tick(&[g(42)]).is_empty(), "first scan should not fire");
+        let evts = d.tick(&[g(42)]);
+        assert_eq!(evts.len(), 1);
+        assert!(matches!(evts[0], DetectorEvent::GameStarted(_)));
+    }
+
+    #[test]
+    fn does_not_double_fire() {
+        let mut d = GameDetector::new();
+        d.tick(&[g(42)]);
+        d.tick(&[g(42)]);
+        assert!(
+            d.tick(&[g(42)]).is_empty(),
+            "no re-fire on continued presence"
+        );
+    }
+
+    #[test]
+    fn removes_after_two_consecutive_misses() {
+        let mut d = GameDetector::new();
+        d.tick(&[g(42)]);
+        d.tick(&[g(42)]); // armed
+        assert!(d.tick(&[]).is_empty(), "first miss does not fire");
+        let evts = d.tick(&[]);
+        assert_eq!(evts.len(), 1);
+        assert!(matches!(evts[0], DetectorEvent::GameStopped { pid: 42 }));
+    }
+
+    #[test]
+    fn brief_disappearance_does_not_fire_remove() {
+        let mut d = GameDetector::new();
+        d.tick(&[g(42)]);
+        d.tick(&[g(42)]); // armed
+        d.tick(&[]); // miss 1
+        let evts = d.tick(&[g(42)]); // back!
+        assert!(
+            evts.is_empty(),
+            "no event when game returns within debounce window"
+        );
+    }
+}
