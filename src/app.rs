@@ -527,6 +527,22 @@ pub fn run(start_hidden: bool) {
                 app.add_action_entries([pick_storage_action]);
             }
 
+            // app.rebind-clip-hotkey — hotkey rebinder for the clips save
+            // shortcut. Stub for now; full implementation lands in Phase 4
+            // alongside the global-shortcuts portal wiring. Registered so
+            // the Page 3 "Change…" button doesn't fail with an unknown
+            // action.
+            {
+                let rebind_action = gtk::gio::ActionEntry::builder("rebind-clip-hotkey")
+                    .activate(|_app: &adw::Application, _action, _param| {
+                        log::info!(
+                            "app.rebind-clip-hotkey invoked (stub — Phase 4)"
+                        );
+                    })
+                    .build();
+                app.add_action_entries([rebind_action]);
+            }
+
             // GSR-install detection poll. If the user installs GSR via the
             // system app store / a terminal while sitting on Page 1, this
             // timer notices and enables the Next button. The in-app install
