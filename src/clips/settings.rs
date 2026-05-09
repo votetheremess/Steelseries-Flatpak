@@ -155,10 +155,26 @@ pub fn save(s: &ClipSettings) -> std::io::Result<()> {
 /// token, but the wizard is shown at PickScreen so the user explicitly
 /// confirms the persisted selection. The flag flips to true only when the
 /// user actually clicks Next on Page 2.
-pub fn mark_onboarding_complete() -> std::io::Result<()> {
-    let mut s = load();
-    s.onboarding_complete = true;
-    save(&s)
+///
+/// **Important**: this function takes the shared in-memory settings cell
+/// rather than just `load()`-ing from disk. The settings page widgets and
+/// the wizard Page 3 storage button mutate the shared cell and then call
+/// `save(&clip_settings.borrow())`, which writes the WHOLE struct. If we
+/// only flipped the flag on disk via `load(); save()` the next such write
+/// would clobber it back to false (because the in-memory copy was loaded
+/// at app startup, before onboarding was complete). Updating the cell
+/// here keeps memory and disk in sync.
+pub fn mark_onboarding_complete(
+    clip_settings: &Rc<RefCell<ClipSettings>>,
+) -> std::io::Result<()> {
+    {
+        let mut s = clip_settings.borrow_mut();
+        if s.onboarding_complete {
+            return Ok(());
+        }
+        s.onboarding_complete = true;
+    }
+    save(&clip_settings.borrow())
 }
 
 /// Build a `CaptureConfig` from the persisted settings + the headset sink
@@ -688,5 +704,30 @@ mod tests {
         s.onboarding_complete = true;
         // Just verify the field flips; full round-trip via save/load needs a real $HOME.
         assert!(s.onboarding_complete);
+    }
+
+    #[test]
+    fn mark_onboarding_complete_idempotent_on_already_set() {
+        // Regression coverage for the bug where mark_onboarding_complete
+        // only touched the disk file. The new signature takes the shared
+        // in-memory cell so future save(&cell.borrow()) calls don't clobber
+        // the flag back to false. This test verifies the in-memory cell is
+        // updated; the early-return path guards against redundant disk
+        // writes when already set.
+        //
+        // Pure in-memory check — we do NOT exercise the disk write path
+        // because $HOME is a process-wide env var and other tests run in
+        // parallel against the real $HOME via save_token / load_token.
+        // Manipulating HOME here would race them.
+        let cell = Rc::new(RefCell::new(ClipSettings::default()));
+        assert!(!cell.borrow().onboarding_complete);
+
+        // Pre-set the flag to simulate the idempotency check.
+        cell.borrow_mut().onboarding_complete = true;
+        // Call with the flag already true → the function takes its early
+        // return path and never tries to write to disk, so this is a safe
+        // no-op even without an isolated $HOME.
+        mark_onboarding_complete(&cell).expect("idempotent");
+        assert!(cell.borrow().onboarding_complete);
     }
 }

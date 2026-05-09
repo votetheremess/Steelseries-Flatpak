@@ -567,6 +567,7 @@ pub fn run(start_hidden: bool) {
             {
                 let buffer_for_next = buffer.clone();
                 let clips_page = window.clips_page();
+                let clip_settings_for_next = clip_settings.clone();
                 let next_action = gtk::gio::ActionEntry::builder("wizard-next")
                     .activate(move |_app: &adw::Application, _action, _param| {
                         use crate::clips::WizardStep;
@@ -575,10 +576,19 @@ pub fn run(start_hidden: bool) {
                                 clips_page.set_wizard_step(WizardStep::PickScreen);
                             }
                             WizardStep::PickScreen => {
-                                if let Err(e) = crate::clips::settings::mark_onboarding_complete()
-                                {
+                                log::info!(
+                                    "wizard-next: PickScreen → Settings; \
+                                     marking onboarding_complete=true"
+                                );
+                                if let Err(e) = crate::clips::settings::mark_onboarding_complete(
+                                    &clip_settings_for_next,
+                                ) {
                                     log::warn!(
                                         "failed to persist onboarding_complete: {e}"
+                                    );
+                                } else {
+                                    log::info!(
+                                        "wizard-next: onboarding_complete persisted to disk"
                                     );
                                 }
                                 clips_page.set_wizard_step(WizardStep::Settings);
@@ -612,8 +622,13 @@ pub fn run(start_hidden: bool) {
                         let buffer_for_setup = buffer_for_setup.clone();
                         let resources_for_setup = resources_for_setup.clone();
                         glib::spawn_future_local(async move {
+                            log::info!("setup-clips: invoking portal picker");
                             match crate::clips::portal::pick_screencast_source().await {
                                 Ok(token) => {
+                                    log::info!(
+                                        "setup-clips: portal returned token (len={})",
+                                        token.len()
+                                    );
                                     if token.is_empty() {
                                         // Portal succeeded but returned no
                                         // persistent token. Surface as a
@@ -622,8 +637,8 @@ pub fn run(start_hidden: bool) {
                                         // round-trip to "no token" and
                                         // re-trigger the picker anyway).
                                         log::warn!(
-                                            "portal returned empty restore token; \
-                                             treating as try-again"
+                                            "setup-clips: portal returned empty \
+                                             restore token; treating as try-again"
                                         );
                                         clips_page.wizard.screen_picked_label.set_visible(true);
                                         clips_page.wizard.screen_picked_label.set_label(
@@ -637,9 +652,13 @@ pub fn run(start_hidden: bool) {
                                         return;
                                     }
                                     if let Err(e) = crate::clips::portal::save_token(&token) {
-                                        log::warn!("save_token failed: {e}");
+                                        log::warn!("setup-clips: save_token failed: {e}");
                                         return;
                                     }
+                                    log::info!(
+                                        "setup-clips: token saved successfully \
+                                         (will persist across launches)"
+                                    );
                                     // Notify BufferController. Looked up at
                                     // call time so a recreated backend
                                     // handle (future) is picked up.
@@ -655,7 +674,8 @@ pub fn run(start_hidden: bool) {
                                             .on_portal_pick_complete(token, &tx);
                                     } else {
                                         log::warn!(
-                                            "no clip backend available to receive portal pick"
+                                            "setup-clips: no clip backend available to \
+                                             receive portal pick"
                                         );
                                     }
                                     // Update wizard Page 2: hide Pick
@@ -669,7 +689,7 @@ pub fn run(start_hidden: bool) {
                                     clips_page.wizard.show_screen_picked_state();
                                 }
                                 Err(e) => {
-                                    log::warn!("portal pick failed: {e}");
+                                    log::warn!("setup-clips: portal pick failed: {e}");
                                 }
                             }
                         });
@@ -1129,11 +1149,25 @@ pub fn run(start_hidden: bool) {
             //                                       onboarding_complete —
             //                                       wait for user's Next.
             {
-                let clip_settings = crate::clips::settings::load();
+                let resumed_settings = crate::clips::settings::load();
                 let token = crate::clips::portal::load_token();
                 let gsr_ok = crate::clips::gsr_install::is_installed();
 
-                if clip_settings.onboarding_complete && gsr_ok && token.is_some() {
+                log::info!(
+                    "auto-resume: gsr_ok={} token={} onboarding_complete={}",
+                    gsr_ok,
+                    if let Some(ref t) = token {
+                        format!("Some(len={})", t.len())
+                    } else {
+                        "None".to_string()
+                    },
+                    resumed_settings.onboarding_complete
+                );
+
+                if resumed_settings.onboarding_complete && gsr_ok && token.is_some() {
+                    log::info!(
+                        "auto-resume: arm 1 (skip wizard, go to browser)"
+                    );
                     if let Some(t) = token {
                         let cmd_tx = resources
                             .borrow()
@@ -1145,10 +1179,15 @@ pub fn run(start_hidden: bool) {
                     }
                     window.clips_page().set_state(crate::clips::PageState::Empty);
                 } else if !gsr_ok {
+                    log::info!("auto-resume: arm 2 (Page 1 / install GSR)");
                     window
                         .clips_page()
                         .set_wizard_step(crate::clips::WizardStep::InstallGsr);
                 } else if token.is_none() {
+                    log::info!(
+                        "auto-resume: arm 3 (Page 2 / pick screen — no token \
+                         on disk)"
+                    );
                     window
                         .clips_page()
                         .set_wizard_step(crate::clips::WizardStep::PickScreen);
@@ -1158,6 +1197,10 @@ pub fn run(start_hidden: bool) {
                     // install prompt.
                     window.clips_page().wizard.show_installed_state();
                 } else {
+                    log::info!(
+                        "auto-resume: arm 4 (Page 2 / token saved but \
+                         onboarding_complete=false — confirm pick)"
+                    );
                     // GSR installed + token present + onboarding flag false.
                     // The user reached Page 2 last session but never pressed
                     // Next. Connect the buffer with the persisted token (so
