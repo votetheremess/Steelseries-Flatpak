@@ -97,6 +97,8 @@ pub struct WizardWidgets {
     pub step: RefCell<WizardStep>,
     // Page 1
     pub install_status_label: gtk::Label,
+    pub install_btn: gtk::Button,
+    pub install_manually_btn: gtk::Button,
     pub install_next_btn: gtk::Button,
     // Page 2
     pub screen_picked_label: gtk::Label,
@@ -105,6 +107,27 @@ pub struct WizardWidgets {
     pub hotkey_label: gtk::Label,
     pub buffer_scale: gtk::Scale,
     pub storage_label: gtk::Label,
+}
+
+impl WizardWidgets {
+    /// State A → B transition: GSR detected as installed. Hide the install
+    /// controls and reveal the Next button so the user can advance.
+    /// Mirrors `show_not_installed_state` so install-status flips are
+    /// always centralised here rather than scattered across app.rs.
+    pub fn show_installed_state(&self) {
+        self.install_btn.set_visible(false);
+        self.install_manually_btn.set_visible(false);
+        self.install_next_btn.set_visible(true);
+    }
+
+    /// State B → A transition: GSR went missing (uninstalled while we
+    /// were running, or never installed). Restore the install controls
+    /// and hide Next so the user can re-install.
+    pub fn show_not_installed_state(&self) {
+        self.install_btn.set_visible(true);
+        self.install_manually_btn.set_visible(true);
+        self.install_next_btn.set_visible(false);
+    }
 }
 
 pub fn build_clips_page() -> ClipsPage {
@@ -222,7 +245,8 @@ fn build_wizard() -> WizardWidgets {
         .transition_duration(200)
         .build();
 
-    let (page1, install_status_label, install_next_btn) = build_page1_install();
+    let (page1, install_status_label, install_btn, install_manually_btn, install_next_btn) =
+        build_page1_install();
     let (page2, screen_picked_label, screen_next_btn) = build_page2_screen();
     let (page3, hotkey_label, buffer_scale, storage_label) = build_page3_settings();
 
@@ -235,6 +259,8 @@ fn build_wizard() -> WizardWidgets {
         stack,
         step: RefCell::new(WizardStep::InstallGsr),
         install_status_label,
+        install_btn,
+        install_manually_btn,
         install_next_btn,
         screen_picked_label,
         screen_next_btn,
@@ -245,49 +271,66 @@ fn build_wizard() -> WizardWidgets {
 }
 
 fn step_indicator(current: u8, total: u8) -> gtk::Label {
+    // No `caption` class — body-size text reads as a header above the
+    // wizard pages. The layout pins this label near the top of each
+    // page (margin_top ~16) while the title/body/buttons sit centred
+    // in the remaining space, so the indicator visually belongs to the
+    // page chrome rather than the content cluster.
     let lbl = gtk::Label::new(Some(&format!("Step {current} of {total}")));
     lbl.add_css_class("dim-label");
-    lbl.add_css_class("caption");
     lbl.set_xalign(0.5);
     lbl
 }
 
-fn build_page1_install() -> (gtk::Widget, gtk::Label, gtk::Button) {
+fn build_page1_install() -> (gtk::Widget, gtk::Label, gtk::Button, gtk::Button, gtk::Button) {
+    // Outer page box: step indicator pinned near top (margin_top 16),
+    // then a vexpanding centre box that holds the title/body/button
+    // cluster vertically centred in the remaining space.
     let page = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(16)
-        .margin_top(40)
+        .margin_top(16)
         .margin_bottom(40)
         .margin_start(40)
         .margin_end(40)
         .halign(gtk::Align::Center)
-        .valign(gtk::Align::Center)
+        .vexpand(true)
         .build();
 
     page.append(&step_indicator(1, 3));
 
+    let center_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(24)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .vexpand(true)
+        .build();
+
     let title = gtk::Label::new(Some("Install gpu-screen-recorder"));
     title.add_css_class("title-1");
-    page.append(&title);
+    center_box.append(&title);
 
     let body = gtk::Label::new(Some(
-        "Clips uses gpu-screen-recorder, a free open-source Flatpak \
-         from Flathub, to capture gameplay efficiently. Click Install \
-         to set it up automatically, or Install Manually for other options.",
+        "Clips uses gpu-screen-recorder, a free open-source Flatpak, \
+         to capture gameplay.",
     ));
     body.set_wrap(true);
-    body.set_max_width_chars(60);
+    body.set_max_width_chars(50);
     body.set_xalign(0.5);
-    page.append(&body);
+    body.set_justify(gtk::Justification::Center);
+    center_box.append(&body);
 
-    // Primary install button.
+    // Primary install button. State A control (visible when GSR is
+    // not installed); hidden by `show_installed_state()` once install
+    // succeeds.
     let install_btn = gtk::Button::builder()
         .label("Install")
         .css_classes(["pill", "suggested-action"])
         .halign(gtk::Align::Center)
+        .width_request(200)
         .build();
     install_btn.set_action_name(Some("app.gsr-install"));
-    page.append(&install_btn);
+    center_box.append(&install_btn);
 
     // Secondary "Install Manually" button. Opens an AlertDialog with the
     // app-store + copy-command options, so Page 1 stays uncluttered for
@@ -296,89 +339,103 @@ fn build_page1_install() -> (gtk::Widget, gtk::Label, gtk::Button) {
         .label("Install Manually")
         .css_classes(["pill"])
         .halign(gtk::Align::Center)
+        .width_request(200)
         .build();
     install_manually_btn.set_action_name(Some("app.gsr-install-manually"));
-    page.append(&install_manually_btn);
+    center_box.append(&install_manually_btn);
 
     // Status label (reflects install progress when active).
     let install_status_label = gtk::Label::new(None);
     install_status_label.add_css_class("dim-label");
     install_status_label.set_visible(false);
-    page.append(&install_status_label);
+    center_box.append(&install_status_label);
 
-    // Vertical spacer to keep the Next button visually distinct from the
-    // install/install-manually pair above. The page Box uses spacing=16,
-    // so this 20px box adds an extra ~36px gap before Next.
-    let spacer = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .height_request(20)
-        .build();
-    page.append(&spacer);
-
-    // Next button: centered, wider than default, disabled until
-    // is_installed() returns true (driven by the install progress
-    // watcher in app.rs).
+    // Next button: hidden until install detection sees GSR installed
+    // (driven by the bidirectional install watcher in app.rs +
+    // `WizardWidgets::show_installed_state`). Mutually exclusive with
+    // the Install / Install Manually pair above — page 1 either shows
+    // install controls or the Next button, never both.
     let install_next_btn = gtk::Button::builder()
         .label("Next")
         .css_classes(["pill", "suggested-action"])
         .halign(gtk::Align::Center)
-        .width_request(140)
-        .sensitive(false)
+        .width_request(200)
+        .visible(false)
         .build();
     install_next_btn.set_action_name(Some("app.wizard-next"));
-    page.append(&install_next_btn);
+    center_box.append(&install_next_btn);
 
-    (page.upcast(), install_status_label, install_next_btn)
+    page.append(&center_box);
+
+    (
+        page.upcast(),
+        install_status_label,
+        install_btn,
+        install_manually_btn,
+        install_next_btn,
+    )
 }
 
 fn build_page2_screen() -> (gtk::Widget, gtk::Label, gtk::Button) {
     let page = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(16)
-        .margin_top(40)
+        .margin_top(16)
         .margin_bottom(40)
         .margin_start(40)
         .margin_end(40)
         .halign(gtk::Align::Center)
-        .valign(gtk::Align::Center)
+        .vexpand(true)
         .build();
 
     page.append(&step_indicator(2, 3));
 
+    let center_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(24)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .vexpand(true)
+        .build();
+
     let title = gtk::Label::new(Some("Pick the screen to record"));
     title.add_css_class("title-1");
-    page.append(&title);
+    center_box.append(&title);
 
     let body = gtk::Label::new(Some(
         "Choose which display Clips should capture from. \
          You can change this later in Settings.",
     ));
     body.set_wrap(true);
-    body.set_max_width_chars(60);
+    body.set_max_width_chars(50);
     body.set_xalign(0.5);
-    page.append(&body);
+    body.set_justify(gtk::Justification::Center);
+    center_box.append(&body);
 
     let pick_btn = gtk::Button::builder()
         .label("Pick screen")
         .css_classes(["pill", "suggested-action"])
         .halign(gtk::Align::Center)
+        .width_request(200)
         .build();
     pick_btn.set_action_name(Some("app.setup-clips"));
-    page.append(&pick_btn);
+    center_box.append(&pick_btn);
 
     let screen_picked_label = gtk::Label::new(None);
     screen_picked_label.add_css_class("dim-label");
     screen_picked_label.set_visible(false);
-    page.append(&screen_picked_label);
+    center_box.append(&screen_picked_label);
 
     let screen_next_btn = gtk::Button::builder()
         .label("Next")
         .css_classes(["pill", "suggested-action"])
-        .halign(gtk::Align::End)
+        .halign(gtk::Align::Center)
+        .width_request(200)
         .sensitive(false)
         .build();
     screen_next_btn.set_action_name(Some("app.wizard-next"));
-    page.append(&screen_next_btn);
+    center_box.append(&screen_next_btn);
+
+    page.append(&center_box);
 
     (page.upcast(), screen_picked_label, screen_next_btn)
 }
@@ -386,29 +443,37 @@ fn build_page2_screen() -> (gtk::Widget, gtk::Label, gtk::Button) {
 fn build_page3_settings() -> (gtk::Widget, gtk::Label, gtk::Scale, gtk::Label) {
     let page = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(16)
-        .margin_top(40)
+        .margin_top(16)
         .margin_bottom(40)
         .margin_start(40)
         .margin_end(40)
         .halign(gtk::Align::Center)
-        .valign(gtk::Align::Center)
+        .vexpand(true)
         .build();
 
     page.append(&step_indicator(3, 3));
 
+    let center_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(24)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .vexpand(true)
+        .build();
+
     let title = gtk::Label::new(Some("Configure clips"));
     title.add_css_class("title-1");
-    page.append(&title);
+    center_box.append(&title);
 
     let body = gtk::Label::new(Some(
         "All settings have sensible defaults. Tweak now \
          or later in Settings.",
     ));
     body.set_wrap(true);
-    body.set_max_width_chars(60);
+    body.set_max_width_chars(50);
     body.set_xalign(0.5);
-    page.append(&body);
+    body.set_justify(gtk::Justification::Center);
+    center_box.append(&body);
 
     // Hotkey row
     let hotkey_row = gtk::Box::builder()
@@ -423,7 +488,7 @@ fn build_page3_settings() -> (gtk::Widget, gtk::Label, gtk::Scale, gtk::Label) {
     let rebind_btn = gtk::Button::builder().label("Change…").build();
     rebind_btn.set_action_name(Some("app.rebind-clip-hotkey"));
     hotkey_row.append(&rebind_btn);
-    page.append(&hotkey_row);
+    center_box.append(&hotkey_row);
 
     // Buffer length scale
     let buffer_row = gtk::Box::builder()
@@ -441,7 +506,7 @@ fn build_page3_settings() -> (gtk::Widget, gtk::Label, gtk::Scale, gtk::Label) {
     buffer_scale.set_draw_value(true);
     buffer_scale.set_value_pos(gtk::PositionType::Right);
     buffer_row.append(&buffer_scale);
-    page.append(&buffer_row);
+    center_box.append(&buffer_row);
 
     // Storage path row
     let storage_row = gtk::Box::builder()
@@ -457,16 +522,19 @@ fn build_page3_settings() -> (gtk::Widget, gtk::Label, gtk::Scale, gtk::Label) {
     let pick_storage_btn = gtk::Button::builder().label("Pick folder").build();
     pick_storage_btn.set_action_name(Some("app.pick-clip-storage"));
     storage_row.append(&pick_storage_btn);
-    page.append(&storage_row);
+    center_box.append(&storage_row);
 
     // Done button
     let done_btn = gtk::Button::builder()
         .label("Done")
         .css_classes(["pill", "suggested-action"])
-        .halign(gtk::Align::End)
+        .halign(gtk::Align::Center)
+        .width_request(200)
         .build();
     done_btn.set_action_name(Some("app.wizard-next"));
-    page.append(&done_btn);
+    center_box.append(&done_btn);
+
+    page.append(&center_box);
 
     (page.upcast(), hotkey_label, buffer_scale, storage_label)
 }

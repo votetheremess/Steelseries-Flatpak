@@ -335,7 +335,7 @@ pub fn run(start_hidden: bool) {
                             .install_status_label
                             .set_label("Starting install…");
                         let label = clips_page.wizard.install_status_label.clone();
-                        let next_btn = clips_page.wizard.install_next_btn.clone();
+                        let wizard = clips_page.wizard.clone();
                         glib::timeout_add_local(Duration::from_millis(100), move || {
                             while let Ok(evt) = rx.try_recv() {
                                 use crate::clips::gsr_install::InstallProgress;
@@ -346,13 +346,20 @@ pub fn run(start_hidden: bool) {
                                     InstallProgress::Status(s) => label.set_label(&s),
                                     InstallProgress::Done => {
                                         label.set_label("Installed.");
-                                        next_btn.set_sensitive(true);
+                                        // Hide install controls, reveal Next.
+                                        // The 2-s install watcher will
+                                        // confirm-and-keep this state on its
+                                        // next tick (and reverse it if GSR
+                                        // disappears later).
+                                        wizard.show_installed_state();
                                         in_progress.set(false);
                                         return glib::ControlFlow::Break;
                                     }
                                     InstallProgress::Failed { reason } => {
                                         label.set_label(&format!("Install failed: {reason}"));
-                                        // Next stays disabled — user can retry.
+                                        // Install controls stay visible —
+                                        // user can retry. Next remains
+                                        // hidden.
                                         in_progress.set(false);
                                         return glib::ControlFlow::Break;
                                     }
@@ -407,40 +414,72 @@ pub fn run(start_hidden: bool) {
                                  the recorder yourself.",
                             )
                             .build();
-                        dialog.add_response("app-store", "Open in app store");
-                        dialog.add_response("copy", "Copy install command");
+
+                        // Vertical button stack inside the dialog body
+                        // (extra_child). adw::AlertDialog only lays its
+                        // responses out horizontally; to get a vertical
+                        // stack with Close visually below the action
+                        // buttons we move the two action buttons into
+                        // the body and keep Close as the only response.
+                        // Both action buttons share width_request 200 so
+                        // they match each other and the wizard buttons.
+                        let buttons_box = gtk::Box::builder()
+                            .orientation(gtk::Orientation::Vertical)
+                            .spacing(8)
+                            .halign(gtk::Align::Center)
+                            .margin_top(8)
+                            .build();
+
+                        let app_for_store = app.clone();
+                        let dialog_for_store = dialog.clone();
+                        let app_store_btn = gtk::Button::builder()
+                            .label("Open in app store")
+                            .css_classes(["pill"])
+                            .width_request(200)
+                            .build();
+                        app_store_btn.connect_clicked(move |_btn| {
+                            app_for_store.activate_action("gsr-open-in-app-store", None);
+                            dialog_for_store.close();
+                        });
+                        buttons_box.append(&app_store_btn);
+
+                        let app_for_copy = app.clone();
+                        let dialog_for_copy = dialog.clone();
+                        let copy_btn = gtk::Button::builder()
+                            .label("Copy install command")
+                            .css_classes(["pill"])
+                            .width_request(200)
+                            .build();
+                        copy_btn.connect_clicked(move |_btn| {
+                            app_for_copy.activate_action("gsr-copy-cli", None);
+                            // Best-effort confirmation toast so the
+                            // silent clipboard set feels responsive.
+                            if let Some(window) = app_for_copy.active_window()
+                                && let Ok(adw_win) =
+                                    window.downcast::<adw::ApplicationWindow>()
+                                && let Some(overlay) =
+                                    crate::clips::notifications::find_toast_overlay(
+                                        &adw_win,
+                                    )
+                            {
+                                let toast = adw::Toast::builder()
+                                    .title("Install command copied")
+                                    .timeout(3)
+                                    .build();
+                                overlay.add_toast(toast);
+                            }
+                            dialog_for_copy.close();
+                        });
+                        buttons_box.append(&copy_btn);
+
+                        dialog.set_extra_child(Some(&buttons_box));
+
+                        // Only Close remains as a real response — gives
+                        // us the visual order [Open in app store] /
+                        // [Copy install command] (in body) → [Close]
+                        // (response area at the bottom).
                         dialog.add_response("close", "Close");
                         dialog.set_close_response("close");
-
-                        let app_for_response = app.clone();
-                        dialog.connect_response(None, move |_dlg, response| {
-                            match response {
-                                "app-store" => {
-                                    app_for_response
-                                        .activate_action("gsr-open-in-app-store", None);
-                                }
-                                "copy" => {
-                                    app_for_response.activate_action("gsr-copy-cli", None);
-                                    // Best-effort confirmation toast so the
-                                    // silent clipboard set feels responsive.
-                                    if let Some(window) = app_for_response.active_window()
-                                        && let Ok(adw_win) =
-                                            window.downcast::<adw::ApplicationWindow>()
-                                        && let Some(overlay) =
-                                            crate::clips::notifications::find_toast_overlay(
-                                                &adw_win,
-                                            )
-                                    {
-                                        let toast = adw::Toast::builder()
-                                            .title("Install command copied")
-                                            .timeout(3)
-                                            .build();
-                                        overlay.add_toast(toast);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        });
 
                         if let Some(window) = app.active_window() {
                             dialog.present(Some(&window));
@@ -948,13 +987,19 @@ pub fn run(start_hidden: bool) {
                         return glib::ControlFlow::Break;
                     }
                     let installed = crate::clips::gsr_install::is_installed();
-                    clips_page.wizard.install_next_btn.set_sensitive(installed);
                     if installed {
+                        clips_page.wizard.show_installed_state();
                         clips_page.wizard.install_status_label.set_visible(true);
                         clips_page
                             .wizard
                             .install_status_label
                             .set_label("Installed.");
+                    } else {
+                        // GSR went missing (uninstalled from the system app
+                        // store, or never installed). Restore Install +
+                        // Install Manually so the user can re-install; hide
+                        // Next.
+                        clips_page.wizard.show_not_installed_state();
                     }
                     glib::ControlFlow::Continue
                 });
@@ -1004,13 +1049,11 @@ pub fn run(start_hidden: bool) {
                     window
                         .clips_page()
                         .set_wizard_step(crate::clips::WizardStep::PickScreen);
-                    // Already past page 1 — keep its Next enabled too in case
-                    // the user navigates back.
-                    window
-                        .clips_page()
-                        .wizard
-                        .install_next_btn
-                        .set_sensitive(true);
+                    // Already past page 1 — keep its Next visible (and
+                    // hide the install controls) so navigating back from
+                    // Page 2 lands on the post-install state, not the
+                    // install prompt.
+                    window.clips_page().wizard.show_installed_state();
                 } else {
                     // GSR installed + token present + onboarding flag false.
                     // The user reached Page 2 last session but never pressed
@@ -1035,9 +1078,11 @@ pub fn run(start_hidden: bool) {
                         "Previously picked. Click Next to keep, or Pick screen to change.",
                     );
                     cp.wizard.screen_next_btn.set_sensitive(true);
-                    // Already past page 1 — keep its Next enabled too in
-                    // case the user navigates back.
-                    cp.wizard.install_next_btn.set_sensitive(true);
+                    // Already past page 1 — keep its Next visible (and
+                    // hide the install controls) so navigating back from
+                    // Page 2 lands on the post-install state, not the
+                    // install prompt.
+                    cp.wizard.show_installed_state();
                     // Onboarding state remains incomplete until user
                     // confirms via Next.
                 }
