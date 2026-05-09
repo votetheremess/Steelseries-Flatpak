@@ -230,15 +230,40 @@ pub fn run(start_hidden: bool) {
                 glib::ControlFlow::Continue
             });
 
-            // Clip backend event poll. The backend idles until a later phase
-            // sends StartReplay, so this just logs whatever comes through.
+            // Build the BufferController seeded with the user's headset sink
+            // monitor and default Videos/Clips output dir. The portal restore
+            // token is wired in later (Phase 3) — until then the controller
+            // stays in Uninitialized and never sends StartReplay.
+            let buffer = {
+                let mut initial_cfg = crate::clips::CaptureConfig::default();
+                if let Some(res) = resources.borrow().as_ref() {
+                    initial_cfg.headset_sink_monitor = format!("{}.monitor", res.headset_sink);
+                }
+                initial_cfg.output_dir = std::path::PathBuf::from(
+                    std::env::var("HOME").unwrap_or_default(),
+                )
+                .join("Videos/Clips");
+                Rc::new(RefCell::new(crate::clips::BufferController::new(initial_cfg)))
+            };
+
+            // Clip backend event poll. Drains BackendEvents into the
+            // BufferController so its state stays in sync with the backend
+            // thread (Armed / Disarmed / Saved / errors).
             let resources_for_clips = resources.clone();
+            let buf_for_events = buffer.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
                 if let Some(res) = resources_for_clips.borrow().as_ref() {
-                    if let Some(rx) = res.clip_events.as_ref() {
+                    if let (Some(rx), Some(tx)) = (
+                        res.clip_events.as_ref(),
+                        res.clip_backend.as_ref().map(|h| h.sender()),
+                    ) {
+                        let mut buf = buf_for_events.borrow_mut();
                         loop {
                             match rx.try_recv() {
-                                Ok(evt) => log::info!("clip event: {evt:?}"),
+                                Ok(evt) => {
+                                    log::info!("clip event: {evt:?}");
+                                    buf.on_backend_event(&evt, &tx);
+                                }
                                 Err(TryRecvError::Empty) => break,
                                 Err(TryRecvError::Disconnected) => {
                                     return glib::ControlFlow::Break;
@@ -272,14 +297,35 @@ pub fn run(start_hidden: bool) {
             });
 
             // Game detector: scan /proc every 2 seconds, feed the debouncing
-            // GameDetector, and (for now) just log any state-change events.
-            // Phase 2 chunk B will wire these events into the BufferController.
+            // GameDetector, and forward state-change events into the
+            // BufferController. The controller is responsible for deciding
+            // whether to actually arm (it stays in Uninitialized until the
+            // portal pick lands in Phase 3, so no StartReplay is sent yet).
             let detector_state = Rc::new(RefCell::new(crate::clips::GameDetector::new()));
+            let buf_for_detector = buffer.clone();
+            let resources_for_detector = resources.clone();
             glib::timeout_add_seconds_local(2, move || {
                 let games = crate::clips::detector::scan_once();
                 let evts = detector_state.borrow_mut().tick(&games);
-                for e in evts {
-                    log::info!("detector event: {e:?}");
+                if !evts.is_empty() {
+                    if let Some(res) = resources_for_detector.borrow().as_ref() {
+                        if let Some(tx) =
+                            res.clip_backend.as_ref().map(|h| h.sender())
+                        {
+                            let mut buf = buf_for_detector.borrow_mut();
+                            for e in evts {
+                                log::info!("detector event: {e:?}");
+                                match e {
+                                    crate::clips::DetectorEvent::GameStarted(g) => {
+                                        buf.on_game_started(g, &tx);
+                                    }
+                                    crate::clips::DetectorEvent::GameStopped { pid } => {
+                                        buf.on_game_stopped(pid, &tx);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 glib::ControlFlow::Continue
             });

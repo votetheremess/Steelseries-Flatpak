@@ -10,6 +10,7 @@ pub mod settings;
 pub mod thumbnail;
 
 pub use browser::build_clips_page;
+pub use buffer::{BufferController, BufferState};
 pub use detector::{DetectedGame, DetectorEvent, GameDetector};
 
 use std::path::PathBuf;
