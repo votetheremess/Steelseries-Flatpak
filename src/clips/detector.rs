@@ -12,6 +12,12 @@ pub fn read_comm(pid: u32) -> Option<String> {
 
 /// Read /proc/<pid>/cmdline. Returns argv joined by ASCII spaces (the file is
 /// NUL-separated). None if unreadable.
+///
+/// Note: joining argv with spaces is lossy — `["foo bar", "baz"]` and
+/// `["foo", "bar baz"]` produce the same string. Matchers that grep for
+/// substrings (`SteamLaunch AppId=`, `lutris-wrapper`) are unaffected since
+/// those tokens never span argv boundaries. A future matcher that needs
+/// per-arg precision should use the raw NUL-separated bytes directly.
 pub fn read_cmdline(pid: u32) -> Option<String> {
     let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let s = bytes
@@ -182,6 +188,12 @@ pub struct DetectedGame {
 }
 
 /// Try to identify a game from a process snapshot.
+///
+/// Matchers are evaluated top-down and **first match wins**. Order matters because
+/// launchers nest — Steam wraps gamescope, gamescope wraps mangohud — so checking
+/// Steam-cmdline before gamescope-comm gives us the best name. If you add a new
+/// matcher, place it according to specificity: more-specific patterns above
+/// less-specific ones.
 pub fn match_game(
     pid: u32,
     comm: &str,
