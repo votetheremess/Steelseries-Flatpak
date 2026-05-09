@@ -378,12 +378,120 @@ fn empty_page() -> gtk::Widget {
     page.upcast()
 }
 
-fn loaded_page() -> gtk::Widget {
-    // Real grid view added in Phase 5.
-    gtk::Box::builder()
+/// Explicit refs to the per-card child widgets, attached to each `ListItem`
+/// via GLib data so the bind step does not have to walk the widget tree
+/// with `first_child()` / `last_child()` (which would silently break the
+/// moment a kebab button or any other peer widget is added in Task 5.5).
+#[derive(Clone)]
+struct CardWidgets {
+    image: gtk::Picture,
+    title: gtk::Label,
+}
+
+fn build_clip_card() -> (gtk::Box, CardWidgets) {
+    let card = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .build()
-        .upcast()
+        .spacing(4)
+        .build();
+    card.add_css_class("clip-card");
+
+    let image = gtk::Picture::builder()
+        .height_request(180)
+        .width_request(320)
+        .build();
+    image.add_css_class("clip-thumb");
+
+    let title = gtk::Label::builder()
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(30)
+        .xalign(0.0)
+        .build();
+    title.add_css_class("clip-title");
+
+    card.append(&image);
+    card.append(&title);
+
+    (card, CardWidgets { image, title })
+}
+
+fn bind_label_only(widgets: &CardWidgets, clip: &ClipObject) {
+    let meta = clip.meta();
+    let game = if meta.game_name.is_empty() {
+        "Untitled"
+    } else {
+        meta.game_name.as_str()
+    };
+    widgets.title.set_label(game);
+    // Picture left blank in this task; thumbnail wiring lands in Task 5.4c.
+}
+
+fn loaded_page() -> gtk::Widget {
+    use crate::clips::library;
+
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .build();
+
+    let storage_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join("Videos/Clips");
+    let _ = std::fs::create_dir_all(&storage_dir);
+
+    let model = gtk::gio::ListStore::new::<ClipObject>();
+    for meta in library::reconcile(&storage_dir) {
+        model.append(&ClipObject::new(meta, storage_dir.clone()));
+    }
+
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_factory, item| {
+        let item = item
+            .downcast_ref::<gtk::ListItem>()
+            .expect("setup signal item must be a ListItem");
+        let (card, widgets) = build_clip_card();
+        // Stash the explicit widget refs on the ListItem so bind() can
+        // retrieve them without walking the widget tree.
+        //
+        // SAFETY: We attach a `CardWidgets` value (a `Clone` struct of
+        // owned widget refs) under a stable string key. The matching
+        // retrieval in `connect_bind` reads back with the same `T`, and
+        // `connect_unbind` (eventually, in Task 5.5+) would `steal_data`
+        // with the same `T`. The only invariant `set_data` requires is
+        // that the type at retrieval matches the type at storage; that
+        // holds here because the key is unique to this factory.
+        unsafe {
+            item.set_data::<CardWidgets>("card-widgets", widgets);
+        }
+        item.set_child(Some(&card));
+    });
+    factory.connect_bind(|_factory, item| {
+        let item = item
+            .downcast_ref::<gtk::ListItem>()
+            .expect("bind signal item must be a ListItem");
+        // SAFETY: `card-widgets` was set in `connect_setup` with the same
+        // `CardWidgets` type. The pointer remains valid for the life of
+        // the ListItem (until `steal_data`, which we do not call), so the
+        // `as_ref()` borrow + clone here is sound.
+        let widgets: CardWidgets = unsafe {
+            item.data::<CardWidgets>("card-widgets")
+                .map(|p| p.as_ref().clone())
+                .expect("card-widgets attached during setup")
+        };
+        let clip = item
+            .item()
+            .and_then(|o| o.downcast::<ClipObject>().ok())
+            .expect("model item must be a ClipObject");
+        bind_label_only(&widgets, &clip);
+    });
+
+    let grid = gtk::GridView::builder()
+        .model(&gtk::SingleSelection::new(Some(model)))
+        .factory(&factory)
+        .min_columns(2)
+        .max_columns(5)
+        .build();
+
+    scroll.set_child(Some(&grid));
+    scroll.upcast()
 }
 
 impl ClipsPage {
