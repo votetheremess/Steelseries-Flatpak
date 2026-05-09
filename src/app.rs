@@ -613,7 +613,10 @@ pub fn run(start_hidden: bool) {
                                             "Picker returned no persistent token. \
                                              Try again.",
                                         );
-                                        clips_page.wizard.screen_next_btn.set_sensitive(false);
+                                        // Stay in not-picked state so the
+                                        // user can retry via the still-
+                                        // visible Pick screen button.
+                                        clips_page.wizard.show_screen_not_picked_state();
                                         return;
                                     }
                                     if let Err(e) = crate::clips::portal::save_token(&token) {
@@ -638,13 +641,15 @@ pub fn run(start_hidden: bool) {
                                             "no clip backend available to receive portal pick"
                                         );
                                     }
-                                    // Update wizard Page 2.
+                                    // Update wizard Page 2: hide Pick
+                                    // screen, reveal Next (mirrors Page 1's
+                                    // post-install flip).
                                     clips_page.wizard.screen_picked_label.set_visible(true);
                                     clips_page
                                         .wizard
                                         .screen_picked_label
                                         .set_label("Screen picked.");
-                                    clips_page.wizard.screen_next_btn.set_sensitive(true);
+                                    clips_page.wizard.show_screen_picked_state();
                                 }
                                 Err(e) => {
                                     log::warn!("portal pick failed: {e}");
@@ -811,7 +816,12 @@ pub fn run(start_hidden: bool) {
                         }
                         // GSR is still installed (the user just wants a new
                         // screen pick), so jump straight to PickScreen rather
-                        // than the install step.
+                        // than the install step. Reset Page 2's button
+                        // visibility back to the not-picked state so the
+                        // user sees Pick screen again instead of a stale
+                        // Next from the previous successful pick.
+                        clips_page.wizard.show_screen_not_picked_state();
+                        clips_page.wizard.screen_picked_label.set_visible(false);
                         clips_page.set_wizard_step(crate::clips::WizardStep::PickScreen);
                         clips_page.set_state(crate::clips::PageState::Onboarding);
                     })
@@ -1112,9 +1122,11 @@ pub fn run(start_hidden: bool) {
                     cp.set_wizard_step(crate::clips::WizardStep::PickScreen);
                     cp.wizard.screen_picked_label.set_visible(true);
                     cp.wizard.screen_picked_label.set_label(
-                        "Previously picked. Click Next to keep, or Pick screen to change.",
+                        "Previously picked. Click Next to keep.",
                     );
-                    cp.wizard.screen_next_btn.set_sensitive(true);
+                    // Page 2 in picked state: only Next visible. The user
+                    // can still change source later via Settings → Reset.
+                    cp.wizard.show_screen_picked_state();
                     // Already past page 1 — keep its Next visible (and
                     // hide the install controls) so navigating back from
                     // Page 2 lands on the post-install state, not the

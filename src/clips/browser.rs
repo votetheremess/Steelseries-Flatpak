@@ -102,6 +102,7 @@ pub struct WizardWidgets {
     pub install_next_btn: gtk::Button,
     // Page 2
     pub screen_picked_label: gtk::Label,
+    pub pick_screen_btn: gtk::Button,
     pub screen_next_btn: gtk::Button,
     // Page 3
     pub hotkey_label: gtk::Label,
@@ -127,6 +128,22 @@ impl WizardWidgets {
         self.install_btn.set_visible(true);
         self.install_manually_btn.set_visible(true);
         self.install_next_btn.set_visible(false);
+    }
+
+    /// Page 2 State A → B transition: portal pick succeeded. Hide the
+    /// "Pick screen" button and reveal Next so only one primary action is
+    /// visible at a time (mirrors Page 1's install-then-Next flip).
+    pub fn show_screen_picked_state(&self) {
+        self.pick_screen_btn.set_visible(false);
+        self.screen_next_btn.set_visible(true);
+    }
+
+    /// Page 2 State B → A transition: capture source was reset (Settings →
+    /// Reset). Restore the "Pick screen" button and hide Next so the user
+    /// can pick again.
+    pub fn show_screen_not_picked_state(&self) {
+        self.pick_screen_btn.set_visible(true);
+        self.screen_next_btn.set_visible(false);
     }
 }
 
@@ -247,7 +264,7 @@ fn build_wizard() -> WizardWidgets {
 
     let (page1, install_status_label, install_btn, install_manually_btn, install_next_btn) =
         build_page1_install();
-    let (page2, screen_picked_label, screen_next_btn) = build_page2_screen();
+    let (page2, screen_picked_label, pick_screen_btn, screen_next_btn) = build_page2_screen();
     let (page3, hotkey_label, buffer_scale, storage_label) = build_page3_settings();
 
     stack.add_named(&page1, Some("wizard-1-install"));
@@ -263,6 +280,7 @@ fn build_wizard() -> WizardWidgets {
         install_manually_btn,
         install_next_btn,
         screen_picked_label,
+        pick_screen_btn,
         screen_next_btn,
         hotkey_label,
         buffer_scale,
@@ -376,7 +394,7 @@ fn build_page1_install() -> (gtk::Widget, gtk::Label, gtk::Button, gtk::Button, 
     )
 }
 
-fn build_page2_screen() -> (gtk::Widget, gtk::Label, gtk::Button) {
+fn build_page2_screen() -> (gtk::Widget, gtk::Label, gtk::Button, gtk::Button) {
     let page = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .margin_top(16)
@@ -411,33 +429,41 @@ fn build_page2_screen() -> (gtk::Widget, gtk::Label, gtk::Button) {
     body.set_justify(gtk::Justification::Center);
     center_box.append(&body);
 
-    let pick_btn = gtk::Button::builder()
+    // State A button: visible when no portal pick yet. Mutually exclusive
+    // with screen_next_btn — `WizardWidgets::show_screen_picked_state` /
+    // `show_screen_not_picked_state` flip the visibility together so only
+    // one primary action shows at a time (mirrors Page 1's Install/Next
+    // flip).
+    let pick_screen_btn = gtk::Button::builder()
         .label("Pick screen")
         .css_classes(["pill", "suggested-action"])
         .halign(gtk::Align::Center)
         .width_request(200)
         .build();
-    pick_btn.set_action_name(Some("app.setup-clips"));
-    center_box.append(&pick_btn);
+    pick_screen_btn.set_action_name(Some("app.setup-clips"));
+    center_box.append(&pick_screen_btn);
 
     let screen_picked_label = gtk::Label::new(None);
     screen_picked_label.add_css_class("dim-label");
     screen_picked_label.set_visible(false);
     center_box.append(&screen_picked_label);
 
+    // State B button: hidden until the portal pick succeeds. We hide
+    // (rather than set_sensitive(false)) so the layout looks like Page 1
+    // post-install — only one button visible at a time.
     let screen_next_btn = gtk::Button::builder()
         .label("Next")
         .css_classes(["pill", "suggested-action"])
         .halign(gtk::Align::Center)
         .width_request(200)
-        .sensitive(false)
+        .visible(false)
         .build();
     screen_next_btn.set_action_name(Some("app.wizard-next"));
     center_box.append(&screen_next_btn);
 
     page.append(&center_box);
 
-    (page.upcast(), screen_picked_label, screen_next_btn)
+    (page.upcast(), screen_picked_label, pick_screen_btn, screen_next_btn)
 }
 
 fn build_page3_settings() -> (gtk::Widget, gtk::Label, gtk::Scale, gtk::Label) {
