@@ -741,6 +741,118 @@ fn rename_in_index(old: &str, new: &str) {
     }
 }
 
+/// Validate a user-typed rename stem. Reject anything that could escape
+/// the storage dir, smuggle a leading dash into a future ffmpeg/ffprobe
+/// invocation, masquerade as a hidden file, hide a control character in
+/// a terminal listing, or trip case-insensitive filesystem confusion.
+///
+/// Returns `Err(reason)` with a short user-facing message on failure;
+/// the caller surfaces that as a toast / inline error label and aborts
+/// the rename.
+///
+/// `pub(crate)` so the validator is unit-testable in isolation. Tests
+/// in `mod rename_validator_tests` exercise every rejection branch.
+pub(crate) fn validate_rename_stem(stem: &str) -> Result<(), &'static str> {
+    if stem.is_empty() {
+        return Err("Name cannot be empty.");
+    }
+    // Trim-then-empty catches all-whitespace ("   "), which would look
+    // like a normal name to the user but be empty after we trim before
+    // joining — that's the same bug class as an empty stem.
+    if stem.trim().is_empty() {
+        return Err("Name cannot be only whitespace.");
+    }
+    // Trailing whitespace and trailing `.` cause case-insensitive
+    // filesystem confusion (Windows / NTFS / case-insensitive volume on
+    // macOS) where `name. ` and `name` resolve to the same dirent. We
+    // store on Linux but the user might sync the folder to a Windows
+    // share; reject defensively.
+    if stem.ends_with(' ') || stem.ends_with('\t') || stem.ends_with('.') {
+        return Err("Name cannot end with whitespace or a period.");
+    }
+    if stem.starts_with('.') {
+        return Err("Name cannot start with a period (would create a hidden file).");
+    }
+    if stem.starts_with('-') {
+        // ffmpeg / ffprobe parse a leading '-' as a flag. A future invocation
+        // (e.g. remix export, thumbnail extraction) that accidentally puts
+        // the rendered filename in the args list without `--` would then
+        // execute attacker-controlled flags.
+        return Err("Name cannot start with a dash.");
+    }
+    if stem.contains("..") {
+        // library::resolve_collision ends up calling storage_dir.join(stem),
+        // and `..` in `stem` lets the joined path resolve outside the
+        // storage dir. Belt-and-suspenders: even though the rename target
+        // is `storage_dir.join("foo..bar.mp4")` (joined unconditionally,
+        // not interpreted as a path), the caller's collision-resolution
+        // helper path-walks the result and could produce `<storage>/../...
+        // .mp4` if a future change relaxes the join discipline.
+        return Err("Name cannot contain '..' (path traversal).");
+    }
+    if stem.contains('/') || stem.contains('\\') || stem.contains('\0') {
+        return Err("Name contains an invalid character.");
+    }
+    if stem.chars().any(|c| c.is_control()) {
+        // Terminal escape sequences (ESC, BEL, ANSI CSI introducers)
+        // could rewrite the user's terminal when an `ls` listing of the
+        // storage dir is rendered. Rare but cheap to guard.
+        return Err("Name contains a control character.");
+    }
+    Ok(())
+}
+
+/// Look up the active toast overlay for a widget so rename / delete
+/// failures (and any other transient UI feedback) can show via an
+/// `adw::Toast` with consistent styling. Returns `None` if the widget
+/// isn't currently parented in a window with a `ToastOverlay` — the
+/// caller should fall back to logging in that case.
+pub(crate) fn find_toast_overlay_for(widget: &impl IsA<gtk::Widget>) -> Option<adw::ToastOverlay> {
+    let window = widget.root().and_then(|r| r.downcast::<gtk::Window>().ok())?;
+    let mut current = window.child();
+    while let Some(w) = current {
+        if let Ok(o) = w.clone().downcast::<adw::ToastOverlay>() {
+            return Some(o);
+        }
+        current = w.first_child();
+    }
+    None
+}
+
+/// Show a transient failure message via the toast overlay. Falls back
+/// to a `gio::Notification` (which most desktop environments render as
+/// a tray-style notification) when no toast overlay is reachable —
+/// e.g. if the window was hidden between the action and its callback.
+pub(crate) fn surface_failure(
+    anchor: &impl IsA<gtk::Widget>,
+    title: &str,
+) {
+    if let Some(overlay) = find_toast_overlay_for(anchor) {
+        let toast = adw::Toast::builder()
+            .title(title)
+            .timeout(6)
+            .build();
+        overlay.add_toast(toast);
+        return;
+    }
+    // Fallback: best-effort desktop notification. We don't have an
+    // app handle here (the kebab callback only sees the widget), so
+    // we render via gio::Notification with a static id. The id is
+    // shared with notify_saved's; that's fine because user-visible
+    // text will replace it. If even this fails (no session bus,
+    // headless), the warning we logged above is the user's only
+    // signal.
+    let notif = gio::Notification::new(title);
+    if let Some(app) = anchor
+        .root()
+        .and_then(|r| r.downcast::<gtk::Window>().ok())
+        .and_then(|w| w.application())
+        .and_then(|a| a.downcast::<gtk::Application>().ok())
+    {
+        app.send_notification(Some("clip-action-error"), &notif);
+    }
+}
+
 fn show_rename_dialog(
     anchor: &impl IsA<gtk::Widget>,
     old_filename: String,
@@ -793,32 +905,29 @@ fn show_rename_dialog(
     dialog.set_extra_child(Some(&body));
 
     let parent = parent_window_of(anchor);
+    let anchor_for_response: gtk::Widget = anchor.clone().upcast();
     dialog.connect_response(None, move |_dlg, response| {
         if response != "save" {
             // "cancel" or any non-save response: AlertDialog closes itself.
             return;
         }
+        // Note: trim() before validation so the user's leading/trailing
+        // whitespace doesn't cause spurious failures, but the validator
+        // still rejects internal trailing whitespace via its own rules.
         let new_stem = entry.text().trim().to_string();
-        // AlertDialog closes itself on response; on any validation
-        // failure below we simply log + return. The user can re-open the
-        // kebab menu and try again. (The `status` label is wired up but
-        // currently only displays for the dialog's *initial* present —
-        // future improvement: switch to keep-open by intercepting the
-        // response signal with a separate Save button in extra_child.)
-        if new_stem.is_empty() {
-            status.set_label("Name cannot be empty.");
-            status.set_visible(true);
-            log::warn!("rename: empty name rejected");
-            return;
-        }
         if new_stem == old_stem {
             // No-op rename.
             return;
         }
-        // Sanitize: disallow path separators and NUL so the user can't
-        // escape the storage dir.
-        if new_stem.contains('/') || new_stem.contains('\\') || new_stem.contains('\0') {
-            log::warn!("rename: rejecting name with path separator: {new_stem}");
+        if let Err(reason) = validate_rename_stem(&new_stem) {
+            // Surface BOTH inline (in the dialog's status label, in case
+            // the dialog is still presented after AdwAlertDialog's
+            // response handling) AND via toast (covers the case where
+            // the dialog has dismissed by the time we get here).
+            status.set_label(reason);
+            status.set_visible(true);
+            surface_failure(&anchor_for_response, &format!("Rename failed: {reason}"));
+            log::warn!("rename: rejecting stem {new_stem:?}: {reason}");
             return;
         }
         // Resolve collisions by appending -2, -3, … via the same helper
@@ -845,6 +954,10 @@ fn show_rename_dialog(
                     "rename failed: {} -> {}: {e}",
                     old_path.display(),
                     new_path.display()
+                );
+                surface_failure(
+                    &anchor_for_response,
+                    &format!("Couldn't rename clip: {e}"),
                 );
             }
         }
@@ -1100,5 +1213,76 @@ mod object_tests {
         let obj = ClipObject::new(m.clone(), dir.clone());
         assert_eq!(obj.meta(), m);
         assert_eq!(obj.storage_dir(), dir);
+    }
+}
+
+#[cfg(test)]
+mod rename_validator_tests {
+    //! Tests for `validate_rename_stem` covering security M-1: every
+    //! way a malicious or accidentally-tricky rename could escape the
+    //! storage dir, smuggle a leading flag into a future ffmpeg call,
+    //! masquerade as a hidden file, hide a control character, or trip
+    //! case-insensitive filesystem confusion.
+    use super::*;
+
+    #[test]
+    fn rejects_empty_and_whitespace_only() {
+        assert!(validate_rename_stem("").is_err());
+        assert!(validate_rename_stem("   ").is_err());
+        assert!(validate_rename_stem("\t\t").is_err());
+    }
+
+    #[test]
+    fn rejects_path_traversal_double_dot() {
+        assert!(validate_rename_stem("..").is_err());
+        assert!(validate_rename_stem("..hello").is_err());
+        assert!(validate_rename_stem("hello..world").is_err());
+        assert!(validate_rename_stem("foo/../bar").is_err());
+    }
+
+    #[test]
+    fn rejects_leading_dot() {
+        assert!(validate_rename_stem(".hidden").is_err());
+        assert!(validate_rename_stem(".").is_err());
+    }
+
+    #[test]
+    fn rejects_leading_dash() {
+        assert!(validate_rename_stem("-flag").is_err());
+        assert!(validate_rename_stem("--flag").is_err());
+    }
+
+    #[test]
+    fn rejects_trailing_whitespace_or_period() {
+        assert!(validate_rename_stem("name ").is_err());
+        assert!(validate_rename_stem("name\t").is_err());
+        assert!(validate_rename_stem("name.").is_err());
+        assert!(validate_rename_stem("with.dots.").is_err());
+    }
+
+    #[test]
+    fn rejects_control_characters() {
+        assert!(validate_rename_stem("name\nwith\nnewline").is_err());
+        assert!(validate_rename_stem("escape\x1bhere").is_err());
+        assert!(validate_rename_stem("bell\x07").is_err());
+        // NUL is also a control char; the explicit `\0` check is
+        // technically redundant with the is_control() branch but harmless.
+        assert!(validate_rename_stem("nul\x00here").is_err());
+    }
+
+    #[test]
+    fn rejects_path_separators() {
+        assert!(validate_rename_stem("dir/file").is_err());
+        assert!(validate_rename_stem("c:\\windows").is_err());
+    }
+
+    #[test]
+    fn accepts_normal_names() {
+        assert!(validate_rename_stem("Cyberpunk - epic moment").is_ok());
+        assert!(validate_rename_stem("clip_2026-01-01").is_ok());
+        assert!(validate_rename_stem("game.session.1").is_ok());
+        assert!(validate_rename_stem("ARC Raiders win").is_ok());
+        // Internal periods are fine; trailing one is the only rejection.
+        assert!(validate_rename_stem("foo.bar.baz").is_ok());
     }
 }
