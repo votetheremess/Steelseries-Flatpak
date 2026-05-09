@@ -302,7 +302,25 @@ pub fn spawn_gsr(args: &[String], fifo_path: &PathBuf) -> std::io::Result<Child>
         });
     }
 
-    cmd.spawn()
+    let mut child = cmd.spawn()?;
+    // Drain GSR's stderr on a worker thread and tag each line so it surfaces
+    // in our journalctl output. Without this, GSR's pipe fills and either
+    // blocks the child or (more often) we lose all diagnostic context when
+    // GSR exits non-zero — the user just sees `ExitStatus(unix_wait_status(256))`
+    // with no clue why. Mirrors the FIFO-reader pattern.
+    if let Some(stderr) = child.stderr.take() {
+        let _ = std::thread::Builder::new()
+            .name("gsr-stderr".into())
+            .spawn(move || {
+                let r = std::io::BufReader::new(stderr);
+                for line in std::io::BufRead::lines(r).map_while(Result::ok) {
+                    if !line.trim().is_empty() {
+                        log::warn!("gsr stderr: {line}");
+                    }
+                }
+            });
+    }
+    Ok(child)
 }
 
 /// Send a signal to the GSR child by PID.
