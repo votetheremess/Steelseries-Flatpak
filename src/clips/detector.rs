@@ -417,3 +417,17 @@ mod detector_tests {
         );
     }
 }
+
+/// Scan the current process tree once and return identified games.
+pub fn scan_once() -> Vec<DetectedGame> {
+    let mut games = Vec::new();
+    for pid in all_pids() {
+        let comm = read_comm(pid).unwrap_or_default();
+        let cmdline = read_cmdline(pid).unwrap_or_default();
+        let environ = read_environ(pid).unwrap_or_default();
+        if let Some(g) = match_game(pid, &comm, &cmdline, &environ) {
+            games.push(g);
+        }
+    }
+    games
+}

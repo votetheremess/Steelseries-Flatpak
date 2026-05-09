@@ -271,6 +271,19 @@ pub fn run(start_hidden: bool) {
                 glib::ControlFlow::Continue
             });
 
+            // Game detector: scan /proc every 2 seconds, feed the debouncing
+            // GameDetector, and (for now) just log any state-change events.
+            // Phase 2 chunk B will wire these events into the BufferController.
+            let detector_state = Rc::new(RefCell::new(crate::clips::GameDetector::new()));
+            glib::timeout_add_seconds_local(2, move || {
+                let games = crate::clips::detector::scan_once();
+                let evts = detector_state.borrow_mut().tick(&games);
+                for e in evts {
+                    log::info!("detector event: {e:?}");
+                }
+                glib::ControlFlow::Continue
+            });
+
             // Spawn the system tray icon and poll for commands on the main thread
             let tray_rx = tray::spawn();
             let app_for_tray = app.clone();
