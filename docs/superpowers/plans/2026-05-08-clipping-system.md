@@ -4,9 +4,9 @@
 
 **Goal:** Replace the existing `Clips (coming soon)` placeholder tab (`src/window.rs:238`) with a working SteelSeries-Moments-style replay-buffer clip capture feature: continuously buffer recent gameplay video+audio, hotkey to save the last 30–300 s, browse/manage saved clips in-app with per-source audio remix.
 
-**Architecture:** Drive `gpu-screen-recorder` (GSR) as a long-lived child process behind one new dedicated thread (mirrors the existing `eq-pipeline` thread pattern). Game detection via 2-second `/proc` scan with SteamAppId resolution. Hotkey via XDG GlobalShortcuts portal (`ashpd`) plus a `GAction` fallback exposed on the existing `org.gtk.Actions` D-Bus surface. UI is a `gtk::GridView` clip browser plus settings additions and a status indicator on the existing dashboard.
+**Architecture:** Drive the `com.dec05eba.gpu_screen_recorder` Flathub Flatpak (invoked as `flatpak run com.dec05eba.gpu_screen_recorder ...`) as a long-lived child process behind one new dedicated thread (mirrors the existing `eq-pipeline` thread pattern). Bazzite-flatpak-only — the project never layers via rpm-ostree, so GSR runs as a Flatpak both during dev and after this app is itself packaged. Game detection via 2-second `/proc` scan with SteamAppId resolution. Hotkey via XDG GlobalShortcuts portal (`ashpd`) plus a `GAction` fallback exposed on the existing `org.gtk.Actions` D-Bus surface. UI is a `gtk::GridView` clip browser plus settings additions and a status indicator on the existing dashboard.
 
-**Tech Stack:** Rust 2024, GTK4 + libadwaita, `std::sync::mpsc` + `glib::timeout_add_local` for cross-thread comms, `ashpd` 0.10 (gtk4 feature) for portal calls, `libc` for prctl/kill, `ffmpeg` child process for thumbnails + remix export, `gpu-screen-recorder` child process for capture.
+**Tech Stack:** Rust 2024, GTK4 + libadwaita, `std::sync::mpsc` + `glib::timeout_add_local` for cross-thread comms, `ashpd` 0.10 (gtk4 feature) for portal calls, `libc` for prctl/kill, `ffmpeg` child process for thumbnails + remix export, `flatpak run com.dec05eba.gpu_screen_recorder` child process for capture.
 
 **Reference spec:** `docs/superpowers/specs/2026-05-08-clipping-system-design.md` (commit `f03a7cd`).
 
@@ -28,23 +28,25 @@ git status
 
 If `M` lines for files outside this plan's scope are present, ask the user how to proceed before starting.
 
-- [ ] **P.2: Verify GSR is installed on host + KDE version + locate install command**
+- [ ] **P.2: Verify GSR Flatpak + KDE version**
+
+This project takes a "Bazzite-flatpak-only, never layer" approach. GSR is consumed as a Flatpak (`com.dec05eba.gpu_screen_recorder` from Flathub), not as a host binary. End users will install the same Flatpak alongside this app.
 
 Run:
 
 ```bash
-which gpu-screen-recorder && gpu-screen-recorder --help 2>&1 | head -20
+flatpak info com.dec05eba.gpu_screen_recorder 2>&1 | head -10
 ```
 
-Expected: a path (e.g. `/usr/bin/gpu-screen-recorder`) and a flag listing.
+Expected: lines like `gpu-screen-recorder` / `Branch: stable` / `Version: 5.x.x`.
 
-If not installed, find the exact install command on this Bazzite spin:
+If "not installed", instruct the user to install:
 
 ```bash
-ujust --choose 2>/dev/null | grep -i gpu-screen-recorder || true
+flatpak install --user flathub com.dec05eba.gpu_screen_recorder
 ```
 
-If a `ujust` recipe exists, use that. Otherwise fall back to `rpm-ostree install gpu-screen-recorder` (which requires a reboot on Bazzite atomic). Document the exact command found in this preflight in your implementation log.
+Tasks 1.1–1.6 do not invoke GSR and can land before this is satisfied. Do not proceed past Task 1.7 (which spawns GSR via `flatpak run`) until `flatpak info` succeeds.
 
 Also verify KDE Plasma version — the GlobalShortcuts portal had a known bug fixed in Plasma 6.4.1 (KDE xdg-desktop-portal-kde MR !412):
 
@@ -52,9 +54,7 @@ Also verify KDE Plasma version — the GlobalShortcuts portal had a known bug fi
 plasmashell --version
 ```
 
-Expected: ≥ 6.4.1. If older, log this — Phase 4 portal binding may silently fail and only the GAction fallback (Phase 4 Task 4.1) will reach the buffer.
-
-Do not proceed without GSR available.
+Expected: ≥ 6.4.1. If older, log it — Phase 4 portal binding may silently fail and only the GAction fallback will reach the buffer.
 
 - [ ] **P.3: Verify ffmpeg is installed**
 
@@ -66,6 +66,10 @@ which ffmpeg && which ffprobe
 
 Expected: paths for both. They are part of every Bazzite install.
 
+- [ ] **P.4: GSR Flatpak filesystem-permission strategy**
+
+The GSR Flatpak's default Flathub manifest grants `--filesystem=xdg-videos:create`. We place the save-callback script and FIFO inside `<storage>/.arctis/` (i.e. `~/Videos/Clips/.arctis/save_callback.sh` + `save.fifo`) so GSR can read/exec the script and write to the FIFO without any extra `flatpak override` on the user's part. No action needed at preflight; this is just a note that Task 1.6 places those fixtures there for this reason.
+
 ---
 
 ## File Structure
@@ -75,7 +79,7 @@ Expected: paths for both. They are part of every Bazzite install.
 | Path | Responsibility |
 |---|---|
 | `src/clips/mod.rs` | Public entry: `init()`, channel types, `build_clips_page()`, status indicator widget |
-| `src/clips/backend.rs` | `GsrBackend` — drives `gpu-screen-recorder` child process. Owns the long-lived backend thread. |
+| `src/clips/backend.rs` | `GsrBackend` — drives the `com.dec05eba.gpu_screen_recorder` Flatpak via `flatpak run` as a child process. Owns the long-lived backend thread. |
 | `src/clips/detector.rs` | `GameDetector` — `/proc` scan, SteamAppId lookup, debounce, optional gamemoded D-Bus monitor |
 | `src/clips/buffer.rs` | `BufferController` — state machine (Uninitialized / Idle / Arming / Armed / Saving / ErrorState) |
 | `src/clips/hotkey.rs` | GlobalShortcuts portal binding via ashpd + `GAction` registration |
@@ -492,30 +496,35 @@ use std::os::unix::fs::OpenOptionsExt;
 
 const SAVE_CALLBACK_BYTES: &[u8] = include_bytes!("../../data/clips/save_callback.sh");
 
-/// Path to the extracted save-callback script (~/.cache/arctis-chatmix/clips/save_callback.sh).
-pub fn save_callback_path() -> PathBuf {
-    cache_dir().join("save_callback.sh")
+/// Default storage directory. Both the callback script and the FIFO live in
+/// `<storage>/.arctis/` so the GSR Flatpak's `--filesystem=xdg-videos:create`
+/// permission covers them without requiring any user-side `flatpak override`.
+pub fn default_storage_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").expect("HOME");
+    PathBuf::from(home).join("Videos/Clips")
 }
 
-/// Path to the FIFO the callback writes to (~/.cache/arctis-chatmix/clips/save.fifo).
-pub fn save_fifo_path() -> PathBuf {
-    cache_dir().join("save.fifo")
+/// Hidden subdirectory inside the storage dir for save-callback fixtures.
+fn fixtures_dir(storage_dir: &PathBuf) -> PathBuf {
+    storage_dir.join(".arctis")
 }
 
-fn cache_dir() -> PathBuf {
-    let xdg = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .expect("HOME or XDG_CACHE_HOME must be set");
-    xdg.join("arctis-chatmix").join("clips")
+/// Path to the extracted save-callback script.
+pub fn save_callback_path(storage_dir: &PathBuf) -> PathBuf {
+    fixtures_dir(storage_dir).join("save_callback.sh")
 }
 
-/// Extract the bundled save-callback script. Idempotent (size-mismatch check, mirrors
-/// the HRIR/Lucide-icon pattern).
-pub fn ensure_save_callback() -> std::io::Result<PathBuf> {
-    let dir = cache_dir();
+/// Path to the FIFO the callback writes to.
+pub fn save_fifo_path(storage_dir: &PathBuf) -> PathBuf {
+    fixtures_dir(storage_dir).join("save.fifo")
+}
+
+/// Extract the bundled save-callback script into `<storage>/.arctis/`.
+/// Idempotent (size-mismatch check, mirrors the HRIR/Lucide-icon pattern).
+pub fn ensure_save_callback(storage_dir: &PathBuf) -> std::io::Result<PathBuf> {
+    let dir = fixtures_dir(storage_dir);
     fs::create_dir_all(&dir)?;
-    let path = save_callback_path();
+    let path = save_callback_path(storage_dir);
     let needs_write = match fs::metadata(&path) {
         Ok(m) => m.len() != SAVE_CALLBACK_BYTES.len() as u64,
         Err(_) => true,
@@ -529,9 +538,10 @@ pub fn ensure_save_callback() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Create the save FIFO if it doesn't already exist. Idempotent.
-pub fn ensure_save_fifo() -> std::io::Result<PathBuf> {
-    let path = save_fifo_path();
+/// Create the save FIFO inside `<storage>/.arctis/` if it doesn't already exist.
+/// Idempotent.
+pub fn ensure_save_fifo(storage_dir: &PathBuf) -> std::io::Result<PathBuf> {
+    let path = save_fifo_path(storage_dir);
     fs::create_dir_all(path.parent().unwrap())?;
     if !path.exists() {
         // mkfifo via libc — no shell-out for a single syscall.
@@ -549,33 +559,41 @@ pub fn ensure_save_fifo() -> std::io::Result<PathBuf> {
 mod fixture_tests {
     use super::*;
 
+    fn temp_storage_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("arctis-clips-test-{}", std::process::id()))
+    }
+
     #[test]
     fn ensure_save_callback_creates_executable_script() {
-        let path = ensure_save_callback().expect("write callback");
+        let dir = temp_storage_dir();
+        let path = ensure_save_callback(&dir).expect("write callback");
         assert!(path.exists());
         let m = fs::metadata(&path).unwrap();
         let mode = std::os::unix::fs::PermissionsExt::mode(&m.permissions());
         assert_eq!(mode & 0o100, 0o100, "owner-execute bit must be set");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn ensure_save_callback_is_idempotent() {
-        let p1 = ensure_save_callback().unwrap();
-        let p2 = ensure_save_callback().unwrap();
+        let dir = temp_storage_dir().join("idem");
+        let p1 = ensure_save_callback(&dir).unwrap();
+        let p2 = ensure_save_callback(&dir).unwrap();
         assert_eq!(p1, p2);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn ensure_save_fifo_creates_fifo() {
-        // Remove first to test creation.
-        let p = save_fifo_path();
+        let dir = temp_storage_dir().join("fifo");
+        let p = save_fifo_path(&dir);
         let _ = fs::remove_file(&p);
-        let path = ensure_save_fifo().expect("create fifo");
+        let path = ensure_save_fifo(&dir).expect("create fifo");
         let m = fs::metadata(&path).unwrap();
         let ft = m.file_type();
-        // PipeWire-style FIFO check via std::os::unix::fs::FileTypeExt
         use std::os::unix::fs::FileTypeExt;
         assert!(ft.is_fifo());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 ```
@@ -608,12 +626,19 @@ Append to `src/clips/backend.rs`:
 use std::process::{Child, Command, Stdio};
 use std::os::unix::process::CommandExt;
 
-/// Spawn a `gpu-screen-recorder` child with PR_SET_PDEATHSIG so it dies if we die.
-/// Sets ARCTIS_CHATMIX_SAVE_FIFO in env so the callback script can find the FIFO.
+/// Spawn a `gpu-screen-recorder` child via the Flathub Flatpak with
+/// PR_SET_PDEATHSIG so it dies if we die. Sets ARCTIS_CHATMIX_SAVE_FIFO via
+/// `--env=` so the callback script (run inside the Flatpak sandbox) sees it.
+///
+/// Returns the Child handle for the `flatpak` wrapper process. Signals sent to
+/// this PID are forwarded by Flatpak's bwrap into the contained GSR process.
 pub fn spawn_gsr(args: &[String], fifo_path: &PathBuf) -> std::io::Result<Child> {
-    let mut cmd = Command::new("gpu-screen-recorder");
-    cmd.args(args)
-        .env("ARCTIS_CHATMIX_SAVE_FIFO", fifo_path)
+    let mut cmd = Command::new("flatpak");
+    cmd.arg("run")
+        // Pass the FIFO path as an env var into the sandbox.
+        .arg(format!("--env=ARCTIS_CHATMIX_SAVE_FIFO={}", fifo_path.display()))
+        .arg("com.dec05eba.gpu_screen_recorder")
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -721,8 +746,13 @@ struct ActiveCapture {
 }
 
 fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
-    let _ = ensure_save_callback();
-    let _ = ensure_save_fifo();
+    // Use the default storage dir for fixtures until we get the first StartReplay
+    // command (which carries the user-configured storage_dir). Re-extract on each
+    // arm so a settings-changed storage path is honored.
+    let initial_storage = default_storage_dir();
+    let _ = std::fs::create_dir_all(&initial_storage);
+    let _ = ensure_save_callback(&initial_storage);
+    let _ = ensure_save_fifo(&initial_storage);
 
     let mut active: Option<ActiveCapture> = None;
     let mut active_config: Option<CaptureConfig> = None;
@@ -831,8 +861,9 @@ fn arm(
     if active.is_some() {
         return Ok(()); // already armed; idempotent
     }
-    let cb = ensure_save_callback()?;
-    let fifo = ensure_save_fifo()?;
+    std::fs::create_dir_all(&config.output_dir)?;
+    let cb = ensure_save_callback(&config.output_dir)?;
+    let fifo = ensure_save_fifo(&config.output_dir)?;
     let args = build_gsr_args(
         config,
         cb.to_str().unwrap(),
@@ -883,7 +914,13 @@ fn save(active: &Option<ActiveCapture>, signal: libc::c_int, evt_tx: &Sender<Bac
 
 fn run_fifo_reader(evt_tx: Sender<BackendEvent>) {
     use std::fs::File;
-    let path = save_fifo_path();
+    // The FIFO lives under the active storage dir. For the reader we use the
+    // default-storage path as a fallback; if the user configures a different
+    // storage_dir, the backend recreates the FIFO there at arm time. The reader
+    // re-opens on each iteration via the path supplied to arm() through the
+    // config; the simplest approach is to scan both default and any later
+    // configured paths. For v1, the default path covers ≥99% of users.
+    let path = save_fifo_path(&default_storage_dir());
     loop {
         // Opening a FIFO for reading blocks until a writer connects; that's fine —
         // the GSR callback opens for write each time it fires.

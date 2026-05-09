@@ -127,7 +127,7 @@ Pause/resume is **not** supported in replay mode (`SIGUSR2` is documented as "no
 echo "$1" > "$ARCTIS_CHATMIX_SAVE_FIFO"
 ```
 
-The wrapper is extracted from `include_bytes!`-bundled content into `~/.cache/arctis-chatmix/clips/save_callback.sh` on first arm (idempotent, mirroring how Lucide icons and HRIR WAVs are bundled). The FIFO lives at `~/.cache/arctis-chatmix/clips/save.fifo`. The backend thread reads lines from the FIFO and emits `BackendEvent::Saved { path }` for each.
+The wrapper is extracted from `include_bytes!`-bundled content into `<storage_dir>/.arctis/save_callback.sh` on first arm (idempotent, mirroring how Lucide icons and HRIR WAVs are bundled). The FIFO lives at `<storage_dir>/.arctis/save.fifo`. **Both fixtures live inside the storage directory — not under `~/.cache/` — so the GSR Flatpak's default `--filesystem=xdg-videos:create` permission covers them without any user-side `flatpak override`.** The backend thread reads lines from the FIFO and emits `BackendEvent::Saved { path }` for each.
 
 ### Supervision
 
@@ -359,9 +359,9 @@ New files:
 - `~/.config/arctis-chatmix/clips_settings.txt` — line-oriented `key=value`. Settings keys: `buffer_length`, `bitrate_mbps`, `auto_arm`, `always_armed`, `per_source_tracks`, `mic_capture`, `storage_path`, `disk_cap_gb`, `hotkey_binding` (just the suggested string; portal owns the actual binding).
 - `~/.config/arctis-chatmix/clips_portal.txt` — single line: the persisted ScreenCast `restore_token`.
 - `~/.config/arctis-chatmix/clips_index.txt` — clip metadata index (described above).
-- `~/.cache/arctis-chatmix/clips/save_callback.sh` — extracted bundled callback script.
-- `~/.cache/arctis-chatmix/clips/save.fifo` — IPC FIFO from callback to backend thread.
-- `~/.cache/arctis-chatmix/clips/thumbs/` (mirror of `<storage_path>/.cache/thumbs/` for legacy / migration cases).
+- `<storage_dir>/.arctis/save_callback.sh` — extracted bundled callback script (default `~/Videos/Clips/.arctis/save_callback.sh`). Inside the storage dir so the GSR Flatpak's xdg-videos permission covers it.
+- `<storage_dir>/.arctis/save.fifo` — IPC FIFO from the callback to the backend thread (default `~/Videos/Clips/.arctis/save.fifo`).
+- `<storage_dir>/.cache/thumbs/` — generated thumbnail JPEGs (default `~/Videos/Clips/.cache/thumbs/`).
 
 ## Lifecycle integration
 
@@ -411,18 +411,20 @@ These need to be confirmed in practice during implementation; the design assumes
 3. **`-restore-portal-session yes` behavior on KDE 6.x.** Assumed: silent restore on subsequent launches. KDE 6.5+ has bug-fixed this path; verify.
 4. **xdg-desktop-portal #1371 still open on Bazzite's KDE.** If KDE has fixed it independently of upstream, the recovery UI (thumbnail in toast, Test capture button) becomes a smaller concern.
 5. **Steam appmanifest path.** Assumed `~/.steam/steam/steamapps/`. On Bazzite-deck (Flatpak Steam) the path may differ — check before locking.
-
-Each of these should be a brief integration test the implementer runs before claiming the feature done.
+6. **Signal forwarding through `flatpak run`.** GSR is invoked via `flatpak run com.dec05eba.gpu_screen_recorder`. The Flatpak wrapper (bwrap) is documented to forward POSIX signals (SIGINT, SIGTERM, SIGUSR1) to the contained process, but real-time signals (SIGRTMIN+1..3 for duration-specific saves) are less commonly tested. Verify with: `flatpak run com.dec05eba.gpu_screen_recorder ... &` then `kill -SIGRTMIN+1 <pid>` and confirm GSR saves the 30s clip. If real-time signals don't forward, fall back to using only SIGUSR1 and ignore the duration-specific variants in v1 (the `-r` config dictates buffer length anyway).
+7. **Multi-monitor capture target restore.** xdg-desktop-portal #1371 may still be open on Plasma 6.6.4 — verify the persisted source picker honors the originally-selected monitor across restart.
 
 ## Future Flatpak strategy
 
-When packaging as Flatpak:
+This project is "Bazzite-flatpak-only, never layer." GSR is consumed as a Flatpak (`com.dec05eba.gpu_screen_recorder` from Flathub) both during dev and after this app is itself packaged. End users install both Flatpaks side-by-side; that's documented as a setup step and surfaced in the app's Clips onboarding card with a one-click `flatpak install --user` prompt (using `--talk-name=org.freedesktop.Flatpak`).
+
+When packaging this app as Flatpak:
 
 - Manifest depends on `org.freedesktop.Sdk` (default).
-- Permissions: `--socket=pipewire`, `--device=dri` (VAAPI), `--device=all` (NVIDIA NVENC — narrowed if Bazzite's NVIDIA Flatpak overlay supports it explicitly), `--filesystem=xdg-videos:create`, `--talk-name=org.freedesktop.portal.*`.
-- GSR is **not bundled.** The Flatpak calls `flatpak-spawn --host gpu-screen-recorder ...` to use the host binary. Same arguments. Same control plane (signals work across `flatpak-spawn`). This avoids GPL-3.0 derivative-work concerns and lets Bazzite's GSR install be the source of truth.
-- The save-callback FIFO needs a path the host script can write to that the sandbox can read. Use `/run/user/<uid>/arctis-chatmix-save.fifo` (host-accessible via `--filesystem=xdg-run`).
-- Steam appmanifest reading needs `--filesystem=~/.steam:ro`.
+- Permissions: `--socket=pipewire`, `--filesystem=xdg-videos:create` (clip output + save-callback fixtures), `--filesystem=~/.steam:ro` (Steam appmanifest reading for game names), `--talk-name=org.freedesktop.portal.*` (ScreenCast + GlobalShortcuts portals), `--talk-name=org.freedesktop.Flatpak` (to spawn GSR via `flatpak-spawn`).
+- GSR is **not bundled.** Bundling would force GPL-3.0 onto this app. Instead, the Flatpak calls `flatpak-spawn --host flatpak run com.dec05eba.gpu_screen_recorder ...` — host's `flatpak` CLI used to run the other sandboxed Flatpak. "The host runs both."
+- The save-callback fixtures (script + FIFO) live inside the storage directory at `<storage>/.arctis/`, which the GSR Flatpak's xdg-videos permission already covers. No extra `flatpak override` needed at end-user install time.
+- License-wise: GSR remains a separate sandboxed process invoked via `flatpak run`. No linking, no shared address space. The app's license stays whatever you choose — no GPL-3.0 obligation from GSR's side.
 
 This is a small, well-scoped follow-up — not a rewrite. The architecture above is Flatpak-ready by design.
 
