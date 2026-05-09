@@ -432,6 +432,15 @@ fn arm(
     if active.is_some() {
         return Ok(()); // already armed; idempotent
     }
+    if !crate::clips::gsr_install::is_installed() {
+        // The user uninstalled the Flatpak after onboarding. Emit a typed
+        // NotFound error so `run_backend` can surface it as a recovery toast
+        // pointing at Settings → Clips → Reinstall.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "gpu-screen-recorder Flatpak is not installed. Reinstall it from Settings → Clips.",
+        ));
+    }
     std::fs::create_dir_all(&config.output_dir)?;
     let cb = ensure_save_callback(&config.output_dir)?;
     let fifo = ensure_save_fifo(&config.output_dir)?;

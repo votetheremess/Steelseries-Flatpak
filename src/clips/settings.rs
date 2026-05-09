@@ -123,9 +123,9 @@ pub fn mark_onboarding_complete() -> std::io::Result<()> {
 }
 
 /// Build the Clips PreferencesGroup for the Settings page. Currently exposes
-/// the Capture source row (Test + Reset buttons). The gpu-screen-recorder
-/// Reinstall row is added in Task 3.8. Other clip settings (buffer length,
-/// bitrate, storage path, etc.) come in Phase 6.
+/// the Capture source row (Test + Reset buttons) and the gpu-screen-recorder
+/// Reinstall row. Other clip settings (buffer length, bitrate, storage path,
+/// etc.) come in Phase 6.
 pub fn build_clips_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder().title("Clips").build();
 
@@ -146,6 +146,23 @@ pub fn build_clips_group() -> adw::PreferencesGroup {
     row_box.append(&reset_btn);
     reset_row.add_suffix(&row_box);
     group.add(&reset_row);
+
+    // gpu-screen-recorder row — Reinstall button reuses the wizard's
+    // `app.gsr-install` action (registered in app.rs). This handles the case
+    // where the user uninstalled the GSR Flatpak via Bazaar/Discover after
+    // onboarding; the next `arm()` will fail with a NotFound error and the
+    // user can recover via this button.
+    let reinstall_row = adw::ActionRow::builder()
+        .title("gpu-screen-recorder")
+        .subtitle("The Flatpak Clips uses to capture gameplay")
+        .build();
+    let reinstall_btn = gtk::Button::builder()
+        .label("Reinstall")
+        .valign(gtk::Align::Center)
+        .build();
+    reinstall_btn.set_action_name(Some("app.gsr-install"));
+    reinstall_row.add_suffix(&reinstall_btn);
+    group.add(&reinstall_row);
 
     group
 }
