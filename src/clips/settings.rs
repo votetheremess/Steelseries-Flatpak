@@ -4,6 +4,7 @@
 //! config files. Unknown keys are silently ignored so a downgrade doesn't
 //! lose data the older binary doesn't understand.
 
+use adw::prelude::*;
 use std::path::PathBuf;
 
 const SETTINGS_FILENAME: &str = "clips_settings.txt";
@@ -119,6 +120,28 @@ pub fn mark_onboarding_complete() -> std::io::Result<()> {
     let mut s = load();
     s.onboarding_complete = true;
     save(&s)
+}
+
+/// Build the Clips PreferencesGroup for the Settings page. Currently exposes
+/// the Capture source row (Reset button). The Test button is added in Task
+/// 3.7 and the gpu-screen-recorder Reinstall row in Task 3.8. Other clip
+/// settings (buffer length, bitrate, storage path, etc.) come in Phase 6.
+pub fn build_clips_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Clips").build();
+
+    let reset_row = adw::ActionRow::builder()
+        .title("Capture source")
+        .subtitle("Pick the screen recorded by the clip buffer")
+        .build();
+    let reset_btn = gtk::Button::builder()
+        .label("Reset")
+        .valign(gtk::Align::Center)
+        .build();
+    reset_btn.set_action_name(Some("app.reset-clips-capture"));
+    reset_row.add_suffix(&reset_btn);
+    group.add(&reset_row);
+
+    group
 }
 
 #[cfg(test)]

@@ -164,6 +164,22 @@ impl BufferController {
         }
     }
 
+    /// Portal pick was reset by the user (Settings → Clips → Reset). Disarm
+    /// if currently armed/arming/saving so we don't keep capturing a screen
+    /// the user no longer wants, then return to Uninitialized so the next
+    /// portal pick re-arms cleanly.
+    pub fn on_portal_reset(&mut self, cmd_tx: &Sender<ClipCommand>) {
+        if matches!(
+            self.state,
+            BufferState::Armed | BufferState::Arming | BufferState::Saving
+        ) {
+            let _ = cmd_tx.send(ClipCommand::StopReplay);
+        }
+        self.has_portal_pick = false;
+        self.config.portal_restore_token = None;
+        self.state = BufferState::Uninitialized;
+    }
+
     fn maybe_arm(&mut self, cmd_tx: &Sender<ClipCommand>) {
         if !self.has_portal_pick {
             return;
@@ -296,6 +312,20 @@ mod tests {
             &tx,
         );
         assert_eq!(b.state(), BufferState::Idle);
+        assert!(matches!(rx.try_recv(), Ok(ClipCommand::StopReplay)));
+    }
+
+    #[test]
+    fn portal_reset_returns_to_uninitialized() {
+        let (tx, rx) = channel();
+        let mut b = BufferController::new(cfg());
+        b.on_portal_pick_complete("t".into(), &tx);
+        b.on_game_started(dg(42), &tx);
+        let _ = rx.try_recv(); // consume StartReplay
+        b.on_backend_event(&BackendEvent::Armed, &tx);
+        assert_eq!(b.state(), BufferState::Armed);
+        b.on_portal_reset(&tx);
+        assert_eq!(b.state(), BufferState::Uninitialized);
         assert!(matches!(rx.try_recv(), Ok(ClipCommand::StopReplay)));
     }
 

@@ -418,6 +418,39 @@ pub fn run(start_hidden: bool) {
                 app.add_action_entries([setup_action]);
             }
 
+            // app.reset-clips-capture — clears the persisted portal token,
+            // disarms the buffer if currently capturing, and returns the
+            // Clips page to the onboarding wizard (PickScreen step, since
+            // GSR is still installed). Triggered from Settings → Clips →
+            // Reset.
+            {
+                let clips_page = window.clips_page();
+                let buffer_for_reset = buffer.clone();
+                let resources_for_reset = resources.clone();
+                let reset_action = gtk::gio::ActionEntry::builder("reset-clips-capture")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        if let Err(e) = crate::clips::portal::clear_token() {
+                            log::warn!("clear_token failed: {e}");
+                        }
+                        let cmd_tx = resources_for_reset
+                            .borrow()
+                            .as_ref()
+                            .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
+                        if let Some(tx) = cmd_tx {
+                            buffer_for_reset.borrow_mut().on_portal_reset(&tx);
+                        } else {
+                            log::warn!("no clip backend available to reset capture");
+                        }
+                        // GSR is still installed (the user just wants a new
+                        // screen pick), so jump straight to PickScreen rather
+                        // than the install step.
+                        clips_page.set_wizard_step(crate::clips::WizardStep::PickScreen);
+                        clips_page.set_state(crate::clips::PageState::Onboarding);
+                    })
+                    .build();
+                app.add_action_entries([reset_action]);
+            }
+
             // app.pick-clip-storage — folder picker for the clips storage
             // path. Stub for now; full implementation comes in a later
             // phase. Registered so the Page 3 button doesn't error out.

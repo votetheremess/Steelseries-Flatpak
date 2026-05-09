@@ -530,6 +530,9 @@ fn build_settings_page(app: &adw::Application) -> gtk::Widget {
     general_group.add(&autostart_row);
     page.add(&general_group);
 
+    // Clips
+    page.add(&crate::clips::settings::build_clips_group());
+
     // Data
     let data_group = adw::PreferencesGroup::builder().title("Data").build();
     let clear_row = adw::ActionRow::builder()
