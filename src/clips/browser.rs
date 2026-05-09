@@ -138,13 +138,13 @@ fn build_page1_install() -> (gtk::Widget, gtk::Label, gtk::Button) {
     alt_label.add_css_class("dim-label");
     page.append(&alt_label);
 
-    let bazaar_btn = gtk::Button::builder()
-        .label("Open in Bazaar")
+    let app_store_btn = gtk::Button::builder()
+        .label("Open in app store")
         .css_classes(["pill"])
         .halign(gtk::Align::Center)
         .build();
-    bazaar_btn.set_action_name(Some("app.gsr-open-in-bazaar"));
-    page.append(&bazaar_btn);
+    app_store_btn.set_action_name(Some("app.gsr-open-in-app-store"));
+    page.append(&app_store_btn);
 
     // Terminal command in a code block + Copy button.
     let code_box = gtk::Box::builder()

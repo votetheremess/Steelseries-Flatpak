@@ -149,9 +149,10 @@ pub fn build_clips_group() -> adw::PreferencesGroup {
 
     // gpu-screen-recorder row — Reinstall button reuses the wizard's
     // `app.gsr-install` action (registered in app.rs). This handles the case
-    // where the user uninstalled the GSR Flatpak via Bazaar/Discover after
-    // onboarding; the next `arm()` will fail with a NotFound error and the
-    // user can recover via this button.
+    // where the user uninstalled the GSR Flatpak via the system app store
+    // (Discover / Software / Bazaar / etc.) after onboarding; the next
+    // `arm()` will fail with a NotFound error and the user can recover via
+    // this button.
     let reinstall_row = adw::ActionRow::builder()
         .title("gpu-screen-recorder")
         .subtitle("The Flatpak Clips uses to capture gameplay")

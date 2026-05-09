@@ -299,16 +299,18 @@ pub fn run(start_hidden: bool) {
                 app.add_action_entries([install_action]);
             }
 
-            // app.gsr-open-in-bazaar — opens appstream:// URL via xdg-open.
+            // app.gsr-open-in-app-store — opens appstream:// URL via xdg-open.
+            // The DE's appstream:// handler decides which app store opens
+            // (Discover on KDE, Software on GNOME, Bazaar on Bazzite, etc.).
             {
-                let bazaar_action = gtk::gio::ActionEntry::builder("gsr-open-in-bazaar")
+                let app_store_action = gtk::gio::ActionEntry::builder("gsr-open-in-app-store")
                     .activate(|_app: &adw::Application, _action, _param| {
-                        if let Err(e) = crate::clips::gsr_install::open_in_bazaar() {
-                            log::warn!("open_in_bazaar failed: {e}");
+                        if let Err(e) = crate::clips::gsr_install::open_in_app_store() {
+                            log::warn!("open_in_app_store failed: {e}");
                         }
                     })
                     .build();
-                app.add_action_entries([bazaar_action]);
+                app.add_action_entries([app_store_action]);
             }
 
             // app.gsr-copy-cli — copy the terminal install command to the
@@ -487,9 +489,9 @@ pub fn run(start_hidden: bool) {
                 app.add_action_entries([pick_storage_action]);
             }
 
-            // GSR-install detection poll. If the user installs GSR via
-            // Bazaar / a terminal while sitting on Page 1, this timer
-            // notices and enables the Next button. The in-app install
+            // GSR-install detection poll. If the user installs GSR via the
+            // system app store / a terminal while sitting on Page 1, this
+            // timer notices and enables the Next button. The in-app install
             // path enables Next via its own progress watcher; whichever
             // finishes first wins.
             {

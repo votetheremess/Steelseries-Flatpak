@@ -103,8 +103,11 @@ fn run_install(tx: Sender<InstallProgress>) {
 }
 
 /// Open the GSR app page in the system app store via AppStream URI.
-/// On Bazzite this opens Bazaar; on KDE it opens Discover; on GNOME it opens Software.
-pub fn open_in_bazaar() -> std::io::Result<()> {
+/// The actual handler depends on the desktop environment's `appstream://`
+/// association: KDE opens Discover, GNOME opens Software, Bazzite-with-Bazaar
+/// opens Bazaar, etc. We don't try to detect the handler — the URL is
+/// generic and xdg-open routes it appropriately.
+pub fn open_in_app_store() -> std::io::Result<()> {
     let url = format!("appstream://{GSR_APP_ID}");
     Command::new("xdg-open")
         .arg(url)
