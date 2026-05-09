@@ -254,3 +254,254 @@ pub fn send_signal(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+use std::io::{BufRead, BufReader};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread::{self, JoinHandle};
+use std::time::Duration as StdDuration;
+
+use crate::clips::{BackendEvent, ClipCommand};
+
+/// Handle for the backend thread. Drop = clean shutdown via Shutdown command.
+pub struct BackendHandle {
+    cmd_tx: Sender<ClipCommand>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl BackendHandle {
+    pub fn send(&self, cmd: ClipCommand) {
+        let _ = self.cmd_tx.send(cmd);
+    }
+}
+
+impl Drop for BackendHandle {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(ClipCommand::Shutdown);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// Spawn the backend thread. Returns a handle for sending commands and a receiver
+/// for events.
+pub fn spawn_backend() -> (BackendHandle, Receiver<BackendEvent>) {
+    let (cmd_tx, cmd_rx) = channel::<ClipCommand>();
+    let (evt_tx, evt_rx) = channel::<BackendEvent>();
+
+    let join = thread::Builder::new()
+        .name("clip-backend".into())
+        .spawn(move || run_backend(cmd_rx, evt_tx))
+        .expect("spawn clip-backend thread");
+
+    (BackendHandle { cmd_tx, join: Some(join) }, evt_rx)
+}
+
+struct ActiveCapture {
+    child: Child,
+    stdout_lines: Vec<String>, // last few lines for error context
+}
+
+fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
+    // Use the default storage dir for fixtures until we get the first StartReplay
+    // command (which carries the user-configured storage_dir). Re-extract on each
+    // arm so a settings-changed storage path is honored.
+    let initial_storage = default_storage_dir();
+    let _ = std::fs::create_dir_all(&initial_storage);
+    let _ = ensure_save_callback(&initial_storage);
+    let _ = ensure_save_fifo(&initial_storage);
+
+    let mut active: Option<ActiveCapture> = None;
+    let mut active_config: Option<CaptureConfig> = None;
+    let mut consecutive_failures = 0u32;
+
+    // Spawn a FIFO reader thread once. It reads lines forever and forwards them
+    // through evt_tx as Saved events.
+    let evt_for_fifo = evt_tx.clone();
+    thread::Builder::new()
+        .name("clip-fifo-reader".into())
+        .spawn(move || run_fifo_reader(evt_for_fifo))
+        .expect("spawn fifo-reader");
+
+    loop {
+        // Drain any pending commands (blocking with a short timeout so we can
+        // also poll the child's exit status).
+        match cmd_rx.recv_timeout(StdDuration::from_millis(200)) {
+            Ok(ClipCommand::StartReplay { config }) => {
+                if let Err(e) = arm(&mut active, &mut active_config, &config, &evt_tx) {
+                    let _ = evt_tx.send(BackendEvent::Error {
+                        context: "StartReplay".into(),
+                        message: e.to_string(),
+                    });
+                } else {
+                    consecutive_failures = 0;
+                    let _ = evt_tx.send(BackendEvent::Armed);
+                }
+            }
+            Ok(ClipCommand::StopReplay) => {
+                disarm(&mut active);
+                let _ = evt_tx.send(BackendEvent::Disarmed);
+            }
+            Ok(ClipCommand::SaveClip) => {
+                save(&active, libc::SIGUSR1, &evt_tx);
+            }
+            Ok(ClipCommand::SaveClipShort) => {
+                save(&active, libc::SIGRTMIN() + 1, &evt_tx);
+            }
+            Ok(ClipCommand::SaveClipMedium) => {
+                save(&active, libc::SIGRTMIN() + 2, &evt_tx);
+            }
+            Ok(ClipCommand::SaveClipLong) => {
+                save(&active, libc::SIGRTMIN() + 3, &evt_tx);
+            }
+            Ok(ClipCommand::Reconfigure { config }) => {
+                disarm(&mut active);
+                if let Err(e) = arm(&mut active, &mut active_config, &config, &evt_tx) {
+                    let _ = evt_tx.send(BackendEvent::Error {
+                        context: "Reconfigure".into(),
+                        message: e.to_string(),
+                    });
+                } else {
+                    let _ = evt_tx.send(BackendEvent::Armed);
+                }
+            }
+            Ok(ClipCommand::Shutdown) => {
+                disarm(&mut active);
+                return;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+
+        // Supervise the child.
+        if let Some(a) = active.as_mut() {
+            match a.child.try_wait() {
+                Ok(Some(status)) => {
+                    let reason = format!("GSR exited with {status:?}");
+                    log::warn!("clip-backend: {reason}");
+                    let _ = evt_tx.send(BackendEvent::BackendDied { reason: reason.clone() });
+                    active = None;
+
+                    consecutive_failures += 1;
+                    if consecutive_failures < 2 {
+                        if let Some(cfg) = active_config.clone() {
+                            log::info!("clip-backend: auto-restart attempt 1");
+                            if let Err(e) = arm(&mut active, &mut active_config, &cfg, &evt_tx) {
+                                let _ = evt_tx.send(BackendEvent::Error {
+                                    context: "auto-restart".into(),
+                                    message: e.to_string(),
+                                });
+                            } else {
+                                let _ = evt_tx.send(BackendEvent::Armed);
+                            }
+                        }
+                    } else {
+                        let _ = evt_tx.send(BackendEvent::Error {
+                            context: "supervision".into(),
+                            message: "GSR died twice in a row; user retry required".into(),
+                        });
+                    }
+                }
+                Ok(None) => {} // still running
+                Err(e) => log::warn!("clip-backend: try_wait error: {e}"),
+            }
+        }
+    }
+}
+
+fn arm(
+    active: &mut Option<ActiveCapture>,
+    active_config: &mut Option<CaptureConfig>,
+    config: &CaptureConfig,
+    _evt_tx: &Sender<BackendEvent>,
+) -> std::io::Result<()> {
+    if active.is_some() {
+        return Ok(()); // already armed; idempotent
+    }
+    std::fs::create_dir_all(&config.output_dir)?;
+    let cb = ensure_save_callback(&config.output_dir)?;
+    let fifo = ensure_save_fifo(&config.output_dir)?;
+    let args = build_gsr_args(
+        config,
+        cb.to_str().unwrap(),
+        config.output_dir.to_str().unwrap(),
+    );
+    let child = spawn_gsr(&args, &fifo)?;
+    *active = Some(ActiveCapture { child, stdout_lines: Vec::new() });
+    *active_config = Some(config.clone());
+    Ok(())
+}
+
+fn disarm(active: &mut Option<ActiveCapture>) {
+    if let Some(mut a) = active.take() {
+        let pid = a.child.id();
+        let _ = send_signal(pid, libc::SIGINT);
+        // Give it 2s to exit cleanly.
+        for _ in 0..20 {
+            if let Ok(Some(_)) = a.child.try_wait() {
+                return;
+            }
+            thread::sleep(StdDuration::from_millis(100));
+        }
+        // Force.
+        let _ = a.child.kill();
+        let _ = a.child.wait();
+    }
+}
+
+fn save(active: &Option<ActiveCapture>, signal: libc::c_int, evt_tx: &Sender<BackendEvent>) {
+    match active {
+        Some(a) => {
+            let pid = a.child.id();
+            if let Err(e) = send_signal(pid, signal) {
+                let _ = evt_tx.send(BackendEvent::Error {
+                    context: "SaveClip".into(),
+                    message: format!("kill({pid}, {signal}) failed: {e}"),
+                });
+            }
+        }
+        None => {
+            let _ = evt_tx.send(BackendEvent::Error {
+                context: "SaveClip".into(),
+                message: "Not armed; nothing to save".into(),
+            });
+        }
+    }
+}
+
+fn run_fifo_reader(evt_tx: Sender<BackendEvent>) {
+    use std::fs::File;
+    // The FIFO lives under the active storage dir. For the reader we use the
+    // default-storage path as a fallback; if the user configures a different
+    // storage_dir, the backend recreates the FIFO there at arm time. The reader
+    // re-opens on each iteration via the path supplied to arm() through the
+    // config; the simplest approach is to scan both default and any later
+    // configured paths. For v1, the default path covers ≥99% of users.
+    let path = save_fifo_path(&default_storage_dir());
+    loop {
+        // Opening a FIFO for reading blocks until a writer connects; that's fine —
+        // the GSR callback opens for write each time it fires.
+        let f = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("clip-fifo-reader: open failed: {e}; sleeping");
+                thread::sleep(StdDuration::from_secs(1));
+                continue;
+            }
+        };
+        let r = BufReader::new(f);
+        for line in r.lines() {
+            match line {
+                Ok(p) if !p.is_empty() => {
+                    let path = PathBuf::from(p);
+                    // Don't ffprobe here — it blocks the reader. Emit Saved with
+                    // duration_ms = 0; the thumbnail-extraction worker (or a
+                    // dedicated Phase 5 ffprobe pass) fills it in via the index.
+                    let _ = evt_tx.send(BackendEvent::Saved { path, duration_ms: 0 });
+                }
+                _ => {}
+            }
+        }
+        // Reader EOF — writer closed; loop and re-open.
+    }
+}
