@@ -52,8 +52,11 @@ pub fn build_gsr_args(config: &CaptureConfig, save_callback_path: &str, output_d
     }
 
     if config.include_mic {
+        // SteelSeries_Mic is an Audio/Source/Virtual, not a sink — it has no
+        // `.monitor` companion. GSR rejects "SteelSeries_Mic.monitor" with
+        // "is not a valid audio device". Pass the source name directly.
         args.push("-a".into());
-        args.push("device:SteelSeries_Mic.monitor".into());
+        args.push("device:SteelSeries_Mic".into());
     }
 
     args
@@ -111,6 +114,25 @@ mod tests {
         let args = build_gsr_args(&c, "/tmp/cb.sh", "/home/u/Videos/Clips");
         let count = args.iter().filter(|a| *a == "-a").count();
         assert_eq!(count, 5, "track 0 mix + 4 per-source = 5");
+    }
+
+    #[test]
+    fn build_args_mic_uses_source_not_monitor() {
+        // SteelSeries_Mic is an Audio/Source/Virtual, not a sink. Sources
+        // don't have `.monitor` siblings, and GSR rejects the suffixed name
+        // with "is not a valid audio device". Make sure we pass the bare
+        // source name through.
+        let mut c = cfg();
+        c.include_mic = true;
+        let args = build_gsr_args(&c, "/tmp/cb.sh", "/home/u/Videos/Clips");
+        assert!(
+            args.iter().any(|a| a == "device:SteelSeries_Mic"),
+            "expected device:SteelSeries_Mic in args, got: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "device:SteelSeries_Mic.monitor"),
+            "device:SteelSeries_Mic.monitor must not appear, got: {args:?}"
+        );
     }
 
     #[test]
