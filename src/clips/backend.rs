@@ -9,9 +9,20 @@ use crate::clips::CaptureConfig;
 /// Caller must still set environment variables ARCTIS_CHATMIX_SAVE_FIFO and -sc path
 /// before spawning the child.
 pub fn build_gsr_args(config: &CaptureConfig, save_callback_path: &str, output_dir: &str) -> Vec<String> {
+    // Pin the portal-session token next to our other GSR fixtures so:
+    //   1. The Flatpak's xdg-videos:create permission covers it (parent
+    //      .arctis/ is already created by ensure_save_callback /
+    //      ensure_save_fifo before spawn_gsr runs, so no extra mkdir).
+    //   2. We don't share GSR's default restore-token location
+    //      (~/.config/gpu-screen-recorder/restore_token) with a user who
+    //      also runs GSR standalone, which would let either app silently
+    //      override the other's persisted session.
+    let gsr_token_path = gsr_portal_token_path(&config.output_dir);
+
     let mut args: Vec<String> = vec![
         "-w".into(), "portal".into(),
         "-restore-portal-session".into(), "yes".into(),
+        "-portal-session-token-filepath".into(), gsr_token_path.to_string_lossy().into_owned(),
         "-r".into(), config.buffer_secs.to_string(),
         "-bm".into(), "cbr".into(),
         "-q".into(), config.bitrate_mbps.to_string(),
@@ -107,6 +118,22 @@ mod tests {
         let args = build_gsr_args(&cfg(), "/tmp/cb.sh", "/home/u/Videos/Clips");
         assert!(args.windows(2).any(|w| w[0] == "-sc" && w[1] == "/tmp/cb.sh"));
     }
+
+    #[test]
+    fn build_args_includes_portal_session_token_filepath() {
+        // GSR's default `-restore-portal-session yes` writes the token to
+        // ~/.config/gpu-screen-recorder/restore_token, which a user running
+        // GSR standalone would also use — collision risk. Pin our session
+        // to the storage dir so the two don't share state.
+        let args = build_gsr_args(&cfg(), "/tmp/cb.sh", "/home/u/Videos/Clips");
+        assert!(
+            args.windows(2).any(|w| {
+                w[0] == "-portal-session-token-filepath"
+                    && w[1].ends_with("gsr_portal.token")
+            }),
+            "expected -portal-session-token-filepath flag with path ending in gsr_portal.token, got: {args:?}"
+        );
+    }
 }
 
 use std::fs;
@@ -135,6 +162,15 @@ pub fn save_callback_path(storage_dir: &PathBuf) -> PathBuf {
 /// Path to the FIFO the callback writes to.
 pub fn save_fifo_path(storage_dir: &PathBuf) -> PathBuf {
     fixtures_dir(storage_dir).join("save.fifo")
+}
+
+/// Path to GSR's portal session restore-token file. Co-located with the
+/// other GSR fixtures so the Flatpak's `--filesystem=xdg-videos:create`
+/// permission covers it without extra overrides. Isolated from GSR's
+/// default location (`~/.config/gpu-screen-recorder/restore_token`) so a
+/// user who also runs GSR standalone doesn't share session state with us.
+pub fn gsr_portal_token_path(storage_dir: &PathBuf) -> PathBuf {
+    fixtures_dir(storage_dir).join("gsr_portal.token")
 }
 
 /// Extract the bundled save-callback script into `<storage>/.arctis/`.
