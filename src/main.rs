@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod autostart;
 mod clips;
+mod desktop_file;
 mod eq;
 mod hid;
 mod icons;

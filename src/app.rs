@@ -1466,6 +1466,20 @@ pub fn run(start_hidden: bool) {
 }
 
 fn init_pipeline() -> Result<AppResources, String> {
+    // Install the .desktop file at ~/.local/share/applications/ so xdg-desktop-portal
+    // can resolve our APP_ID via its Registry interface. Without this,
+    // `ashpd::register_host_app` succeeds at the protocol level but the portal still
+    // logs "App info not found for '<APP_ID>'" and KDE rejects the GlobalShortcuts
+    // bind. We previously only installed the autostart copy at ~/.config/autostart/,
+    // which is NOT in the data search path. Idempotent — only writes if content
+    // drifts (e.g. binary path changed between dev sessions).
+    match crate::desktop_file::install_desktop_file(APP_ID) {
+        Ok(path) => log::info!("Installed desktop file at {}", path.display()),
+        Err(e) => log::warn!(
+            "Failed to install desktop file (register_host_app may fail): {e}"
+        ),
+    }
+
     log::info!("Looking for Arctis Nova Elite audio sink...");
     let headset_sink = router::find_headset_sink()?;
     log::info!("Found headset sink: {headset_sink}");
