@@ -25,6 +25,7 @@ struct Widgets {
     spare_battery_icon: gtk::Image,
     balance_scale: gtk::Scale,
     mixer: Option<MixerWidgets>,
+    clips: Option<Rc<crate::clips::ClipsPage>>,
 }
 
 fn battery_icon(percent: u8) -> (&'static str, bool) {
@@ -81,7 +82,9 @@ impl ChatMixWindow {
         );
         widgets.mixer = mixer_widgets;
         stack.add_named(&eq_page, Some("eq"));
-        stack.add_named(&crate::clips::build_clips_page(), Some("clips"));
+        let clips_page = Rc::new(crate::clips::build_clips_page());
+        stack.add_named(clips_page.widget(), Some("clips"));
+        widgets.clips = Some(clips_page);
         stack.add_named(
             &build_placeholder_page("Engine", "lucide-sliders-horizontal-symbolic", "Coming soon"),
             Some("engine"),
@@ -185,6 +188,17 @@ impl ChatMixWindow {
             scale.set_value(pct as f64);
             m.updating.set(false);
         }
+    }
+
+    /// Returns the `ClipsPage` for this window, panicking if the window was
+    /// constructed without one (which never happens in normal use — the field
+    /// is always populated during `ChatMixWindow::new`).
+    pub fn clips_page(&self) -> Rc<crate::clips::ClipsPage> {
+        self.inner
+            .borrow()
+            .clips
+            .clone()
+            .expect("clips page is always set during window construction")
     }
 
     pub fn set_battery(&self, headset: u8, spare: u8) {
@@ -364,6 +378,7 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
         spare_battery_icon: status_result.spare_battery_icon,
         balance_scale: status_result.balance_scale,
         mixer: None,
+        clips: None,
     };
 
     (scroll.upcast(), widgets)

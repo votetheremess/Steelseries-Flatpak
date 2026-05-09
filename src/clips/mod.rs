@@ -11,7 +11,7 @@ pub mod portal;
 pub mod settings;
 pub mod thumbnail;
 
-pub use browser::build_clips_page;
+pub use browser::{build_clips_page, ClipsPage, PageState, WizardStep};
 pub use buffer::{BufferController, BufferState};
 pub use detector::{DetectedGame, DetectorEvent, GameDetector};
 
