@@ -8,17 +8,23 @@
 //!
 //! State → visual mapping:
 //!
-//! | BufferState              | Visible | Dot color | Label                 |
-//! |--------------------------|---------|-----------|-----------------------|
-//! | Uninitialized            | yes     | dim white | "Set up Clips"        |
-//! | Idle                     | no      | —         | —                     |
-//! | Arming / Armed           | yes     | green     | "Buffering — <game>"  |
-//! | Saving                   | yes     | yellow    | "Saving…"             |
-//! | ErrorState               | yes     | red       | "Capture stopped"     |
+//! | BufferState              | Visible | Dot color | Label                  | Retry button |
+//! |--------------------------|---------|-----------|------------------------|--------------|
+//! | Uninitialized            | yes     | dim white | "Set up Clips"         | no           |
+//! | Idle                     | no      | —         | —                      | no           |
+//! | Arming / Armed           | yes     | green     | "Buffering — <game>"   | no           |
+//! | Saving                   | yes     | yellow    | "Saving…"              | no           |
+//! | ErrorState               | yes     | red       | "Capture stopped"      | yes          |
 //!
 //! Idle hides the badge entirely so the dashboard isn't visually noisy
 //! when the user isn't actively gaming. The other states are persistent
 //! reminders that the buffer is doing something the user might care about.
+//!
+//! The Retry button is wired to the `app.retry-clip-capture` GAction
+//! (registered in `app.rs`), which calls
+//! `BufferController::retry(&cmd_tx)`. That moves the state machine from
+//! `ErrorState → Idle` and runs `maybe_arm` so the buffer re-engages
+//! when a game is detected.
 
 use adw::prelude::*;
 
@@ -31,6 +37,7 @@ pub struct StatusIndicator {
     pub root: gtk::Widget,
     label: gtk::Label,
     dot: gtk::Image,
+    retry_btn: gtk::Button,
 }
 
 impl StatusIndicator {
@@ -43,6 +50,8 @@ impl StatusIndicator {
         for cls in ["dot-armed", "dot-saving", "dot-error", "dot-setup"] {
             self.dot.remove_css_class(cls);
         }
+        // Retry button is only relevant in ErrorState; hide elsewhere.
+        self.retry_btn.set_visible(matches!(state, BufferState::ErrorState));
         self.root.set_visible(true);
         match state {
             BufferState::Uninitialized => {
@@ -80,6 +89,20 @@ pub fn build_status_indicator() -> StatusIndicator {
 
     let label = gtk::Label::builder().label("Set up Clips").build();
 
+    // Retry button: hidden by default. set_state flips it visible when
+    // BufferState::ErrorState is reported. Wired to the
+    // `app.retry-clip-capture` GAction so the click crosses cleanly into
+    // app.rs's BufferController without the indicator needing a Sender
+    // ref. The "flat" + caption styling keeps it visually subordinate to
+    // the badge label so it doesn't shout.
+    let retry_btn = gtk::Button::builder()
+        .label("Retry")
+        .visible(false)
+        .css_classes(["flat", "caption"])
+        .valign(gtk::Align::Center)
+        .build();
+    retry_btn.set_action_name(Some("app.retry-clip-capture"));
+
     let badge = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -89,6 +112,12 @@ pub fn build_status_indicator() -> StatusIndicator {
     badge.add_css_class("clip-indicator");
     badge.append(&dot);
     badge.append(&label);
+    badge.append(&retry_btn);
 
-    StatusIndicator { root: badge.upcast(), label, dot }
+    StatusIndicator {
+        root: badge.upcast(),
+        label,
+        dot,
+        retry_btn,
+    }
 }

@@ -613,6 +613,46 @@ pub fn run(start_hidden: bool) {
                 app.add_action_entries([save_action]);
             }
 
+            // app.retry-clip-capture — bound to the Retry button shown
+            // alongside the dashboard's clip-status badge when
+            // BufferState::ErrorState is active. Calls
+            // BufferController::retry which transitions ErrorState → Idle
+            // and runs maybe_arm so the buffer re-engages immediately if
+            // a known game is detected. No-op outside ErrorState (the
+            // button is hidden in non-error states, but the action is
+            // still safe to dispatch from D-Bus or scripted callers).
+            //
+            // After retry transitions the buffer to a non-error state we
+            // refresh the dashboard indicator so the Retry button hides
+            // and the dot color matches the new state without waiting for
+            // the next BackendEvent (which may not arrive promptly if the
+            // root cause was transient and the next StartReplay succeeds
+            // immediately on its own).
+            {
+                let buffer_for_retry = buffer.clone();
+                let resources_for_retry = resources.clone();
+                let window_for_retry = window.clone();
+                let retry_action = gtk::gio::ActionEntry::builder("retry-clip-capture")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        let cmd_tx = resources_for_retry
+                            .borrow()
+                            .as_ref()
+                            .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
+                        if let Some(tx) = cmd_tx {
+                            buffer_for_retry.borrow_mut().retry(&tx);
+                            let buf = buffer_for_retry.borrow();
+                            window_for_retry.set_clips_state(
+                                buf.state(),
+                                buf.current_game().map(|g| g.name.as_str()),
+                            );
+                        } else {
+                            log::warn!("no clip backend available for retry-clip-capture");
+                        }
+                    })
+                    .build();
+                app.add_action_entries([retry_action]);
+            }
+
             // app.reset-clips-capture — clears the persisted portal token,
             // disarms the buffer if currently capturing, and returns the
             // Clips page to the onboarding wizard (PickScreen step, since
