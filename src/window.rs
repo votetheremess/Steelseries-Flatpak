@@ -199,7 +199,8 @@ impl ChatMixWindow {
              .clip-indicator .dot-armed { color: rgb(77,204,179); } \
              .clip-indicator .dot-saving { color: rgb(242,205,64); } \
              .clip-indicator .dot-error  { color: rgb(230,77,77); } \
-             .clip-indicator .dot-setup  { color: alpha(currentColor, 0.5); }"
+             .clip-indicator .dot-setup  { color: alpha(currentColor, 0.5); } \
+             .clips-row-card { padding: 14px 18px; }"
         );
         gtk::style_context_add_provider_for_display(
             &gtk::prelude::WidgetExt::display(&window),

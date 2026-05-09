@@ -533,13 +533,13 @@ fn build_page3_settings() -> (gtk::Widget, gtk::Button, gtk::Scale, gtk::Label, 
     let hotkey_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(16)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(16)
-        .margin_end(16)
-        .css_classes(["card"])
+        .css_classes(["card", "clips-row-card"])
         .build();
-    hotkey_row.append(&gtk::Label::new(Some("Save hotkey")));
+    let hotkey_label = gtk::Label::builder()
+        .label("Save hotkey")
+        .css_classes(["heading"])
+        .build();
+    hotkey_row.append(&hotkey_label);
     hotkey_row.append(&gtk::Box::builder().hexpand(true).build());
     let hotkey_btn = gtk::Button::builder()
         .label("Super+Shift+R")
@@ -561,13 +561,13 @@ fn build_page3_settings() -> (gtk::Widget, gtk::Button, gtk::Scale, gtk::Label, 
     let clip_length_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(16)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(16)
-        .margin_end(16)
-        .css_classes(["card"])
+        .css_classes(["card", "clips-row-card"])
         .build();
-    clip_length_row.append(&gtk::Label::new(Some("Clip length")));
+    let clip_length_title = gtk::Label::builder()
+        .label("Clip length")
+        .css_classes(["heading"])
+        .build();
+    clip_length_row.append(&clip_length_title);
     clip_length_row.append(&gtk::Box::builder().width_request(8).build());
     let clip_length_scale =
         gtk::Scale::with_range(gtk::Orientation::Horizontal, 30.0, 300.0, 5.0);
@@ -601,13 +601,13 @@ fn build_page3_settings() -> (gtk::Widget, gtk::Button, gtk::Scale, gtk::Label, 
     let storage_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(16)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(16)
-        .margin_end(16)
-        .css_classes(["card"])
+        .css_classes(["card", "clips-row-card"])
         .build();
-    storage_row.append(&gtk::Label::new(Some("Save clips to")));
+    let storage_label = gtk::Label::builder()
+        .label("Save clips to")
+        .css_classes(["heading"])
+        .build();
+    storage_row.append(&storage_label);
     storage_row.append(&gtk::Box::builder().hexpand(true).build());
     let storage_btn = gtk::Button::builder()
         .label("Clips")
