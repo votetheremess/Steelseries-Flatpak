@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
-use crate::clips::{BufferController, CaptureConfig, ClipCommand};
+use crate::clips::{BufferController, CaptureConfig, ClipCommand, ClipsPage};
 
 const SETTINGS_FILENAME: &str = "clips_settings.txt";
 
@@ -200,6 +200,7 @@ pub fn build_clips_group(
     buffer: Rc<RefCell<BufferController>>,
     cmd_tx: Sender<ClipCommand>,
     headset_sink_monitor: String,
+    clips_page: Rc<ClipsPage>,
 ) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder().title("Clips").build();
 
@@ -495,57 +496,38 @@ pub fn build_clips_group(
         let cmd_tx = cmd_tx.clone();
         let monitor = headset_sink_monitor.clone();
         let storage_row = storage_row.clone();
+        let clips_page = clips_page.clone();
         storage_btn.connect_clicked(move |btn| {
-            let dialog = gtk::FileDialog::builder()
-                .title("Pick clip storage folder")
-                .accept_label("Save here")
-                .modal(true)
-                .build();
-            // Seed initial folder from the current setting if it exists.
-            let initial = clip_settings.borrow().storage_path.clone();
-            if initial.exists() {
-                dialog.set_initial_folder(Some(&gio::File::for_path(&initial)));
-            }
             // Find the toplevel window for parent attachment so the
             // dialog is modal to our main window rather than free-floating.
             let parent: Option<gtk::Window> = btn
                 .root()
                 .and_then(|r| r.downcast::<gtk::Window>().ok());
+            let initial = clip_settings.borrow().storage_path.clone();
 
             let clip_settings = clip_settings.clone();
             let buffer = buffer.clone();
             let cmd_tx = cmd_tx.clone();
             let monitor = monitor.clone();
             let storage_row = storage_row.clone();
-            dialog.select_folder(
-                parent.as_ref(),
-                None::<&gio::Cancellable>,
-                move |result| {
-                    let file = match result {
-                        Ok(f) => f,
-                        Err(e) => {
-                            // Cancellation surfaces as Err — only log at debug.
-                            log::debug!("storage folder pick: {e}");
-                            return;
-                        }
-                    };
-                    let Some(path) = file.path() else {
-                        log::warn!(
-                            "storage folder pick returned a file without a local path"
-                        );
+            let clips_page = clips_page.clone();
+            pick_clip_storage_folder(parent, &initial, move |path| {
+                {
+                    let mut s = clip_settings.borrow_mut();
+                    if s.storage_path == path {
                         return;
-                    };
-                    {
-                        let mut s = clip_settings.borrow_mut();
-                        if s.storage_path == path {
-                            return;
-                        }
-                        s.storage_path = path.clone();
                     }
-                    storage_row.set_subtitle(&path.display().to_string());
-                    persist_and_reconfigure(&clip_settings, &buffer, &cmd_tx, &monitor);
-                },
-            );
+                    s.storage_path = path.clone();
+                }
+                storage_row.set_subtitle(&path.display().to_string());
+                // Reflect the new dir in the browser immediately so the
+                // GridView reconciles against it, and the kebab actions
+                // pick it up on next activation. The backend re-points the
+                // FIFO at the new dir on its next arm() call (driven by
+                // persist_and_reconfigure below).
+                clips_page.set_storage_dir(path);
+                persist_and_reconfigure(&clip_settings, &buffer, &cmd_tx, &monitor);
+            });
         });
     }
     storage_row.add_suffix(&storage_btn);
@@ -633,6 +615,53 @@ fn persist_and_reconfigure(
 /// command string.
 pub fn save_clip_dbus_command() -> &'static str {
     SAVE_CLIP_DBUS_COMMAND
+}
+
+/// Open the canonical "Pick clip storage folder" dialog and invoke
+/// `on_picked` with the chosen path. Cancellation is treated as a
+/// no-op (logged at debug level). Shared between Settings → Clips →
+/// Storage location and the wizard Page 3 "Pick folder" button so
+/// both surfaces present the same UX, seed the initial folder the
+/// same way, and silently swallow cancellation identically.
+///
+/// Caller is responsible for: persisting the new path, calling
+/// `clips_page.set_storage_dir()`, and (if needed) pushing a fresh
+/// CaptureConfig to the backend. Keeping those side-effects outside
+/// this helper keeps it reusable.
+pub fn pick_clip_storage_folder(
+    parent_window: Option<gtk::Window>,
+    current: &std::path::Path,
+    on_picked: impl FnOnce(PathBuf) + 'static,
+) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Pick clip storage folder")
+        .accept_label("Save here")
+        .modal(true)
+        .build();
+    if current.exists() {
+        dialog.set_initial_folder(Some(&gio::File::for_path(current)));
+    }
+    dialog.select_folder(
+        parent_window.as_ref(),
+        None::<&gio::Cancellable>,
+        move |result| {
+            let file = match result {
+                Ok(f) => f,
+                Err(e) => {
+                    // Cancellation surfaces as Err — only log at debug.
+                    log::debug!("storage folder pick: {e}");
+                    return;
+                }
+            };
+            let Some(path) = file.path() else {
+                log::warn!(
+                    "storage folder pick returned a file without a local path"
+                );
+                return;
+            };
+            on_picked(path);
+        },
+    );
 }
 
 #[cfg(test)]

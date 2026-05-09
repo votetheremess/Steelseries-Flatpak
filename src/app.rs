@@ -210,11 +210,17 @@ pub fn run(start_hidden: bool) {
             // headless/error paths). Settings page silently omits the
             // Clips group when this is None — the user can recover by
             // restarting once the device is connected.
-            let clips_settings_ctx = resources
+            //
+            // `clips_page` is filled in by ChatMixWindow::new after it
+            // builds the page; the partial context built here carries the
+            // app-side runtime hooks (settings cell, buffer, command
+            // channel, headset sink) and ChatMixWindow attaches the page
+            // before passing it to build_settings_page.
+            let clips_settings_ctx_partial = resources
                 .borrow()
                 .as_ref()
                 .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()))
-                .map(|tx| crate::window::ClipsSettingsContext {
+                .map(|tx| crate::window::ClipsSettingsContextPartial {
                     clip_settings: clip_settings.clone(),
                     buffer: buffer.clone(),
                     cmd_tx: tx,
@@ -228,8 +234,16 @@ pub fn run(start_hidden: bool) {
                 on_reroute,
                 on_mic_reroute,
                 headset_sink,
-                clips_settings_ctx,
+                clips_settings_ctx_partial,
             );
+
+            // After the window is up, push the persisted storage_path into
+            // the ClipsPage so the browser's reconcile target matches the
+            // user's saved setting (otherwise it shows ~/Videos/Clips on
+            // every launch, regardless of any custom path the user picked).
+            window
+                .clips_page()
+                .set_storage_dir(clip_settings.borrow().storage_path.clone());
 
             // Hide on close, keep the process running
             window.window.connect_close_request(move |w| {

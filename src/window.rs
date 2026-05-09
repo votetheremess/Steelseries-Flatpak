@@ -8,7 +8,7 @@ use std::sync::mpsc::Sender;
 use crate::audio::{persistence, sinks};
 use crate::autostart;
 use crate::clips::settings::ClipSettings;
-use crate::clips::{BufferController, ClipCommand};
+use crate::clips::{BufferController, ClipCommand, ClipsPage};
 use crate::eq::model::{Band, EqTarget, SpatialState, NUM_BANDS};
 use crate::hid::protocol::NoiseMode;
 use crate::mixer::MixerWidgets;
@@ -17,15 +17,26 @@ const PLACEHOLDER: &str = "—";
 
 /// Hooks the clips Settings page needs to live-react to user changes.
 ///
-/// Built once in `app.rs` (after the buffer controller and clip backend
-/// thread exist) and passed into `ChatMixWindow::new` so the settings
-/// widgets can update both persisted state and the running buffer config
-/// in one shot.
+/// `app.rs` builds the partial form (everything but `clips_page`, which
+/// it doesn't have access to) and passes it to `ChatMixWindow::new`,
+/// which attaches its own `clips_page` and produces the full context
+/// before forwarding to `build_settings_page`. Splitting the type
+/// avoids leaking the page-construction order between the two modules.
+pub struct ClipsSettingsContextPartial {
+    pub clip_settings: Rc<RefCell<ClipSettings>>,
+    pub buffer: Rc<RefCell<BufferController>>,
+    pub cmd_tx: Sender<ClipCommand>,
+    pub headset_sink_monitor: String,
+}
+
+/// Full settings hook bundle, with the runtime browser page attached.
+/// Consumed by `build_settings_page` and `build_clips_group`.
 pub struct ClipsSettingsContext {
     pub clip_settings: Rc<RefCell<ClipSettings>>,
     pub buffer: Rc<RefCell<BufferController>>,
     pub cmd_tx: Sender<ClipCommand>,
     pub headset_sink_monitor: String,
+    pub clips_page: Rc<ClipsPage>,
 }
 
 pub struct ChatMixWindow {
@@ -70,7 +81,7 @@ impl ChatMixWindow {
         on_reroute: Option<Rc<dyn Fn(&str, &str)>>,
         on_mic_reroute: Option<Rc<dyn Fn(&str)>>,
         headset_sink: Option<String>,
-        clips_settings_ctx: Option<ClipsSettingsContext>,
+        clips_settings_ctx_partial: Option<ClipsSettingsContextPartial>,
     ) -> Self {
         let window = adw::ApplicationWindow::builder()
             .application(app)
@@ -109,11 +120,22 @@ impl ChatMixWindow {
         stack.add_named(&eq_page, Some("eq"));
         let clips_page = Rc::new(crate::clips::build_clips_page());
         stack.add_named(clips_page.widget(), Some("clips"));
-        widgets.clips = Some(clips_page);
+        widgets.clips = Some(clips_page.clone());
         stack.add_named(
             &build_placeholder_page("Engine", "lucide-sliders-horizontal-symbolic", "Coming soon"),
             Some("engine"),
         );
+        // Promote the partial context to the full context by attaching the
+        // runtime browser page we just built. Building inside ChatMixWindow
+        // (rather than in app.rs) keeps the page-construction order
+        // encapsulated: app.rs never touches `clips_page` directly.
+        let clips_settings_ctx = clips_settings_ctx_partial.map(|p| ClipsSettingsContext {
+            clip_settings: p.clip_settings,
+            buffer: p.buffer,
+            cmd_tx: p.cmd_tx,
+            headset_sink_monitor: p.headset_sink_monitor,
+            clips_page: clips_page.clone(),
+        });
         stack.add_named(&build_settings_page(app, clips_settings_ctx), Some("settings"));
 
         content_area.append(&stack);
@@ -646,6 +668,7 @@ fn build_settings_page(
             ctx.buffer,
             ctx.cmd_tx,
             ctx.headset_sink_monitor,
+            ctx.clips_page,
         ));
     }
 

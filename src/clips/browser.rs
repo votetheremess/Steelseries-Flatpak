@@ -83,11 +83,13 @@ pub struct ClipsPage {
     /// are cheap reference bumps.
     pub model: gio::ListStore,
     /// Filesystem directory where the user's saved `.mp4` clips live.
-    /// Identical to the path used at model-build time, so a `reconcile()`
-    /// against this dir reproduces what's on disk now. Stored on the page
-    /// so external callers (and the kebab handlers) don't have to re-derive
-    /// `~/Videos/Clips` every time.
-    pub storage_dir: PathBuf,
+    /// Wrapped in `Rc<RefCell>` so `set_storage_dir` (called from
+    /// Settings → Clips → Pick folder, and from the wizard Page 3 picker)
+    /// can update it live without rebuilding the page. All consumers
+    /// (kebab actions, on_remix, factory bind) hold a clone of the same
+    /// `Rc` and read on demand, so a path change reaches every closure
+    /// without per-closure rewiring.
+    pub storage_dir: Rc<RefCell<PathBuf>>,
 }
 
 pub struct WizardWidgets {
@@ -117,9 +119,16 @@ pub fn build_clips_page() -> ClipsPage {
     // mutating disk state. `loaded_page()` builds the GridView against
     // these — `refresh_clips_model()` then keeps the same model alive,
     // just clearing+repopulating it from a fresh `library::reconcile()`.
-    let storage_dir = PathBuf::from(std::env::var("HOME").unwrap_or_default())
+    //
+    // Storage dir defaults to `~/Videos/Clips` but is overridden by
+    // `set_storage_dir()` when the user picks a different folder in
+    // Settings or the wizard. The settings-loaded value is reapplied
+    // soon after construction by the caller (app.rs) so the page
+    // briefly shows the default before the override lands.
+    let initial_storage = PathBuf::from(std::env::var("HOME").unwrap_or_default())
         .join("Videos/Clips");
-    let _ = std::fs::create_dir_all(&storage_dir);
+    let _ = std::fs::create_dir_all(&initial_storage);
+    let storage_dir: Rc<RefCell<PathBuf>> = Rc::new(RefCell::new(initial_storage));
     let model = gio::ListStore::new::<ClipObject>();
 
     let state = Rc::new(RefCell::new(PageState::Onboarding));
@@ -165,11 +174,14 @@ pub fn build_clips_page() -> ClipsPage {
             };
 
             // on_exported: refresh the grid model so the new
-            // `*-remix.mp4` file shows up.
+            // `*-remix.mp4` file shows up. Read the storage_dir live so a
+            // change between remix open and export close still hits the
+            // right directory.
             let model_for_export = model_for_remix.clone();
             let storage_dir_for_export = storage_dir_for_remix.clone();
             let on_exported = move |_out_path: PathBuf| {
-                refresh_model_in_place(&model_for_export, &storage_dir_for_export);
+                let dir = storage_dir_for_export.borrow().clone();
+                refresh_model_in_place(&model_for_export, &dir);
             };
 
             let panel = crate::clips::remix::build_remix_panel(
@@ -188,7 +200,7 @@ pub fn build_clips_page() -> ClipsPage {
     stack.add_named(&wizard.stack, Some("onboarding"));
     stack.add_named(&empty_page(), Some("empty"));
     stack.add_named(
-        &loaded_page(&storage_dir, &model, on_remix),
+        &loaded_page(storage_dir.clone(), &model, on_remix),
         Some("loaded"),
     );
     stack.add_named(&remix_container, Some("remix"));
@@ -554,7 +566,7 @@ fn build_clip_card() -> (gtk::Overlay, CardWidgets) {
 fn bind_clip_card(
     widgets: &CardWidgets,
     clip: &ClipObject,
-    storage_dir: &PathBuf,
+    storage_dir: &Rc<RefCell<PathBuf>>,
     model: &gio::ListStore,
     on_remix: &Rc<dyn Fn(PathBuf)>,
 ) {
@@ -609,14 +621,15 @@ fn bind_clip_card(
 }
 
 /// Build a fresh per-card action group for the kebab menu. Captures the
-/// bound clip's filename + the page-level storage_dir + model so that
-/// Rename / Delete / Open-in-Folder / Remix can mutate disk state or
-/// switch to the remix panel without walking widget trees or holding
-/// ClipsPage refs.
+/// bound clip's filename + a clone of the page-level `Rc<RefCell<PathBuf>>`
+/// for the storage_dir + model so that Rename / Delete / Open-in-Folder /
+/// Remix can mutate disk state or switch to the remix panel without
+/// walking widget trees or holding ClipsPage refs. The Rc means a live
+/// `set_storage_dir()` change is seen by any subsequent kebab activation.
 fn build_clip_actions(
     widgets: &CardWidgets,
     filename: String,
-    storage_dir: PathBuf,
+    storage_dir: Rc<RefCell<PathBuf>>,
     model: gio::ListStore,
     on_remix: Rc<dyn Fn(PathBuf)>,
 ) -> gio::SimpleActionGroup {
@@ -631,7 +644,8 @@ fn build_clip_actions(
         let storage_dir = storage_dir.clone();
         let filename = filename.clone();
         remix.connect_activate(move |_, _| {
-            on_remix(storage_dir.join(&filename));
+            let dir = storage_dir.borrow().clone();
+            on_remix(dir.join(&filename));
         });
         group.add_action(&remix);
     }
@@ -647,7 +661,7 @@ fn build_clip_actions(
             show_rename_dialog(
                 &kebab,
                 filename.clone(),
-                storage_dir.clone(),
+                storage_dir.borrow().clone(),
                 model.clone(),
             );
         });
@@ -665,7 +679,7 @@ fn build_clip_actions(
             show_delete_dialog(
                 &kebab,
                 filename.clone(),
-                storage_dir.clone(),
+                storage_dir.borrow().clone(),
                 model.clone(),
             );
         });
@@ -680,14 +694,15 @@ fn build_clip_actions(
         let open = gio::SimpleAction::new("open-folder", None);
         let storage_dir = storage_dir.clone();
         open.connect_activate(move |_, _| {
+            let dir = storage_dir.borrow().clone();
             if let Err(e) = std::process::Command::new("xdg-open")
-                .arg(&storage_dir)
+                .arg(&dir)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
             {
-                log::warn!("xdg-open failed for {}: {e}", storage_dir.display());
+                log::warn!("xdg-open failed for {}: {e}", dir.display());
             }
         });
         group.add_action(&open);
@@ -888,7 +903,7 @@ fn refresh_model_in_place(model: &gio::ListStore, storage_dir: &PathBuf) {
 }
 
 fn loaded_page(
-    storage_dir: &PathBuf,
+    storage_dir: Rc<RefCell<PathBuf>>,
     model: &gio::ListStore,
     on_remix: Rc<dyn Fn(PathBuf)>,
 ) -> gtk::Widget {
@@ -919,7 +934,7 @@ fn loaded_page(
         }
         item.set_child(Some(&card));
     });
-    let storage_dir_for_bind = storage_dir.clone();
+    let storage_dir_for_bind = storage_dir;
     let model_for_bind = model.clone();
     let on_remix_for_bind = on_remix;
     factory.connect_bind(move |_factory, item| {
@@ -985,7 +1000,28 @@ impl ClipsPage {
     /// mutate the directory; safe to call from any GTK-main-thread
     /// context.
     pub fn refresh_clips_model(&self) {
-        refresh_model_in_place(&self.model, &self.storage_dir);
+        let dir = self.storage_dir.borrow().clone();
+        refresh_model_in_place(&self.model, &dir);
+    }
+
+    /// Update the storage directory shown by the browser. Called from
+    /// Settings → Clips → Pick folder and the wizard's Page 3 picker
+    /// whenever the user changes `clips_settings.storage_path`. The
+    /// new directory is reconciled immediately so the GridView reflects
+    /// what's on disk under the new path; previously-bound kebab actions
+    /// pick up the new directory on their next activation because they
+    /// hold a clone of the same `Rc<RefCell<PathBuf>>`.
+    ///
+    /// SHOULD be called whenever `ClipSettings::storage_path` changes.
+    pub fn set_storage_dir(&self, new_dir: PathBuf) {
+        {
+            let mut g = self.storage_dir.borrow_mut();
+            if *g == new_dir {
+                return;
+            }
+            *g = new_dir;
+        }
+        self.refresh_clips_model();
     }
 
     /// Kick off the one-time duration-backfill worker. Phase 1's FIFO
@@ -997,7 +1033,7 @@ impl ClipsPage {
     /// `library::backfill_durations` for the rationale).
     fn spawn_duration_backfill(&self) {
         use crate::clips::library;
-        let storage_for_backfill = self.storage_dir.clone();
+        let storage_for_backfill = self.storage_dir.borrow().clone();
         std::thread::spawn(move || {
             if let Err(e) = library::backfill_durations(&storage_for_backfill) {
                 log::warn!("clip duration backfill failed: {e}");
