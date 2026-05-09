@@ -78,3 +78,86 @@ mod proc_tests {
         assert!(read_comm(0).is_none());
     }
 }
+
+/// Look up a Steam game's display name from its appmanifest file.
+/// Returns None if the file is missing or "name" key isn't found.
+pub fn steam_game_name(app_id: &str) -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let path = PathBuf::from(home)
+        .join(".steam/steam/steamapps")
+        .join(format!("appmanifest_{app_id}.acf"));
+    let contents = fs::read_to_string(path).ok()?;
+    parse_acf_name(&contents)
+}
+
+/// Parse the "name" field out of a Steam ACF (Valve Key/Value format).
+/// Looks for a line like:   "name"   "Apex Legends"
+pub fn parse_acf_name(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        // Look for the pattern: "name" "<value>"
+        if let Some(rest) = trimmed.strip_prefix("\"name\"") {
+            let rest = rest.trim_start();
+            // rest now begins with the second quoted field.
+            let mut chars = rest.chars();
+            if chars.next() != Some('"') {
+                continue;
+            }
+            let mut value = String::new();
+            for c in chars {
+                if c == '"' {
+                    return Some(value);
+                }
+                value.push(c);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod acf_tests {
+    use super::*;
+
+    #[test]
+    fn parse_simple_name() {
+        let acf = r#"
+"AppState"
+{
+    "appid"  "1172470"
+    "name"   "Apex Legends"
+    "Universe"  "1"
+}
+"#;
+        assert_eq!(parse_acf_name(acf).as_deref(), Some("Apex Legends"));
+    }
+
+    #[test]
+    fn parse_name_with_unicode() {
+        let acf = r#"
+"AppState"
+{
+    "name"   "ELDEN RING™"
+    "appid"  "1245620"
+}
+"#;
+        assert_eq!(parse_acf_name(acf).as_deref(), Some("ELDEN RING™"));
+    }
+
+    #[test]
+    fn parse_returns_none_when_no_name() {
+        let acf = r#"
+"AppState"
+{
+    "appid"  "1234"
+}
+"#;
+        assert!(parse_acf_name(acf).is_none());
+    }
+
+    #[test]
+    fn parse_handles_extra_whitespace() {
+        let acf = r#""name"        "Counter-Strike 2""#;
+        assert_eq!(parse_acf_name(acf).as_deref(), Some("Counter-Strike 2"));
+    }
+}
