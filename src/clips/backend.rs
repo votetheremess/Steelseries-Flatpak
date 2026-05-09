@@ -267,8 +267,9 @@ pub fn send_signal(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
 
 use std::io::{BufRead, BufReader};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::clips::{BackendEvent, ClipCommand};
 
@@ -324,6 +325,12 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
     let _ = ensure_save_callback(&initial_storage);
     let _ = ensure_save_fifo(&initial_storage);
 
+    // Shared between the supervisor loop (writer, set inside arm()) and the
+    // FIFO reader thread (reader, picked up on each open). Updates here
+    // are seen by the reader on its next iteration without restarting the
+    // thread — settings-driven storage changes flow through transparently.
+    let active_storage = Arc::new(Mutex::new(initial_storage.clone()));
+
     let mut active: Option<ActiveCapture> = None;
     let mut active_config: Option<CaptureConfig> = None;
     let mut consecutive_failures = 0u32;
@@ -331,9 +338,10 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
     // Spawn a FIFO reader thread once. It reads lines forever and forwards them
     // through evt_tx as Saved events.
     let evt_for_fifo = evt_tx.clone();
+    let storage_for_fifo = active_storage.clone();
     thread::Builder::new()
         .name("clip-fifo-reader".into())
-        .spawn(move || run_fifo_reader(evt_for_fifo))
+        .spawn(move || run_fifo_reader(evt_for_fifo, storage_for_fifo))
         .expect("spawn fifo-reader");
 
     loop {
@@ -341,7 +349,7 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
         // also poll the child's exit status).
         match cmd_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(ClipCommand::StartReplay { config }) => {
-                if let Err(e) = arm(&mut active, &mut active_config, &config) {
+                if let Err(e) = arm(&mut active, &mut active_config, &config, &active_storage) {
                     let _ = evt_tx.send(BackendEvent::Error {
                         context: "StartReplay".into(),
                         message: e.to_string(),
@@ -369,7 +377,7 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
             }
             Ok(ClipCommand::Reconfigure { config }) => {
                 disarm(&mut active);
-                if let Err(e) = arm(&mut active, &mut active_config, &config) {
+                if let Err(e) = arm(&mut active, &mut active_config, &config, &active_storage) {
                     let _ = evt_tx.send(BackendEvent::Error {
                         context: "Reconfigure".into(),
                         message: e.to_string(),
@@ -400,7 +408,9 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
                     if consecutive_failures < 2 {
                         if let Some(cfg) = active_config.clone() {
                             log::info!("clip-backend: auto-restart attempt 1");
-                            if let Err(e) = arm(&mut active, &mut active_config, &cfg) {
+                            if let Err(e) =
+                                arm(&mut active, &mut active_config, &cfg, &active_storage)
+                            {
                                 let _ = evt_tx.send(BackendEvent::Error {
                                     context: "auto-restart".into(),
                                     message: e.to_string(),
@@ -428,6 +438,7 @@ fn arm(
     active: &mut Option<ActiveCapture>,
     active_config: &mut Option<CaptureConfig>,
     config: &CaptureConfig,
+    active_storage: &Arc<Mutex<PathBuf>>,
 ) -> std::io::Result<()> {
     if active.is_some() {
         return Ok(()); // already armed; idempotent
@@ -444,6 +455,19 @@ fn arm(
     std::fs::create_dir_all(&config.output_dir)?;
     let cb = ensure_save_callback(&config.output_dir)?;
     let fifo = ensure_save_fifo(&config.output_dir)?;
+    // Publish the active storage dir so the FIFO reader picks up the new
+    // path on its next open. Doing this BEFORE spawn_gsr ensures the
+    // reader is already pointed at the right FIFO by the time GSR fires
+    // its first save callback. Lock-poisoning falls back to overwrite —
+    // a poisoned lock here just means the reader missed the previous
+    // value, which is fine because we're replacing it anyway.
+    if let Ok(mut g) = active_storage.lock() {
+        *g = config.output_dir.clone();
+    } else {
+        log::warn!("arm: active_storage lock poisoned; ignoring and overwriting");
+        let mut g = active_storage.lock().unwrap_or_else(|p| p.into_inner());
+        *g = config.output_dir.clone();
+    }
     let args = build_gsr_args(
         config,
         cb.to_str().unwrap(),
@@ -495,19 +519,115 @@ fn save(active: &Option<ActiveCapture>, signal: libc::c_int, evt_tx: &Sender<Bac
     }
 }
 
-fn run_fifo_reader(evt_tx: Sender<BackendEvent>) {
+/// Maximum age (since file mtime) at which a save-callback line is still
+/// considered fresh. Anything older than this is rejected as stale or
+/// replayed. Real GSR saves write the file then `echo "$path" > $FIFO`
+/// within milliseconds, so 30 s is a generous safety window.
+const FIFO_MAX_MTIME_AGE: Duration = Duration::from_secs(30);
+
+/// Maximum number of bytes from a malformed FIFO line we'll log. Defends
+/// against a same-uid attacker padding a line with terminal-control or
+/// ANSI sequences and us echoing them into journalctl. 200 chars is
+/// enough to identify the offender without flooding logs.
+const FIFO_LOG_LINE_MAX: usize = 200;
+
+/// Reasons for rejecting a save-callback line. Returned from
+/// `validate_fifo_line` so the caller can log a specific cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FifoLineRejection {
+    Empty,
+    NotCanonicalizable,
+    OutsideStorageDir,
+    NotMp4,
+    DoesNotExist,
+    NotARegularFile,
+    Stale,
+}
+
+/// Validate a single line read from the save-callback FIFO. The line is
+/// treated as a path written by `gpu-screen-recorder`'s `-sc` callback;
+/// since the FIFO is owner-only (mode 0o600) but a same-uid process
+/// could still write to it, we treat every line as untrusted and apply
+/// strict checks before emitting a `Saved` event.
+///
+/// Returns the canonicalized path on success (so callers don't have to
+/// re-canonicalize for downstream use), or a typed rejection on failure.
+fn validate_fifo_line(
+    line: &str,
+    storage_dir: &std::path::Path,
+    now: SystemTime,
+) -> Result<PathBuf, FifoLineRejection> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Err(FifoLineRejection::Empty);
+    }
+    let canon_path = std::fs::canonicalize(trimmed)
+        .map_err(|_| FifoLineRejection::NotCanonicalizable)?;
+    let canon_storage = std::fs::canonicalize(storage_dir)
+        .map_err(|_| FifoLineRejection::NotCanonicalizable)?;
+    // Strict path-prefix check: catches both `../` traversal and
+    // siblings that share a name prefix (e.g. `/foo` vs `/foobar`)
+    // because `starts_with` operates on path components, not byte
+    // prefixes.
+    if !canon_path.starts_with(&canon_storage) {
+        return Err(FifoLineRejection::OutsideStorageDir);
+    }
+    if canon_path.extension().and_then(|s| s.to_str()) != Some("mp4") {
+        return Err(FifoLineRejection::NotMp4);
+    }
+    let meta = match std::fs::metadata(&canon_path) {
+        Ok(m) => m,
+        Err(_) => return Err(FifoLineRejection::DoesNotExist),
+    };
+    if !meta.is_file() {
+        return Err(FifoLineRejection::NotARegularFile);
+    }
+    // Stale-mtime guard. A spoofer who somehow guessed a path inside
+    // the storage dir but wrote it into the FIFO long after creation
+    // (or replayed an older Saved line) gets filtered here.
+    let mtime = meta
+        .modified()
+        .map_err(|_| FifoLineRejection::Stale)?;
+    let age = now
+        .duration_since(mtime)
+        .unwrap_or(Duration::ZERO);
+    if age > FIFO_MAX_MTIME_AGE {
+        return Err(FifoLineRejection::Stale);
+    }
+    Ok(canon_path)
+}
+
+fn truncate_for_log(s: &str, max: usize) -> String {
+    // We log lines that may be malicious; strip control chars so a
+    // crafted line can't smuggle ANSI/escape sequences into the
+    // journal, then truncate to `max` chars to keep journalctl
+    // readable.
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max)
+        .collect();
+    if s.len() > max {
+        format!("{cleaned}…")
+    } else {
+        cleaned
+    }
+}
+
+fn run_fifo_reader(evt_tx: Sender<BackendEvent>, active_storage: Arc<Mutex<PathBuf>>) {
     use std::fs::File;
-    // The FIFO lives under the active storage dir. For the reader we use the
-    // default-storage path as a fallback; if the user configures a different
-    // storage_dir, the backend recreates the FIFO there at arm time. The reader
-    // re-opens on each iteration via the path supplied to arm() through the
-    // config; the simplest approach is to scan both default and any later
-    // configured paths. For v1, the default path covers ≥99% of users.
-    let path = save_fifo_path(&default_storage_dir());
+    // The FIFO lives under whichever storage dir was last set by `arm()`.
+    // We re-resolve the path on each open so a settings-driven storage
+    // change picks up the new FIFO without restarting the reader thread.
     loop {
+        let storage_dir = active_storage
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|p| p.into_inner().clone());
+        let fifo_path = save_fifo_path(&storage_dir);
         // Opening a FIFO for reading blocks until a writer connects; that's fine —
         // the GSR callback opens for write each time it fires.
-        let f = match File::open(&path) {
+        let f = match File::open(&fifo_path) {
             Ok(f) => f,
             Err(e) => {
                 log::warn!("clip-fifo-reader: open failed: {e}; sleeping");
@@ -517,18 +637,38 @@ fn run_fifo_reader(evt_tx: Sender<BackendEvent>) {
         };
         let r = BufReader::new(f);
         for line in r.lines() {
-            match line {
-                Ok(p) if !p.is_empty() => {
-                    let path = PathBuf::from(p);
+            let raw = match line {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // Re-read the active storage dir for each line — the user may
+            // have just changed it, in which case a callback line still in
+            // flight from the prior FIFO instance must be validated against
+            // the new storage dir (which would correctly reject it).
+            let validation_storage = active_storage
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_else(|p| p.into_inner().clone());
+            match validate_fifo_line(&raw, &validation_storage, SystemTime::now()) {
+                Ok(canon) => {
                     // Don't ffprobe here — it blocks the reader. Emit Saved with
                     // duration_ms = 0; the thumbnail-extraction worker (or a
                     // dedicated Phase 5 ffprobe pass) fills it in via the index.
-                    let _ = evt_tx.send(BackendEvent::Saved { path, duration_ms: 0 });
+                    let _ = evt_tx.send(BackendEvent::Saved {
+                        path: canon,
+                        duration_ms: 0,
+                    });
                 }
-                _ => {}
+                Err(reason) => {
+                    let cleaned = truncate_for_log(&raw, FIFO_LOG_LINE_MAX);
+                    log::warn!(
+                        "clip-fifo-reader: rejecting save-callback line ({reason:?}): {cleaned:?}"
+                    );
+                }
             }
         }
-        // Reader EOF — writer closed; loop and re-open.
+        // Reader EOF — writer closed; loop and re-open against the
+        // currently-active storage dir.
     }
 }
 
@@ -635,5 +775,170 @@ mod supervision_tests {
             Step::ChildDied { restart_ok: false }, // back to 1, NOT 2
         ]);
         assert_eq!(h, vec![1, 0, 1]);
+    }
+}
+
+#[cfg(test)]
+mod fifo_validation_tests {
+    //! Tests for `validate_fifo_line` covering the security H-1 attack
+    //! surface: a same-uid attacker who writes to the save-callback FIFO
+    //! shouldn't be able to spoof a Saved event for an arbitrary path,
+    //! traverse out of the storage dir, replay an old line, or smuggle a
+    //! non-mp4 path into the index. Each case below corresponds to one
+    //! validation rule.
+    use super::*;
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "arctis-fifo-validation-{}-{}-{}",
+            std::process::id(),
+            label,
+            // Tag with a per-test nanos suffix so parallel tests don't
+            // collide. cargo test runs tests in parallel by default.
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0),
+        ))
+    }
+
+    fn touch_mp4(dir: &std::path::Path, name: &str) -> PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        fs::write(&p, b"\x00\x00\x00\x18ftypmp42").unwrap();
+        p
+    }
+
+    #[test]
+    fn empty_line_is_rejected() {
+        let dir = temp_dir("empty");
+        fs::create_dir_all(&dir).unwrap();
+        let r = validate_fifo_line("", &dir, SystemTime::now());
+        assert_eq!(r, Err(FifoLineRejection::Empty));
+        let r = validate_fifo_line("   \t  ", &dir, SystemTime::now());
+        assert_eq!(r, Err(FifoLineRejection::Empty));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nonexistent_path_is_rejected() {
+        let dir = temp_dir("missing");
+        fs::create_dir_all(&dir).unwrap();
+        let bogus = dir.join("nope.mp4");
+        let r = validate_fifo_line(
+            bogus.to_str().unwrap(),
+            &dir,
+            SystemTime::now(),
+        );
+        // Falls into NotCanonicalizable because canonicalize() on a
+        // non-existent path returns ENOENT. The exact variant doesn't
+        // matter for security — it's enough that the line is rejected.
+        assert!(matches!(
+            r,
+            Err(FifoLineRejection::NotCanonicalizable | FifoLineRejection::DoesNotExist)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_outside_storage_dir_is_rejected() {
+        let dir = temp_dir("outside-storage");
+        let foreign = temp_dir("outside-foreign");
+        fs::create_dir_all(&dir).unwrap();
+        let evil = touch_mp4(&foreign, "elsewhere.mp4");
+        let r = validate_fifo_line(
+            evil.to_str().unwrap(),
+            &dir,
+            SystemTime::now(),
+        );
+        assert_eq!(r, Err(FifoLineRejection::OutsideStorageDir));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&foreign);
+    }
+
+    #[test]
+    fn path_traversal_is_rejected_after_canonicalization() {
+        let dir = temp_dir("traversal");
+        fs::create_dir_all(&dir).unwrap();
+        // Plant a real file in the parent so canonicalize succeeds, then
+        // see whether the traversal escape is caught by the prefix check.
+        let parent = dir.parent().unwrap();
+        let evil = touch_mp4(parent, "arctis-fifo-validation-escape.mp4");
+        let traversal = format!("{}/../arctis-fifo-validation-escape.mp4", dir.display());
+        let r = validate_fifo_line(&traversal, &dir, SystemTime::now());
+        assert_eq!(r, Err(FifoLineRejection::OutsideStorageDir));
+        let _ = fs::remove_file(&evil);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_mp4_extension_is_rejected() {
+        let dir = temp_dir("nonmp4");
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("clip.txt");
+        fs::write(&p, b"not a clip").unwrap();
+        let r = validate_fifo_line(p.to_str().unwrap(), &dir, SystemTime::now());
+        assert_eq!(r, Err(FifoLineRejection::NotMp4));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_mtime_is_rejected() {
+        let dir = temp_dir("stale");
+        let p = touch_mp4(&dir, "old.mp4");
+        // Pretend "now" is 60s ahead of the file's mtime to trip the
+        // staleness guard without depending on real clock drift.
+        let metadata = fs::metadata(&p).unwrap();
+        let mtime = metadata.modified().unwrap();
+        let pretend_now = mtime + Duration::from_secs(60);
+        let r = validate_fifo_line(p.to_str().unwrap(), &dir, pretend_now);
+        assert_eq!(r, Err(FifoLineRejection::Stale));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_mp4_inside_storage_is_accepted() {
+        let dir = temp_dir("happy");
+        let p = touch_mp4(&dir, "fresh.mp4");
+        let r = validate_fifo_line(p.to_str().unwrap(), &dir, SystemTime::now());
+        // The canonicalized path may differ on macOS (e.g. /var → /private/var)
+        // but on Linux it should match. We only care that the line was
+        // accepted — the returned path must end with our basename and live
+        // under the canonicalized storage dir.
+        let canon = r.expect("happy path must be accepted");
+        assert!(canon.ends_with("fresh.mp4"));
+        assert!(canon.starts_with(fs::canonicalize(&dir).unwrap()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_path_is_rejected() {
+        let dir = temp_dir("isdir");
+        let inner = dir.join("not-a-file.mp4");
+        fs::create_dir_all(&inner).unwrap();
+        let r = validate_fifo_line(inner.to_str().unwrap(), &dir, SystemTime::now());
+        assert_eq!(r, Err(FifoLineRejection::NotARegularFile));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncate_for_log_strips_control_chars_and_caps_length() {
+        // Control chars (newline, escape, carriage return, NUL) get
+        // dropped so they can't smuggle ANSI sequences into journalctl.
+        let s = "evil\x1b[2Jline\nwith\x00chars";
+        let cleaned = truncate_for_log(s, 200);
+        assert!(!cleaned.contains('\x1b'));
+        assert!(!cleaned.contains('\n'));
+        assert!(!cleaned.contains('\x00'));
+        assert!(cleaned.contains("evil"));
+
+        // Long lines get truncated with an ellipsis marker.
+        let long = "a".repeat(500);
+        let cleaned = truncate_for_log(&long, 50);
+        assert!(cleaned.ends_with('…'));
+        // 50 'a's + the ellipsis = 51 chars total.
+        assert_eq!(cleaned.chars().count(), 51);
     }
 }
