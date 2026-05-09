@@ -332,13 +332,24 @@ pub fn send_signal(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
     Ok(())
 }
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::clips::{BackendEvent, ClipCommand};
+
+/// Maximum number of auto-restart attempts allowed within `RESTART_WINDOW`
+/// before the supervisor surrenders. Tuned so a single transient failure
+/// (portal hiccup, GSR cold-start hiccup) self-heals, but a runaway loop
+/// (every spawn dies in well under a second) hits the brake quickly.
+const MAX_RESTARTS_PER_WINDOW: usize = 3;
+/// Rolling window over which restart attempts are counted. Long enough that
+/// rapid failures (sub-second deaths) clearly cluster, short enough that an
+/// unrelated crash 5 minutes later doesn't count toward the cap.
+const RESTART_WINDOW: Duration = Duration::from_secs(30);
 
 /// Handle for the backend thread. Drop = clean shutdown via Shutdown command.
 pub struct BackendHandle {
@@ -400,7 +411,13 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
 
     let mut active: Option<ActiveCapture> = None;
     let mut active_config: Option<CaptureConfig> = None;
-    let mut consecutive_failures = 0u32;
+    // Rolling window of recent auto-restart attempt timestamps. Replaces
+    // the old `consecutive_failures` counter, which had a fatal flaw: each
+    // successful auto-restart reset the counter, so a runaway loop where
+    // every spawn died in <1 s and "succeeded" at re-arming never tripped
+    // the cap. The deque counts attempts within RESTART_WINDOW regardless
+    // of whether each one survived.
+    let mut restart_attempts: VecDeque<Instant> = VecDeque::new();
 
     // Spawn a FIFO reader thread once. It reads lines forever and forwards them
     // through evt_tx as Saved events.
@@ -416,13 +433,16 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
         // also poll the child's exit status).
         match cmd_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(ClipCommand::StartReplay { config }) => {
+                // User intent — fresh start, wipe any prior auto-restart
+                // history so a previously-exhausted budget doesn't carry
+                // over into a manual retry.
+                restart_attempts.clear();
                 if let Err(e) = arm(&mut active, &mut active_config, &config, &active_storage) {
                     let _ = evt_tx.send(BackendEvent::Error {
                         context: "StartReplay".into(),
                         message: e.to_string(),
                     });
                 } else {
-                    consecutive_failures = 0;
                     let _ = evt_tx.send(BackendEvent::Armed);
                 }
             }
@@ -443,6 +463,9 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
                 save(&active, libc::SIGRTMIN() + 3, &evt_tx);
             }
             Ok(ClipCommand::Reconfigure { config }) => {
+                // Same rationale as StartReplay: user intent overrides any
+                // prior auto-restart history.
+                restart_attempts.clear();
                 disarm(&mut active);
                 if let Err(e) = arm(&mut active, &mut active_config, &config, &active_storage) {
                     let _ = evt_tx.send(BackendEvent::Error {
@@ -450,7 +473,6 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
                         message: e.to_string(),
                     });
                 } else {
-                    consecutive_failures = 0;
                     let _ = evt_tx.send(BackendEvent::Armed);
                 }
             }
@@ -471,26 +493,51 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
                     let _ = evt_tx.send(BackendEvent::BackendDied { reason: reason.clone() });
                     active = None;
 
-                    consecutive_failures += 1;
-                    if consecutive_failures < 2 {
+                    // Age out attempts older than the rolling window so a
+                    // single failure 5 minutes after a clean run doesn't
+                    // count toward the cap.
+                    let now = Instant::now();
+                    while let Some(&front) = restart_attempts.front() {
+                        if now.duration_since(front) >= RESTART_WINDOW {
+                            restart_attempts.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if restart_attempts.len() < MAX_RESTARTS_PER_WINDOW {
+                        restart_attempts.push_back(now);
+                        log::info!(
+                            "clip-backend: auto-restart attempt {}/{} within last {}s",
+                            restart_attempts.len(),
+                            MAX_RESTARTS_PER_WINDOW,
+                            RESTART_WINDOW.as_secs()
+                        );
                         if let Some(cfg) = active_config.clone() {
-                            log::info!("clip-backend: auto-restart attempt 1");
-                            if let Err(e) =
-                                arm(&mut active, &mut active_config, &cfg, &active_storage)
-                            {
-                                let _ = evt_tx.send(BackendEvent::Error {
-                                    context: "auto-restart".into(),
-                                    message: e.to_string(),
-                                });
-                            } else {
-                                consecutive_failures = 0;
-                                let _ = evt_tx.send(BackendEvent::Armed);
+                            match arm(&mut active, &mut active_config, &cfg, &active_storage) {
+                                Ok(()) => {
+                                    let _ = evt_tx.send(BackendEvent::Armed);
+                                }
+                                Err(e) => {
+                                    let _ = evt_tx.send(BackendEvent::Error {
+                                        context: "auto-restart".into(),
+                                        message: e.to_string(),
+                                    });
+                                }
                             }
                         }
                     } else {
+                        // Don't clear restart_attempts here. Letting the
+                        // window age out naturally means a quiet period
+                        // of RESTART_WINDOW seconds opens a fresh budget
+                        // without requiring an explicit user action.
                         let _ = evt_tx.send(BackendEvent::Error {
                             context: "supervision".into(),
-                            message: "GSR died twice in a row; user retry required".into(),
+                            message: format!(
+                                "GSR died {} times in {}s; not auto-restarting. Check 'gsr stderr' lines above for the cause.",
+                                MAX_RESTARTS_PER_WINDOW,
+                                RESTART_WINDOW.as_secs()
+                            ),
                         });
                     }
                 }
@@ -741,107 +788,199 @@ fn run_fifo_reader(evt_tx: Sender<BackendEvent>, active_storage: Arc<Mutex<PathB
 
 #[cfg(test)]
 mod supervision_tests {
-    //! Counter-only simulation of the supervisor flow in `run_backend`.
+    //! Rolling-window simulation of the supervisor flow in `run_backend`.
     //!
     //! We can't drive a real GSR child in unit tests (no Flatpak runtime, no
-    //! display, no portal), but the *counter logic* is pure state and can be
-    //! exercised in isolation. This simulation mirrors exactly what
-    //! `run_backend` does to `consecutive_failures` so any future divergence
+    //! display, no portal), but the *deque arithmetic* is pure state and can
+    //! be exercised in isolation. This simulation mirrors exactly what
+    //! `run_backend` does to `restart_attempts` so any future divergence
     //! between this test and the supervisor will surface as a failing test.
+    //!
+    //! The previous design used a naive `consecutive_failures` counter that
+    //! reset to 0 on every successful auto-restart. That meant a tight loop
+    //! where every spawn died in <1 s but `arm()` returned Ok would never
+    //! trip the cap — the user saw infinite log spam. The new design counts
+    //! restart *attempts* within a rolling window, regardless of how long
+    //! each attempt survived.
     //!
     //! Manual end-to-end verification (run by hand on a Bazzite host with the
     //! Flatpak GSR installed):
     //!   1. Arm replay (Clips → Start). Confirm `Armed` event.
     //!   2. `pkill -KILL gpu-screen-recorder` — observe `BackendDied` then
-    //!      `Armed` (auto-restart). Counter went 0 → 1 → 0.
-    //!   3. `pkill -KILL gpu-screen-recorder` again — `Armed` again.
-    //!      Counter 0 → 1 → 0 again (the prior reset opened a fresh budget).
-    //!   4. Force two failures back-to-back without an intervening successful
-    //!      arm (e.g. break the portal token then kill twice rapidly):
-    //!      `BackendDied` then `Error{context:"supervision"}` on the second.
-    //!   5. Reconfigure with a fresh, valid config — expect `Armed` and the
-    //!      counter back to 0 so the next failure won't immediately exhaust.
-    //!
-    //! The simulation below codifies steps 2–5 as data.
+    //!      `Armed` (1/3 attempts). Wait > 30 s, kill again — counter resets
+    //!      to 1/3 because the prior attempt aged out.
+    //!   3. Kill rapidly four times in a row — observe attempts 1/3, 2/3,
+    //!      3/3, then `Error{context:"supervision"}`.
+    //!   4. After the surrender, click Start again — `restart_attempts` is
+    //!      cleared by user intent and the budget is fresh.
 
-    /// Mirror of the supervisor's counter mutations. Each `Step` describes
+    use super::{MAX_RESTARTS_PER_WINDOW, RESTART_WINDOW};
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    /// Mirror of the supervisor's deque mutations. Each `Step` describes
     /// what happened in one iteration of `run_backend`'s loop and how the
-    /// counter should evolve. The test simulates the loop and asserts the
-    /// final and intermediate counters.
+    /// deque should evolve.
     enum Step {
-        /// Successful StartReplay or Reconfigure: counter resets to 0.
-        ArmOk,
-        /// Child observed exited; pre-increment, then optionally try to
-        /// auto-restart. `restart_ok` mirrors whether `arm()` returned Ok.
-        ChildDied { restart_ok: bool },
+        /// User-initiated StartReplay or Reconfigure: deque is cleared
+        /// regardless of prior state.
+        UserArm,
+        /// Child observed exited at the given offset from the simulation
+        /// start. The supervisor: ages out timestamps older than
+        /// `RESTART_WINDOW`, then either records a new attempt (when under
+        /// the cap) or surrenders without recording.
+        ChildDiedAt { offset: Duration },
     }
 
-    fn simulate(steps: &[Step]) -> Vec<u32> {
-        let mut counter: u32 = 0;
+    /// Outcome flag returned alongside the deque snapshot so tests can
+    /// assert whether the supervisor would have called `arm()` again or
+    /// emitted a supervision-error event.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Outcome {
+        Idle,        // user-arm step (no child death)
+        Restarted,   // child died, room in the window, attempt recorded
+        Surrendered, // child died, window full, supervision error sent
+    }
+
+    fn simulate(start: Instant, steps: &[Step]) -> Vec<(usize, Outcome)> {
+        let mut deque: VecDeque<Instant> = VecDeque::new();
         let mut history = Vec::with_capacity(steps.len());
         for step in steps {
-            match step {
-                Step::ArmOk => {
-                    counter = 0;
+            let outcome = match step {
+                Step::UserArm => {
+                    deque.clear();
+                    Outcome::Idle
                 }
-                Step::ChildDied { restart_ok } => {
-                    counter += 1;
-                    if counter < 2 && *restart_ok {
-                        counter = 0;
+                Step::ChildDiedAt { offset } => {
+                    let now = start + *offset;
+                    while let Some(&front) = deque.front() {
+                        if now.duration_since(front) >= RESTART_WINDOW {
+                            deque.pop_front();
+                        } else {
+                            break;
+                        }
                     }
-                    // counter >= 2 → supervisor surrenders, leaves counter pinned.
-                    // restart_ok=false with counter < 2 → counter stays at 1
-                    // (next failure will trip the "twice in a row" branch).
+                    if deque.len() < MAX_RESTARTS_PER_WINDOW {
+                        deque.push_back(now);
+                        Outcome::Restarted
+                    } else {
+                        Outcome::Surrendered
+                    }
                 }
-            }
-            history.push(counter);
+            };
+            history.push((deque.len(), outcome));
         }
         history
     }
 
     #[test]
-    fn successful_arm_starts_counter_at_zero() {
-        let h = simulate(&[Step::ArmOk]);
-        assert_eq!(h, vec![0]);
+    fn first_three_failures_within_window_all_restart() {
+        // 3 sub-second deaths exhaust the budget exactly at attempt 3.
+        let t0 = Instant::now();
+        let h = simulate(
+            t0,
+            &[
+                Step::ChildDiedAt { offset: Duration::from_millis(0) },
+                Step::ChildDiedAt { offset: Duration::from_millis(500) },
+                Step::ChildDiedAt { offset: Duration::from_millis(1000) },
+            ],
+        );
+        assert_eq!(
+            h,
+            vec![
+                (1, Outcome::Restarted),
+                (2, Outcome::Restarted),
+                (3, Outcome::Restarted),
+            ]
+        );
     }
 
     #[test]
-    fn one_death_then_successful_restart_resets_counter() {
-        // Was the bug pre-fix: restart succeeded but counter stayed at 1, so a
-        // *second* unrelated failure later would immediately surrender.
-        let h = simulate(&[Step::ChildDied { restart_ok: true }]);
-        assert_eq!(h, vec![0], "counter must reset on successful auto-restart");
+    fn fourth_failure_within_window_surrenders() {
+        // The bug this fix targets: rapid-failure loop. Pre-fix, the counter
+        // reset to 0 on each "successful" auto-restart and the loop never
+        // tripped a cap. New design counts attempts, not consecutive deaths.
+        let t0 = Instant::now();
+        let h = simulate(
+            t0,
+            &[
+                Step::ChildDiedAt { offset: Duration::from_millis(0) },
+                Step::ChildDiedAt { offset: Duration::from_millis(500) },
+                Step::ChildDiedAt { offset: Duration::from_millis(1000) },
+                Step::ChildDiedAt { offset: Duration::from_millis(1500) },
+            ],
+        );
+        assert_eq!(h.last().unwrap(), &(3, Outcome::Surrendered));
     }
 
     #[test]
-    fn two_deaths_in_a_row_surrender() {
-        let h = simulate(&[
-            Step::ChildDied { restart_ok: false },
-            Step::ChildDied { restart_ok: false },
-        ]);
-        assert_eq!(h, vec![1, 2], "counter at 2 → supervisor stops retrying");
+    fn old_attempts_age_out_after_window() {
+        // After RESTART_WINDOW seconds of quiet, prior attempts should age
+        // out and free up budget for a new failure.
+        let t0 = Instant::now();
+        let h = simulate(
+            t0,
+            &[
+                Step::ChildDiedAt { offset: Duration::from_millis(0) },
+                Step::ChildDiedAt { offset: Duration::from_millis(500) },
+                // Both entries above are > RESTART_WINDOW old at this offset,
+                // so both age out and the third attempt starts a fresh deque.
+                Step::ChildDiedAt { offset: RESTART_WINDOW + Duration::from_secs(1) },
+            ],
+        );
+        assert_eq!(h[0], (1, Outcome::Restarted));
+        assert_eq!(h[1], (2, Outcome::Restarted));
+        // After both stale entries age out, len drops back to 1 (just the
+        // freshly-recorded attempt). This is the whole point of the
+        // rolling-window policy: a single failure long after a clean run
+        // doesn't carry over.
+        assert_eq!(h[2], (1, Outcome::Restarted));
     }
 
     #[test]
-    fn death_restart_then_later_death_does_not_immediately_surrender() {
-        // The fix's whole point: a successful restart wipes the slate so a
-        // future, unrelated failure isn't penalized for the earlier one.
-        let h = simulate(&[
-            Step::ChildDied { restart_ok: true }, // 0
-            Step::ChildDied { restart_ok: true }, // 0 — would be 2 (surrender) without the fix
-        ]);
-        assert_eq!(h, vec![0, 0]);
+    fn user_arm_after_surrender_clears_the_budget() {
+        // After the supervisor gives up, the user clicks Start (or
+        // Reconfigure) — that's an explicit retry signal and we wipe
+        // restart_attempts entirely.
+        let t0 = Instant::now();
+        let h = simulate(
+            t0,
+            &[
+                Step::ChildDiedAt { offset: Duration::from_millis(0) },
+                Step::ChildDiedAt { offset: Duration::from_millis(100) },
+                Step::ChildDiedAt { offset: Duration::from_millis(200) },
+                Step::ChildDiedAt { offset: Duration::from_millis(300) }, // surrender
+                Step::UserArm,
+                Step::ChildDiedAt { offset: Duration::from_millis(400) },
+            ],
+        );
+        assert_eq!(h[3], (3, Outcome::Surrendered));
+        assert_eq!(h[4], (0, Outcome::Idle));
+        assert_eq!(h[5], (1, Outcome::Restarted));
     }
 
     #[test]
-    fn reconfigure_after_a_failure_clears_the_counter() {
-        // Reconfigure success path resets counter — same fix.
-        let h = simulate(&[
-            Step::ChildDied { restart_ok: false }, // counter = 1
-            Step::ArmOk,                            // simulating user Reconfigure success → 0
-            Step::ChildDied { restart_ok: false }, // back to 1, NOT 2
-        ]);
-        assert_eq!(h, vec![1, 0, 1]);
+    fn surrender_does_not_clear_deque_so_quiet_period_must_age_out_naturally() {
+        // After a surrender we explicitly DON'T clear the deque — a quiet
+        // period of RESTART_WINDOW seconds should age the entries out
+        // naturally instead of immediately reopening the budget.
+        let t0 = Instant::now();
+        let h = simulate(
+            t0,
+            &[
+                Step::ChildDiedAt { offset: Duration::from_millis(0) },
+                Step::ChildDiedAt { offset: Duration::from_millis(100) },
+                Step::ChildDiedAt { offset: Duration::from_millis(200) },
+                Step::ChildDiedAt { offset: Duration::from_millis(300) }, // surrender
+                // A failure 1 ms later: deque still has 3 entries, none aged
+                // out, so the supervisor surrenders again. (Real code never
+                // tries to arm when surrendered, but the deque arithmetic
+                // is what we're testing here.)
+                Step::ChildDiedAt { offset: Duration::from_millis(301) },
+            ],
+        );
+        assert_eq!(h[3], (3, Outcome::Surrendered));
+        assert_eq!(h[4], (3, Outcome::Surrendered));
     }
 }
 
