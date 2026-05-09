@@ -272,8 +272,8 @@ fn build_page1_install() -> (gtk::Widget, gtk::Label, gtk::Button) {
 
     let body = gtk::Label::new(Some(
         "Clips uses gpu-screen-recorder, a free open-source Flatpak \
-         from Flathub, to capture gameplay efficiently. Pick any of \
-         the install methods below — Clips will detect when it's ready.",
+         from Flathub, to capture gameplay efficiently. Click Install \
+         to set it up automatically, or Install Manually for other options.",
     ));
     body.set_wrap(true);
     body.set_max_width_chars(60);
@@ -289,35 +289,16 @@ fn build_page1_install() -> (gtk::Widget, gtk::Label, gtk::Button) {
     install_btn.set_action_name(Some("app.gsr-install"));
     page.append(&install_btn);
 
-    // Secondary actions row.
-    let alt_label = gtk::Label::new(Some("— or install manually —"));
-    alt_label.add_css_class("dim-label");
-    page.append(&alt_label);
-
-    let app_store_btn = gtk::Button::builder()
-        .label("Open in app store")
+    // Secondary "Install Manually" button. Opens an AlertDialog with the
+    // app-store + copy-command options, so Page 1 stays uncluttered for
+    // the happy path (one Install button + one Next button).
+    let install_manually_btn = gtk::Button::builder()
+        .label("Install Manually")
         .css_classes(["pill"])
         .halign(gtk::Align::Center)
         .build();
-    app_store_btn.set_action_name(Some("app.gsr-open-in-app-store"));
-    page.append(&app_store_btn);
-
-    // Terminal command in a code block + Copy button.
-    let code_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
-        .css_classes(["card"])
-        .build();
-    let cmd_label = gtk::Label::new(Some(crate::clips::gsr_install::GSR_TERMINAL_INSTALL_COMMAND));
-    cmd_label.add_css_class("monospace");
-    cmd_label.set_selectable(true);
-    cmd_label.set_xalign(0.0);
-    cmd_label.set_hexpand(true);
-    code_box.append(&cmd_label);
-    let copy_btn = gtk::Button::builder().label("Copy").build();
-    copy_btn.set_action_name(Some("app.gsr-copy-cli"));
-    code_box.append(&copy_btn);
-    page.append(&code_box);
+    install_manually_btn.set_action_name(Some("app.gsr-install-manually"));
+    page.append(&install_manually_btn);
 
     // Status label (reflects install progress when active).
     let install_status_label = gtk::Label::new(None);
@@ -325,11 +306,23 @@ fn build_page1_install() -> (gtk::Widget, gtk::Label, gtk::Button) {
     install_status_label.set_visible(false);
     page.append(&install_status_label);
 
-    // Next button — disabled until is_installed() returns true.
+    // Vertical spacer to keep the Next button visually distinct from the
+    // install/install-manually pair above. The page Box uses spacing=16,
+    // so this 20px box adds an extra ~36px gap before Next.
+    let spacer = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .height_request(20)
+        .build();
+    page.append(&spacer);
+
+    // Next button: centered, wider than default, disabled until
+    // is_installed() returns true (driven by the install progress
+    // watcher in app.rs).
     let install_next_btn = gtk::Button::builder()
         .label("Next")
         .css_classes(["pill", "suggested-action"])
-        .halign(gtk::Align::End)
+        .halign(gtk::Align::Center)
+        .width_request(140)
         .sensitive(false)
         .build();
     install_next_btn.set_action_name(Some("app.wizard-next"));

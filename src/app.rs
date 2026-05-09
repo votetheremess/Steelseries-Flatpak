@@ -393,6 +393,63 @@ pub fn run(start_hidden: bool) {
                 app.add_action_entries([copy_action]);
             }
 
+            // app.gsr-install-manually — present a small AlertDialog that
+            // exposes the two manual-install fallbacks (app store + copy
+            // command). Wired to the secondary "Install Manually" button on
+            // wizard Page 1; keeps the page uncluttered for the happy path.
+            {
+                let manual_action = gtk::gio::ActionEntry::builder("gsr-install-manually")
+                    .activate(move |app: &adw::Application, _action, _param| {
+                        let dialog = adw::AlertDialog::builder()
+                            .heading("Install gpu-screen-recorder manually")
+                            .body(
+                                "Choose one of these options to install \
+                                 the recorder yourself.",
+                            )
+                            .build();
+                        dialog.add_response("app-store", "Open in app store");
+                        dialog.add_response("copy", "Copy install command");
+                        dialog.add_response("close", "Close");
+                        dialog.set_close_response("close");
+
+                        let app_for_response = app.clone();
+                        dialog.connect_response(None, move |_dlg, response| {
+                            match response {
+                                "app-store" => {
+                                    app_for_response
+                                        .activate_action("gsr-open-in-app-store", None);
+                                }
+                                "copy" => {
+                                    app_for_response.activate_action("gsr-copy-cli", None);
+                                    // Best-effort confirmation toast so the
+                                    // silent clipboard set feels responsive.
+                                    if let Some(window) = app_for_response.active_window()
+                                        && let Ok(adw_win) =
+                                            window.downcast::<adw::ApplicationWindow>()
+                                        && let Some(overlay) =
+                                            crate::clips::notifications::find_toast_overlay(
+                                                &adw_win,
+                                            )
+                                    {
+                                        let toast = adw::Toast::builder()
+                                            .title("Install command copied")
+                                            .timeout(3)
+                                            .build();
+                                        overlay.add_toast(toast);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        });
+
+                        if let Some(window) = app.active_window() {
+                            dialog.present(Some(&window));
+                        }
+                    })
+                    .build();
+                app.add_action_entries([manual_action]);
+            }
+
             // app.copy-clip-hotkey-cmd — copy the dbus-send command that
             // triggers `save-clip` to the system clipboard. Lets users
             // bind the save action from any external shortcut daemon
@@ -477,8 +534,8 @@ pub fn run(start_hidden: bool) {
                                         );
                                         clips_page.wizard.screen_picked_label.set_visible(true);
                                         clips_page.wizard.screen_picked_label.set_label(
-                                            "Picker returned no persistent token \
-                                             — try again.",
+                                            "Picker returned no persistent token. \
+                                             Try again.",
                                         );
                                         clips_page.wizard.screen_next_btn.set_sensitive(false);
                                         return;
@@ -975,7 +1032,7 @@ pub fn run(start_hidden: bool) {
                     cp.set_wizard_step(crate::clips::WizardStep::PickScreen);
                     cp.wizard.screen_picked_label.set_visible(true);
                     cp.wizard.screen_picked_label.set_label(
-                        "Previously picked — click Next to keep, or Pick screen to change.",
+                        "Previously picked. Click Next to keep, or Pick screen to change.",
                     );
                     cp.wizard.screen_next_btn.set_sensitive(true);
                     // Already past page 1 — keep its Next enabled too in
@@ -1401,7 +1458,7 @@ fn show_test_capture_dialog(app: &adw::Application, image_path: &std::path::Path
         .heading("Capture source preview")
         .body(
             "This is a system screenshot. On multi-monitor setups it may \
-             differ from the actual capture target — to verify the real \
+             differ from the actual capture target. To verify the real \
              target, save a brief test clip and check which screen was \
              captured.",
         )

@@ -13,7 +13,7 @@ use crate::eq::model::{Band, EqTarget, SpatialState, NUM_BANDS};
 use crate::hid::protocol::NoiseMode;
 use crate::mixer::MixerWidgets;
 
-const PLACEHOLDER: &str = "—";
+const PLACEHOLDER: &str = "-";
 
 /// Hooks the clips Settings page needs to live-react to user changes.
 ///

@@ -97,7 +97,7 @@ pub fn notify_saved(
 /// finds it. The loop is defensive: if the wrapping ever changes (e.g.
 /// adding an `adw::ToolbarView` between the window and the overlay), this
 /// still finds it without code edits.
-fn find_toast_overlay(window: &adw::ApplicationWindow) -> Option<adw::ToastOverlay> {
+pub(crate) fn find_toast_overlay(window: &adw::ApplicationWindow) -> Option<adw::ToastOverlay> {
     let mut current = window.child();
     while let Some(w) = current {
         if let Ok(o) = w.clone().downcast::<adw::ToastOverlay>() {

@@ -64,7 +64,7 @@ impl StatusIndicator {
             BufferState::Arming | BufferState::Armed => {
                 self.dot.add_css_class("dot-armed");
                 let g = game.unwrap_or("game");
-                self.label.set_label(&format!("Buffering — {g}"));
+                self.label.set_label(&format!("Buffering: {g}"));
             }
             BufferState::Saving => {
                 self.dot.add_css_class("dot-saving");
