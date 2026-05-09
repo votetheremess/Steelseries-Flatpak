@@ -1059,16 +1059,50 @@ pub fn run(start_hidden: bool) {
             // triggering app.rebind-clip-hotkey, which spawns a fresh
             // session.
             //
-            // We pass the active window so the portal can derive our app
-            // id via xdg-foreign. KDE's xdg-desktop-portal-kde rejects
-            // bind_shortcuts with `NotAllowed: An app id is required`
-            // when the caller is host-installed (no .flatpak-info), so
-            // omitting the parent here was killing the listener at
-            // startup.
+            // First, call `ashpd::register_host_app(APP_ID)`. xdg-desktop-portal
+            // 1.19.4+ exposes `org.freedesktop.host.portal.Registry` which lets
+            // a host-installed (non-Flatpak) caller publish its application id
+            // to the portal daemon. Without it, KDE's xdg-desktop-portal-kde
+            // returns `NotAllowed: An app id is required` from
+            // `bind_shortcuts` and the listener exits before any shortcut can
+            // fire. Older portal daemons silently ignore the call (ashpd
+            // returns an error which we log but tolerate; it just means
+            // GlobalShortcuts may not work — passing the parent window via
+            // xdg-foreign is the legacy fallback for that case).
+            //
+            // We pass the active window so the portal can also fall back to
+            // xdg-foreign for app-id derivation on portal versions that
+            // pre-date Registry.
             {
                 let app_for_hotkey = app.clone();
                 let parent_for_hotkey = window.window.clone();
                 glib::MainContext::default().spawn_local(async move {
+                    // Construct the AppID from the existing constant. The
+                    // unwrap is justified: APP_ID is a compile-time literal
+                    // we've validated against ashpd's app-id rules.
+                    match APP_ID.parse::<ashpd::AppID>() {
+                        Ok(app_id) => {
+                            match ashpd::register_host_app(app_id).await {
+                                Ok(()) => {
+                                    log::info!(
+                                        "ashpd::register_host_app succeeded with id: {APP_ID}"
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "ashpd::register_host_app failed (xdg-desktop-portal may be older than 1.19.4): {e}. \
+                                         Falling back to no-app-id mode; GlobalShortcuts portal may not work."
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "APP_ID failed ashpd validation, skipping register_host_app: {e}"
+                            );
+                        }
+                    }
+
                     let app_for_cb = app_for_hotkey.clone();
                     let result = crate::clips::hotkey::run_global_shortcuts(
                         Some(&parent_for_hotkey),
