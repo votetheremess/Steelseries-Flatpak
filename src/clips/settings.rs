@@ -116,6 +116,20 @@ pub fn save(s: &ClipSettings) -> std::io::Result<()> {
 }
 
 /// Mark onboarding complete. Idempotent.
+///
+/// Semantics: the flag means "user has confirmed Page 2 (screen pick) at
+/// least once" — NOT "everything is set up." Reset capture source clears
+/// the portal token but does NOT flip this flag back; we treat a second-
+/// time wizard appearance after Reset as a re-confirmation of the screen,
+/// not a full re-onboarding. This keeps Reset friction-free for
+/// experienced users.
+///
+/// Auto-resume on the fourth arm (GSR + token + flag false — meaning the
+/// user reached Page 2 last session but never pressed Next) intentionally
+/// does NOT call this function: the buffer is connected with the persisted
+/// token, but the wizard is shown at PickScreen so the user explicitly
+/// confirms the persisted selection. The flag flips to true only when the
+/// user actually clicks Next on Page 2.
 pub fn mark_onboarding_complete() -> std::io::Result<()> {
     let mut s = load();
     s.onboarding_complete = true;
