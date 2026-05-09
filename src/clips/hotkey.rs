@@ -45,21 +45,34 @@ pub fn suggested_bindings() -> Vec<NewShortcut> {
 /// or rebind the suggested chords. Subsequent launches re-bind the same
 /// shortcuts silently as long as the user accepted them once.
 ///
+/// `parent` is the window the portal can use to derive the calling app's
+/// identity via xdg-foreign. KDE's xdg-desktop-portal-kde requires this
+/// when running OUTSIDE a Flatpak sandbox: passing `None` triggers
+/// `org.freedesktop.portal.Error.NotAllowed: An app id is required` and
+/// the listener exits before any shortcut can fire. Inside a Flatpak
+/// (final shipping target), either form works because the portal reads
+/// the app id from the sandbox metadata. Pass `Some(&window)` whenever
+/// possible; `None` is accepted but expected to fail on host-installed
+/// builds.
+///
 /// Returns when the portal session ends (which usually means the portal
 /// daemon died — caller may want to log or surface this).
-pub async fn run_global_shortcuts<F>(mut on_shortcut: F) -> ashpd::Result<()>
+pub async fn run_global_shortcuts<F>(
+    parent: Option<&impl IsA<gtk::Native>>,
+    mut on_shortcut: F,
+) -> ashpd::Result<()>
 where
     F: FnMut(&str) + 'static,
 {
     let proxy = GlobalShortcuts::new().await?;
     let session = proxy.create_session().await?;
-    // Third arg is Option<&WindowIdentifier>; passing None lets the portal
-    // pick the focus root. We don't have a transient parent to attach to
-    // because the binding happens at startup before the window may even be
-    // visible (autostart --hidden), and the bind dialog's lifetime is
-    // user-driven anyway.
+    let identifier = if let Some(p) = parent {
+        WindowIdentifier::from_native(p).await
+    } else {
+        None
+    };
     proxy
-        .bind_shortcuts(&session, &suggested_bindings(), None)
+        .bind_shortcuts(&session, &suggested_bindings(), identifier.as_ref())
         .await?;
     let mut stream = proxy.receive_activated().await?;
     while let Some(activation) = stream.next().await {

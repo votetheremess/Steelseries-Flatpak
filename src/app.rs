@@ -1058,23 +1058,34 @@ pub fn run(start_hidden: bool) {
             // future returns and we log it — the user can retry by
             // triggering app.rebind-clip-hotkey, which spawns a fresh
             // session.
+            //
+            // We pass the active window so the portal can derive our app
+            // id via xdg-foreign. KDE's xdg-desktop-portal-kde rejects
+            // bind_shortcuts with `NotAllowed: An app id is required`
+            // when the caller is host-installed (no .flatpak-info), so
+            // omitting the parent here was killing the listener at
+            // startup.
             {
                 let app_for_hotkey = app.clone();
+                let parent_for_hotkey = window.window.clone();
                 glib::MainContext::default().spawn_local(async move {
                     let app_for_cb = app_for_hotkey.clone();
-                    let result = crate::clips::hotkey::run_global_shortcuts(move |id| {
-                        let action_name = match id {
-                            "save-clip" => "save-clip",
-                            "save-clip-short" => "save-clip-short",
-                            "save-clip-medium" => "save-clip-medium",
-                            "save-clip-long" => "save-clip-long",
-                            other => {
-                                log::debug!("ignoring unknown shortcut id: {other}");
-                                return;
-                            }
-                        };
-                        app_for_cb.activate_action(action_name, None);
-                    })
+                    let result = crate::clips::hotkey::run_global_shortcuts(
+                        Some(&parent_for_hotkey),
+                        move |id| {
+                            let action_name = match id {
+                                "save-clip" => "save-clip",
+                                "save-clip-short" => "save-clip-short",
+                                "save-clip-medium" => "save-clip-medium",
+                                "save-clip-long" => "save-clip-long",
+                                other => {
+                                    log::debug!("ignoring unknown shortcut id: {other}");
+                                    return;
+                                }
+                            };
+                            app_for_cb.activate_action(action_name, None);
+                        },
+                    )
                     .await;
                     if let Err(e) = result {
                         log::warn!("GlobalShortcuts portal listener exited: {e}");
