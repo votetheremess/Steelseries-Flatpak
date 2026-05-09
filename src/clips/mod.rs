@@ -4,6 +4,7 @@ pub mod backend;
 pub mod browser;
 pub mod buffer;
 pub mod detector;
+pub mod gsr_install;
 pub mod hotkey;
 pub mod library;
 pub mod portal;
