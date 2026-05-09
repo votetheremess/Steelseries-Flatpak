@@ -1,6 +1,7 @@
 //! Clip metadata index, directory scan, filename sanitization.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -165,6 +166,69 @@ pub fn reconcile(storage_dir: &Path) -> Vec<ClipMeta> {
         }
     }
     indexed
+}
+
+/// Probe a media file's duration via `ffprobe`.
+///
+/// Returns `None` on any failure (binary not found, file unreadable, output
+/// not parseable). Callers treat `None` as "skip this entry, try again
+/// later" — no error propagation needed.
+pub fn ffprobe_duration_ms(path: &Path) -> Option<u64> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let secs: f64 = s.trim().parse().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    Some((secs * 1000.0) as u64)
+}
+
+/// Fill missing `duration_ms` in the on-disk index by ffprobing each clip
+/// whose entry currently has `duration_ms == 0`. Designed to be invoked
+/// from a worker thread spawned at browser-open time.
+///
+/// **Update-propagation strategy:** the worker writes the updated index
+/// to disk via [`save_index`] but does **not** signal the GTK side to
+/// refresh the visible model. The next time `loaded_page()` is built
+/// (next browser open or app restart) the new durations are picked up
+/// via `reconcile()`. This avoids the complexity of a cross-thread
+/// channel + visible-model rewrite for a piece of data the GridView
+/// does not yet display in this chunk (durations land in Phase 5C/D
+/// alongside the kebab menu and visual mockups). If a future task
+/// renders durations on the cards, swap this for an mpsc + glib timer
+/// or `MainContext::default().invoke()` callback.
+pub fn backfill_durations(storage_dir: &Path) -> std::io::Result<()> {
+    let mut idx = load_index();
+    let mut changed = false;
+    for m in idx.iter_mut() {
+        if m.duration_ms == 0 {
+            let p = storage_dir.join(&m.filename);
+            if let Some(ms) = ffprobe_duration_ms(&p) {
+                m.duration_ms = ms;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        save_index(&idx)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

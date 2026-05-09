@@ -466,6 +466,22 @@ fn loaded_page() -> gtk::Widget {
         model.append(&ClipObject::new(meta, storage_dir.clone()));
     }
 
+    // Phase 1's FIFO reader emits `Saved { duration_ms: 0 }` (ffprobe was
+    // deferred out of the FIFO reader to avoid blocking the next save), and
+    // entries created by `reconcile()` for files not yet in the index also
+    // start at zero. Spawn a worker thread to backfill missing durations
+    // by ffprobing each file. The worker writes the updated index in place
+    // and the new values surface on the next browser-open / app launch
+    // (see `library::backfill_durations` for the rationale).
+    {
+        let storage_for_backfill = storage_dir.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = library::backfill_durations(&storage_for_backfill) {
+                log::warn!("clip duration backfill failed: {e}");
+            }
+        });
+    }
+
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_factory, item| {
         let item = item
