@@ -199,6 +199,87 @@ pub fn ffprobe_duration_ms(path: &Path) -> Option<u64> {
     Some((secs * 1000.0) as u64)
 }
 
+/// Total bytes occupied by all `.mp4` files directly under `storage_dir`.
+///
+/// Thumbnails (which live in `storage_dir/.cache/thumbs/*.jpg`) are excluded
+/// — `read_dir` is non-recursive so they're naturally skipped, but the
+/// `.mp4` filter also makes the intent explicit. Returns 0 if the directory
+/// can't be read at all (cleaner than panicking; the caller's retention
+/// loop is a no-op when the total is already under the cap).
+pub fn total_bytes(storage_dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(rd) = std::fs::read_dir(storage_dir) {
+        for entry in rd.flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".mp4") {
+                if let Ok(m) = entry.metadata() {
+                    total += m.len();
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Enforce the disk-cap by deleting oldest clips (by mtime) until the total
+/// is under the cap. Returns the list of deleted filenames so the caller can
+/// log it / refresh any open browser views.
+///
+/// Both the `.mp4` and its matching `.cache/thumbs/<stem>.jpg` are removed.
+/// If the deletion of the .mp4 itself fails (permissions, FS error) we skip
+/// the entry and continue with the next-oldest — partial progress is better
+/// than no progress, and the caller's index reconcile picks up the missing
+/// file on next browser open.
+///
+/// Note: this does NOT update the on-disk index file (`clips_index.txt`);
+/// `reconcile()` removes index entries whose `.mp4` files no longer exist,
+/// so the next browser open / app launch picks up the deletion automatically.
+pub fn enforce_retention(storage_dir: &Path, cap_gb: u32) -> Vec<String> {
+    let cap_bytes = (cap_gb as u64) * 1024 * 1024 * 1024;
+    let mut total = total_bytes(storage_dir);
+    if total <= cap_bytes {
+        return vec![];
+    }
+
+    let mut entries: Vec<(std::time::SystemTime, PathBuf, u64)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(storage_dir) {
+        for entry in rd.flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".mp4") {
+                if let Ok(m) = entry.metadata() {
+                    if let Ok(t) = m.modified() {
+                        entries.push((t, entry.path(), m.len()));
+                    }
+                }
+            }
+        }
+    }
+    entries.sort_by_key(|(t, _, _)| *t);
+
+    let mut deleted = Vec::new();
+    for (_, path, size) in entries {
+        if total <= cap_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            // Also remove the matching thumbnail. Failure is silent — a
+            // stale thumb is harmless; reconcile() will eventually drop it.
+            if let Some(stem) = path.file_stem() {
+                let thumb = storage_dir
+                    .join(".cache/thumbs")
+                    .join(format!("{}.jpg", stem.to_string_lossy()));
+                let _ = std::fs::remove_file(thumb);
+            }
+            deleted.push(
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            total = total.saturating_sub(size);
+        }
+    }
+    deleted
+}
+
 /// Fill missing `duration_ms` in the on-disk index by ffprobing each clip
 /// whose entry currently has `duration_ms == 0`. Designed to be invoked
 /// from a worker thread spawned at browser-open time.
@@ -297,5 +378,63 @@ mod index_tests {
     fn parse_rejects_malformed() {
         assert!(parse_meta("not enough tabs").is_none());
         assert!(parse_meta("a\tb\tc\td\te").is_none());
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    /// Returns a fresh per-test temp dir with PID + a nanosecond-tagged
+    /// suffix so parallel test threads, prior phases, and `cargo test`
+    /// reruns can't collide on the same path.
+    fn unique_dir(suffix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "arctis-retention-test-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            suffix
+        ))
+    }
+
+    #[test]
+    fn enforce_retention_skips_when_under_cap() {
+        let dir = unique_dir("under");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("a.mp4"), vec![0u8; 1024]).unwrap();
+        let deleted = enforce_retention(&dir, 1);
+        assert!(deleted.is_empty(), "no deletions expected when under cap");
+        assert!(dir.join("a.mp4").exists(), "file should still exist");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enforce_retention_deletes_oldest_first() {
+        let dir = unique_dir("over");
+        let _ = std::fs::create_dir_all(&dir);
+        // Write three 500MB sparse files. set_len() doesn't allocate
+        // physical blocks on tmpfs/ext4, so this is essentially free.
+        for name in ["a.mp4", "b.mp4", "c.mp4"] {
+            let f = std::fs::File::create(dir.join(name)).unwrap();
+            f.set_len(500 * 1024 * 1024).unwrap();
+            // Bump mtimes so a < b < c. 10 ms is comfortably above any
+            // FS mtime resolution we're likely to encounter (ext4 = ns,
+            // tmpfs = ns, FAT = 2 s — but no test runs on FAT).
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let deleted = enforce_retention(&dir, 1);
+        assert!(
+            deleted.contains(&"a.mp4".to_string()),
+            "oldest (a.mp4) should be deleted, got {deleted:?}"
+        );
+        assert!(
+            !dir.join("a.mp4").exists(),
+            "a.mp4 should be gone after retention"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

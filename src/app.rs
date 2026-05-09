@@ -1154,16 +1154,20 @@ fn handle_event(event: &HidEvent, window: &ChatMixWindow) {
     }
 }
 
-/// Spawn a worker to extract a thumbnail for a freshly saved clip and post
-/// back to the GTK main thread to dispatch the saved-clip notification.
+/// Spawn workers for a freshly saved clip:
+///   1. Thumbnail extraction → notify_saved (toast / desktop notification).
+///   2. Retention enforcement (if disk_cap_gb is Some) → refresh the Clips
+///      grid after deleting any over-cap clips.
 ///
 /// Called from the BackendEvent poll handler when we see a `Saved` event.
-/// `ensure_thumbnail` shells out to ffmpeg (~50–100 ms) so we can't run it
-/// on the GTK main thread without stutter. We use the same std::sync::mpsc
-/// + glib timer pattern the rest of the app uses (HID listener, tray, clip
-/// backend) — the worker writes the thumbnail path through a one-shot
-/// channel, a 50 ms glib timer drains it on the main thread and dispatches
-/// the toast / notification.
+/// Both `ensure_thumbnail` (ffmpeg shell-out, ~50–100 ms) and
+/// `enforce_retention` (filesystem walk + delete, can be tens of ms on
+/// large directories) are heavy enough that we can't run them on the GTK
+/// main thread. We use the same `std::sync::mpsc` + glib timer pattern the
+/// rest of the app uses (HID listener, tray, clip backend): the workers
+/// write a one-shot result through a channel, a 50 ms glib timer drains it
+/// on the main thread, and the dispatch (toast/notification + grid
+/// refresh) happens there.
 fn dispatch_saved_clip(
     app: &adw::Application,
     window: &Rc<ChatMixWindow>,
@@ -1177,6 +1181,7 @@ fn dispatch_saved_clip(
     let app_for_notify = app.clone();
     let window_for_notify = window.window.clone();
 
+    // ---- Thumbnail + notification -------------------------------------
     let saved_for_thread = saved_path.clone();
     let (tx, rx) = mpsc::channel::<Option<std::path::PathBuf>>();
     std::thread::spawn(move || {
@@ -1203,7 +1208,7 @@ fn dispatch_saved_clip(
     // so the closure consumes `rx` and returns Break the moment it gets a
     // result (or the sender drops, which means the worker died). The 50 ms
     // tick is short enough that even back-to-back saves feel instant.
-    let saved_for_main = saved_path;
+    let saved_for_main = saved_path.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
         match rx.try_recv() {
             Ok(thumb) => {
@@ -1217,11 +1222,54 @@ fn dispatch_saved_clip(
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(mpsc::TryRecvError::Disconnected) => {
-                log::warn!("dispatch_saved_clip: worker disconnected");
+                log::warn!("dispatch_saved_clip: thumbnail worker disconnected");
                 glib::ControlFlow::Break
             }
         }
     });
+
+    // ---- Retention enforcement ----------------------------------------
+    // Settings are loaded fresh each save so a user toggling the cap in
+    // Settings → Clips takes effect on the next save without needing to
+    // restart the app. `load()` is a small file read + parse, ~ms-level.
+    let settings = crate::clips::settings::load();
+    if let Some(cap_gb) = settings.disk_cap_gb {
+        let storage_dir = match saved_path.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return,
+        };
+        let clips_page = window.clips_page();
+        let (rtx, rrx) = mpsc::channel::<Vec<String>>();
+        std::thread::spawn(move || {
+            let deleted = crate::clips::library::enforce_retention(&storage_dir, cap_gb);
+            let _ = rtx.send(deleted);
+        });
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            match rrx.try_recv() {
+                Ok(deleted) => {
+                    if !deleted.is_empty() {
+                        log::info!(
+                            "retention: deleted {} clip(s) over {} GB cap: {:?}",
+                            deleted.len(),
+                            cap_gb,
+                            deleted
+                        );
+                        // Repopulate the GridView so the deleted clips
+                        // disappear from the browser. Safe to call
+                        // unconditionally — `refresh_clips_model` is a
+                        // reconcile against the disk state.
+                        clips_page.refresh_clips_model();
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    log::warn!("dispatch_saved_clip: retention worker disconnected");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
 }
 
 /// Present an AlertDialog with a screenshot of the persisted capture target.
