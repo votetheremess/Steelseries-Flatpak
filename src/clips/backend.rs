@@ -272,6 +272,10 @@ impl BackendHandle {
     pub fn send(&self, cmd: ClipCommand) {
         let _ = self.cmd_tx.send(cmd);
     }
+
+    pub fn sender(&self) -> Sender<ClipCommand> {
+        self.cmd_tx.clone()
+    }
 }
 
 impl Drop for BackendHandle {

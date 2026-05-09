@@ -30,6 +30,8 @@ struct AppResources {
     rx: Option<Receiver<HidEvent>>,
     writer: Option<HidWriter>,
     headset_sink: String,
+    clip_backend: Option<crate::clips::backend::BackendHandle>,
+    clip_events: Option<Receiver<crate::clips::BackendEvent>>,
 }
 
 pub fn run(start_hidden: bool) {
@@ -228,6 +230,26 @@ pub fn run(start_hidden: bool) {
                 glib::ControlFlow::Continue
             });
 
+            // Clip backend event poll. The backend idles until a later phase
+            // sends StartReplay, so this just logs whatever comes through.
+            let resources_for_clips = resources.clone();
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                if let Some(res) = resources_for_clips.borrow().as_ref() {
+                    if let Some(rx) = res.clip_events.as_ref() {
+                        loop {
+                            match rx.try_recv() {
+                                Ok(evt) => log::info!("clip event: {evt:?}"),
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => {
+                                    return glib::ControlFlow::Break;
+                                }
+                            }
+                        }
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+
             // Battery query: send once immediately, then refresh periodically
             if let Some(writer) = writer {
                 let writer = Rc::new(RefCell::new(writer));
@@ -303,6 +325,11 @@ fn init_pipeline() -> Result<AppResources, String> {
     log::info!("Setting up audio routing...");
     let router = AudioRouter::create(&headset_sink)?;
 
+    // Spawn the clip-backend thread. It idles until later phases send a
+    // StartReplay command — no GSR child is launched here.
+    log::info!("Spawning clip backend thread (idle)...");
+    let (clip_backend, clip_events) = crate::clips::backend::spawn_backend();
+
     // Give PipeWire a moment to register the new sinks before trying to move
     // existing sink-inputs to them.
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -340,6 +367,8 @@ fn init_pipeline() -> Result<AppResources, String> {
         rx: Some(rx),
         writer: Some(writer),
         headset_sink,
+        clip_backend: Some(clip_backend),
+        clip_events: Some(clip_events),
     })
 }
 
