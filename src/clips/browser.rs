@@ -59,6 +59,10 @@ pub enum PageState {
     Onboarding,
     Empty,
     Loaded,
+    /// The remix panel is visible. Entered via a card kebab's "Remix"
+    /// item; exits back to `Loaded` via the panel's Close button or after
+    /// a successful Export.
+    Remix,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,12 +122,77 @@ pub fn build_clips_page() -> ClipsPage {
     let _ = std::fs::create_dir_all(&storage_dir);
     let model = gio::ListStore::new::<ClipObject>();
 
+    let state = Rc::new(RefCell::new(PageState::Onboarding));
+
+    // The remix slot is a wrapper Box that holds the active `RemixPanel`
+    // root. We rebuild the panel for each clip the user remixes (rather
+    // than caching one and rebinding) — clips are infrequent and the
+    // panel only has 6 sliders + 12 toggles, so the rebuild cost is
+    // dwarfed by the user's reaction time. Reuse-via-rebind would
+    // require a `RemixPanel::set_clip_path` API that's pure cost for v1.
+    let remix_container = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+
+    // The on_remix closure: invoked from a per-card kebab's `clip.remix`
+    // action with the clicked clip's full path. Builds a fresh RemixPanel
+    // for that clip and switches the page Stack to "remix". Captures
+    // clones of stack / state / model / storage_dir / remix_container so
+    // it doesn't hold a ClipsPage ref (which doesn't exist yet at this
+    // point in construction).
+    let on_remix: Rc<dyn Fn(PathBuf)> = {
+        let stack_for_remix = stack.clone();
+        let state_for_remix = state.clone();
+        let remix_container = remix_container.clone();
+        let model_for_remix = model.clone();
+        let storage_dir_for_remix = storage_dir.clone();
+        Rc::new(move |clip_path: PathBuf| {
+            // Tear down the previous panel (if any) before building the
+            // new one. `while let Some(child) = container.first_child()`
+            // is the canonical drain pattern for gtk::Box in gtk-rs.
+            while let Some(child) = remix_container.first_child() {
+                remix_container.remove(&child);
+            }
+
+            // on_close: switch the page back to "loaded".
+            let stack_for_close = stack_for_remix.clone();
+            let state_for_close = state_for_remix.clone();
+            let on_close = move || {
+                *state_for_close.borrow_mut() = PageState::Loaded;
+                stack_for_close.set_visible_child_name("loaded");
+            };
+
+            // on_exported: refresh the grid model so the new
+            // `*-remix.mp4` file shows up.
+            let model_for_export = model_for_remix.clone();
+            let storage_dir_for_export = storage_dir_for_remix.clone();
+            let on_exported = move |_out_path: PathBuf| {
+                refresh_model_in_place(&model_for_export, &storage_dir_for_export);
+            };
+
+            let panel = crate::clips::remix::build_remix_panel(
+                &clip_path,
+                on_close,
+                on_exported,
+            );
+            remix_container.append(&panel.root);
+
+            *state_for_remix.borrow_mut() = PageState::Remix;
+            stack_for_remix.set_visible_child_name("remix");
+        })
+    };
+
     let wizard = Rc::new(build_wizard());
     stack.add_named(&wizard.stack, Some("onboarding"));
     stack.add_named(&empty_page(), Some("empty"));
-    stack.add_named(&loaded_page(&storage_dir, &model), Some("loaded"));
+    stack.add_named(
+        &loaded_page(&storage_dir, &model, on_remix),
+        Some("loaded"),
+    );
+    stack.add_named(&remix_container, Some("remix"));
 
-    let state = Rc::new(RefCell::new(PageState::Onboarding));
     stack.set_visible_child_name("onboarding");
 
     let page = ClipsPage { root: stack, state, wizard, model, storage_dir };
@@ -455,6 +524,7 @@ fn build_clip_card() -> (gtk::Overlay, CardWidgets) {
     // prefix on this overlay, capturing the bound clip's filename and
     // storage_dir into each action's callback.
     let menu = gio::Menu::new();
+    menu.append(Some("Remix…"), Some("clip.remix"));
     menu.append(Some("Rename…"), Some("clip.rename"));
     menu.append(Some("Open in Folder"), Some("clip.open-folder"));
     // Section break so Delete sits visually separate from the safe
@@ -486,6 +556,7 @@ fn bind_clip_card(
     clip: &ClipObject,
     storage_dir: &PathBuf,
     model: &gio::ListStore,
+    on_remix: &Rc<dyn Fn(PathBuf)>,
 ) {
     let meta = clip.meta();
     let clip_storage_dir = clip.storage_dir();
@@ -508,6 +579,7 @@ fn bind_clip_card(
         meta.filename.clone(),
         storage_dir.clone(),
         model.clone(),
+        on_remix.clone(),
     );
     widgets.card.insert_action_group("clip", Some(&actions));
 
@@ -538,15 +610,31 @@ fn bind_clip_card(
 
 /// Build a fresh per-card action group for the kebab menu. Captures the
 /// bound clip's filename + the page-level storage_dir + model so that
-/// Rename / Delete / Open-in-Folder can mutate disk state and trigger a
-/// model rebuild without walking widget trees or holding ClipsPage refs.
+/// Rename / Delete / Open-in-Folder / Remix can mutate disk state or
+/// switch to the remix panel without walking widget trees or holding
+/// ClipsPage refs.
 fn build_clip_actions(
     widgets: &CardWidgets,
     filename: String,
     storage_dir: PathBuf,
     model: gio::ListStore,
+    on_remix: Rc<dyn Fn(PathBuf)>,
 ) -> gio::SimpleActionGroup {
     let group = gio::SimpleActionGroup::new();
+
+    // Remix — switches the page Stack to the remix panel for this clip.
+    // The on_remix callback (provided by `build_clips_page`) takes the
+    // full clip path and is responsible for rebuilding the panel and
+    // flipping the page state.
+    {
+        let remix = gio::SimpleAction::new("remix", None);
+        let storage_dir = storage_dir.clone();
+        let filename = filename.clone();
+        remix.connect_activate(move |_, _| {
+            on_remix(storage_dir.join(&filename));
+        });
+        group.add_action(&remix);
+    }
 
     // Rename
     {
@@ -799,7 +887,11 @@ fn refresh_model_in_place(model: &gio::ListStore, storage_dir: &PathBuf) {
     }
 }
 
-fn loaded_page(storage_dir: &PathBuf, model: &gio::ListStore) -> gtk::Widget {
+fn loaded_page(
+    storage_dir: &PathBuf,
+    model: &gio::ListStore,
+    on_remix: Rc<dyn Fn(PathBuf)>,
+) -> gtk::Widget {
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
@@ -829,6 +921,7 @@ fn loaded_page(storage_dir: &PathBuf, model: &gio::ListStore) -> gtk::Widget {
     });
     let storage_dir_for_bind = storage_dir.clone();
     let model_for_bind = model.clone();
+    let on_remix_for_bind = on_remix;
     factory.connect_bind(move |_factory, item| {
         let item = item
             .downcast_ref::<gtk::ListItem>()
@@ -846,7 +939,13 @@ fn loaded_page(storage_dir: &PathBuf, model: &gio::ListStore) -> gtk::Widget {
             .item()
             .and_then(|o| o.downcast::<ClipObject>().ok())
             .expect("model item must be a ClipObject");
-        bind_clip_card(&widgets, &clip, &storage_dir_for_bind, &model_for_bind);
+        bind_clip_card(
+            &widgets,
+            &clip,
+            &storage_dir_for_bind,
+            &model_for_bind,
+            &on_remix_for_bind,
+        );
     });
     factory.connect_unbind(|_factory, item| {
         // Clear the per-card action group so the action closures (which
@@ -912,6 +1011,7 @@ impl ClipsPage {
             PageState::Onboarding => self.root.set_visible_child_name("onboarding"),
             PageState::Empty => self.root.set_visible_child_name("empty"),
             PageState::Loaded => self.root.set_visible_child_name("loaded"),
+            PageState::Remix => self.root.set_visible_child_name("remix"),
         }
     }
 
