@@ -400,35 +400,55 @@ pub fn run(start_hidden: bool) {
                 app.add_action_entries([copy_action]);
             }
 
-            // app.gsr-install-manually — present a small AlertDialog that
+            // app.gsr-install-manually — present a custom adw::Dialog that
             // exposes the two manual-install fallbacks (app store + copy
-            // command). Wired to the secondary "Install Manually" button on
-            // wizard Page 1; keeps the page uncluttered for the happy path.
+            // command) plus a Close button. Wired to the secondary
+            // "Install Manually" button on wizard Page 1; keeps the page
+            // uncluttered for the happy path.
+            //
+            // We use a base `adw::Dialog` (not `adw::AlertDialog`) so all
+            // three buttons can share identical pill styling + 200 px
+            // width. AlertDialog renders its responses as a separate row
+            // with non-pill chrome that breaks visual symmetry. Close
+            // sits at the bottom of the same vertical Box with a small
+            // spacer above it so it reads as "the way out" rather than as
+            // a third action peer. Escape-to-close works natively on
+            // adw::Dialog (set_can_close is true by default).
             {
                 let manual_action = gtk::gio::ActionEntry::builder("gsr-install-manually")
                     .activate(move |app: &adw::Application, _action, _param| {
-                        let dialog = adw::AlertDialog::builder()
-                            .heading("Install gpu-screen-recorder manually")
-                            .body(
+                        let dialog = adw::Dialog::new();
+                        dialog.set_title("Install gpu-screen-recorder manually");
+
+                        let content = gtk::Box::builder()
+                            .orientation(gtk::Orientation::Vertical)
+                            .spacing(16)
+                            .margin_top(24)
+                            .margin_bottom(24)
+                            .margin_start(24)
+                            .margin_end(24)
+                            .halign(gtk::Align::Center)
+                            .build();
+
+                        let heading = gtk::Label::builder()
+                            .label("Install gpu-screen-recorder manually")
+                            .css_classes(["title-3"])
+                            .halign(gtk::Align::Center)
+                            .build();
+                        content.append(&heading);
+
+                        let body = gtk::Label::builder()
+                            .label(
                                 "Choose one of these options to install \
                                  the recorder yourself.",
                             )
+                            .wrap(true)
+                            .max_width_chars(40)
+                            .justify(gtk::Justification::Center)
+                            .xalign(0.5)
+                            .css_classes(["dim-label"])
                             .build();
-
-                        // Vertical button stack inside the dialog body
-                        // (extra_child). adw::AlertDialog only lays its
-                        // responses out horizontally; to get a vertical
-                        // stack with Close visually below the action
-                        // buttons we move the two action buttons into
-                        // the body and keep Close as the only response.
-                        // Both action buttons share width_request 200 so
-                        // they match each other and the wizard buttons.
-                        let buttons_box = gtk::Box::builder()
-                            .orientation(gtk::Orientation::Vertical)
-                            .spacing(8)
-                            .halign(gtk::Align::Center)
-                            .margin_top(8)
-                            .build();
+                        content.append(&body);
 
                         let app_for_store = app.clone();
                         let dialog_for_store = dialog.clone();
@@ -436,12 +456,13 @@ pub fn run(start_hidden: bool) {
                             .label("Open in app store")
                             .css_classes(["pill"])
                             .width_request(200)
+                            .halign(gtk::Align::Center)
                             .build();
                         app_store_btn.connect_clicked(move |_btn| {
                             app_for_store.activate_action("gsr-open-in-app-store", None);
                             dialog_for_store.close();
                         });
-                        buttons_box.append(&app_store_btn);
+                        content.append(&app_store_btn);
 
                         let app_for_copy = app.clone();
                         let dialog_for_copy = dialog.clone();
@@ -449,6 +470,7 @@ pub fn run(start_hidden: bool) {
                             .label("Copy install command")
                             .css_classes(["pill"])
                             .width_request(200)
+                            .halign(gtk::Align::Center)
                             .build();
                         copy_btn.connect_clicked(move |_btn| {
                             app_for_copy.activate_action("gsr-copy-cli", None);
@@ -470,16 +492,31 @@ pub fn run(start_hidden: bool) {
                             }
                             dialog_for_copy.close();
                         });
-                        buttons_box.append(&copy_btn);
+                        content.append(&copy_btn);
 
-                        dialog.set_extra_child(Some(&buttons_box));
+                        // Spacer keeps the visual gap between the two
+                        // action buttons and the dismissive Close button
+                        // — without it the three buttons would read as a
+                        // peer trio instead of "two actions, one exit".
+                        content.append(
+                            &gtk::Box::builder().height_request(8).build(),
+                        );
 
-                        // Only Close remains as a real response — gives
-                        // us the visual order [Open in app store] /
-                        // [Copy install command] (in body) → [Close]
-                        // (response area at the bottom).
-                        dialog.add_response("close", "Close");
-                        dialog.set_close_response("close");
+                        let close_btn = gtk::Button::builder()
+                            .label("Close")
+                            .css_classes(["pill"])
+                            .width_request(200)
+                            .halign(gtk::Align::Center)
+                            .build();
+                        {
+                            let dialog = dialog.clone();
+                            close_btn.connect_clicked(move |_| {
+                                dialog.close();
+                            });
+                        }
+                        content.append(&close_btn);
+
+                        dialog.set_child(Some(&content));
 
                         if let Some(window) = app.active_window() {
                             dialog.present(Some(&window));
