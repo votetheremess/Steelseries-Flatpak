@@ -33,6 +33,8 @@ pub struct BufferController {
     current_game: Option<DetectedGame>,
     /// Has the portal been picked? (Set externally after restore_token persists.)
     pub has_portal_pick: bool,
+    /// If a config change arrived while saving, hold it and flush when `Saving → Armed`.
+    pending_reconfigure: bool,
 }
 
 impl BufferController {
@@ -44,6 +46,7 @@ impl BufferController {
             always_armed: false,
             current_game: None,
             has_portal_pick: false,
+            pending_reconfigure: false,
         }
     }
 
@@ -92,7 +95,7 @@ impl BufferController {
     }
 
     /// Backend event arrived from backend thread.
-    pub fn on_backend_event(&mut self, evt: &BackendEvent, _cmd_tx: &Sender<ClipCommand>) {
+    pub fn on_backend_event(&mut self, evt: &BackendEvent, cmd_tx: &Sender<ClipCommand>) {
         match evt {
             BackendEvent::Armed => {
                 if matches!(self.state, BufferState::Arming) {
@@ -100,13 +103,31 @@ impl BufferController {
                 }
             }
             BackendEvent::Disarmed => {
-                if matches!(self.state, BufferState::Armed | BufferState::Arming) {
+                // Only Armed → Idle on disarm. A `Disarmed` arriving while we're `Arming`
+                // is from a prior `StopReplay` whose `disarm()` is just now completing —
+                // we're already mid-StartReplay for a new session and should ignore it.
+                // Otherwise we'd transition Arming → Idle while the backend is actually
+                // about to send `Armed` for the new session, leaving the controller stuck.
+                if matches!(self.state, BufferState::Armed) {
                     self.state = BufferState::Idle;
                 }
             }
             BackendEvent::Saved { .. } => {
                 if matches!(self.state, BufferState::Saving) {
-                    self.state = BufferState::Armed;
+                    // If the game exited mid-save (no current_game) and we're not in
+                    // always_armed mode, disarm. Otherwise return to Armed normally.
+                    if self.current_game.is_none() && !self.always_armed {
+                        let _ = cmd_tx.send(ClipCommand::StopReplay);
+                        self.state = BufferState::Idle;
+                        self.pending_reconfigure = false; // discard — would apply on next arm
+                    } else {
+                        self.state = BufferState::Armed;
+                        if self.pending_reconfigure {
+                            let _ = cmd_tx
+                                .send(ClipCommand::Reconfigure { config: self.config.clone() });
+                            self.pending_reconfigure = false;
+                        }
+                    }
                 }
             }
             BackendEvent::BackendDied { .. } | BackendEvent::Error { .. } => {
@@ -123,8 +144,15 @@ impl BufferController {
             .clone()
             .or_else(|| self.config.portal_restore_token.clone());
         self.config = CaptureConfig { portal_restore_token: token, ..new_config };
-        if matches!(self.state, BufferState::Armed | BufferState::Arming) {
-            let _ = cmd_tx.send(ClipCommand::Reconfigure { config: self.config.clone() });
+        match self.state {
+            BufferState::Armed | BufferState::Arming => {
+                let _ = cmd_tx.send(ClipCommand::Reconfigure { config: self.config.clone() });
+            }
+            BufferState::Saving => {
+                // Defer until Saved arrives.
+                self.pending_reconfigure = true;
+            }
+            _ => {} // Uninitialized / Idle / ErrorState — config will apply on next arm
         }
     }
 
@@ -227,5 +255,78 @@ mod tests {
         b.on_portal_pick_complete("t".into(), &tx);
         assert_eq!(b.state(), BufferState::Arming);
         assert!(matches!(rx.try_recv(), Ok(ClipCommand::StartReplay { .. })));
+    }
+
+    #[test]
+    fn disarmed_during_arming_is_ignored() {
+        let (tx, _rx) = channel();
+        let mut b = BufferController::new(cfg());
+        b.on_portal_pick_complete("t".into(), &tx);
+        b.on_game_started(dg(42), &tx);
+        assert_eq!(b.state(), BufferState::Arming);
+        // Stale Disarmed from a prior session arrives while we're Arming.
+        b.on_backend_event(&BackendEvent::Disarmed, &tx);
+        // Should still be Arming — wait for the actual Armed event.
+        assert_eq!(b.state(), BufferState::Arming);
+        b.on_backend_event(&BackendEvent::Armed, &tx);
+        assert_eq!(b.state(), BufferState::Armed);
+    }
+
+    #[test]
+    fn saved_after_game_exit_disarms() {
+        let (tx, rx) = channel();
+        let mut b = BufferController::new(cfg());
+        b.on_portal_pick_complete("t".into(), &tx);
+        b.on_game_started(dg(42), &tx);
+        let _ = rx.try_recv(); // consume StartReplay
+        b.on_backend_event(&BackendEvent::Armed, &tx);
+        b.on_save_hotkey(&tx);
+        let _ = rx.try_recv(); // consume SaveClip
+        assert_eq!(b.state(), BufferState::Saving);
+        // Game exits while we're saving (debounce window).
+        b.on_game_stopped(42, &tx);
+        // No StopReplay yet — state isn't Armed, predicate skipped.
+        assert!(rx.try_recv().is_err());
+        // Saved arrives. Now we should disarm because no current_game.
+        b.on_backend_event(
+            &BackendEvent::Saved {
+                path: std::path::PathBuf::from("/tmp/clip.mp4"),
+                duration_ms: 60_000,
+            },
+            &tx,
+        );
+        assert_eq!(b.state(), BufferState::Idle);
+        assert!(matches!(rx.try_recv(), Ok(ClipCommand::StopReplay)));
+    }
+
+    #[test]
+    fn config_change_during_saving_is_deferred() {
+        let (tx, rx) = channel();
+        let mut b = BufferController::new(cfg());
+        b.on_portal_pick_complete("t".into(), &tx);
+        b.on_game_started(dg(42), &tx);
+        let _ = rx.try_recv(); // consume StartReplay
+        b.on_backend_event(&BackendEvent::Armed, &tx);
+        b.on_save_hotkey(&tx);
+        let _ = rx.try_recv(); // consume SaveClip
+        assert_eq!(b.state(), BufferState::Saving);
+        // Settings change mid-save.
+        let mut new_cfg = cfg();
+        new_cfg.bitrate_mbps = 40;
+        b.on_config_change(new_cfg, &tx);
+        // Should NOT have sent Reconfigure yet.
+        assert!(rx.try_recv().is_err());
+        // Saved arrives.
+        b.on_backend_event(
+            &BackendEvent::Saved {
+                path: std::path::PathBuf::from("/tmp/c.mp4"),
+                duration_ms: 60_000,
+            },
+            &tx,
+        );
+        // State back to Armed (game still running).
+        assert_eq!(b.state(), BufferState::Armed);
+        // Reconfigure should have flushed.
+        assert!(matches!(rx.try_recv(), Ok(ClipCommand::Reconfigure { .. })));
     }
 }
