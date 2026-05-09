@@ -479,8 +479,10 @@ pub fn build_clips_group(
     // its callback needs access to the row, settings cell, buffer ref,
     // and cmd_tx — the GApplication action system would force us into
     // either captured Rc-of-Rc-of-Rc gymnastics or globals. The wizard's
-    // Page 3 storage button stays on `app.pick-clip-storage` (still a
-    // stub — Settings is the canonical surface for changing this).
+    // Page 3 storage button uses `app.pick-clip-storage` which lands at
+    // a handler in `app.rs` that calls into the same
+    // `pick_clip_storage_folder` helper this row uses — both surfaces
+    // present the same UX.
     // ------------------------------------------------------------------
     let storage_row = adw::ActionRow::builder()
         .title("Storage location")

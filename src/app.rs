@@ -708,14 +708,79 @@ pub fn run(start_hidden: bool) {
             }
 
             // app.pick-clip-storage — folder picker for the clips storage
-            // path. Stub for now; full implementation comes in a later
-            // phase. Registered so the Page 3 button doesn't error out.
+            // path. Triggered from the wizard Page 3 "Pick folder" button.
+            // Uses the same `pick_clip_storage_folder` helper that the
+            // Settings → Clips → Storage location row uses, so both
+            // surfaces present identical UX (modal dialog, same accept
+            // label, same "seed initial folder from current setting" UX,
+            // same cancellation handling). On a successful pick we:
+            //   - update the in-memory ClipSettings cell + persist,
+            //   - update the wizard's storage_label preview,
+            //   - update the ClipsPage's storage_dir so the browser
+            //     reconciles against the new dir,
+            //   - push a fresh CaptureConfig to the buffer so the next
+            //     arm uses the new output_dir.
             {
+                let clip_settings_for_pick = clip_settings.clone();
+                let buffer_for_pick = buffer.clone();
+                let resources_for_pick = resources.clone();
+                let monitor_for_pick = headset_sink_monitor.clone();
+                let window_for_pick = window.clone();
                 let pick_storage_action =
                     gtk::gio::ActionEntry::builder("pick-clip-storage")
-                        .activate(|_app: &adw::Application, _action, _param| {
-                            log::info!(
-                                "app.pick-clip-storage invoked (stub — not yet implemented)"
+                        .activate(move |_app: &adw::Application, _action, _param| {
+                            let parent: Option<gtk::Window> =
+                                Some(window_for_pick.window.clone().upcast());
+                            let initial = clip_settings_for_pick.borrow().storage_path.clone();
+                            // Clones for the move into the picker callback.
+                            let clip_settings = clip_settings_for_pick.clone();
+                            let buffer = buffer_for_pick.clone();
+                            let resources = resources_for_pick.clone();
+                            let monitor = monitor_for_pick.clone();
+                            let window = window_for_pick.clone();
+                            crate::clips::settings::pick_clip_storage_folder(
+                                parent,
+                                &initial,
+                                move |path| {
+                                    {
+                                        let mut s = clip_settings.borrow_mut();
+                                        if s.storage_path == path {
+                                            return;
+                                        }
+                                        s.storage_path = path.clone();
+                                    }
+                                    if let Err(e) = crate::clips::settings::save(
+                                        &clip_settings.borrow(),
+                                    ) {
+                                        log::warn!("clip settings save failed: {e}");
+                                    }
+                                    // Mirror the new path into the wizard
+                                    // Page 3 label so the user sees it
+                                    // confirmed inline.
+                                    window
+                                        .clips_page()
+                                        .wizard
+                                        .storage_label
+                                        .set_label(&path.display().to_string());
+                                    // Update the browser dir so the next
+                                    // reconcile lands on the new folder.
+                                    window.clips_page().set_storage_dir(path.clone());
+                                    // Push a fresh CaptureConfig so the
+                                    // next arm uses the new output_dir.
+                                    let cmd_tx = resources
+                                        .borrow()
+                                        .as_ref()
+                                        .and_then(|r| {
+                                            r.clip_backend.as_ref().map(|h| h.sender())
+                                        });
+                                    if let Some(tx) = cmd_tx {
+                                        let cfg = crate::clips::settings::cfg_from_settings(
+                                            &clip_settings.borrow(),
+                                            &monitor,
+                                        );
+                                        buffer.borrow_mut().on_config_change(cfg, &tx);
+                                    }
+                                },
                             );
                         })
                         .build();
