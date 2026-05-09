@@ -16,6 +16,7 @@ pub fn build_gsr_args(config: &CaptureConfig, save_callback_path: &str, output_d
         "-bm".into(), "cbr".into(),
         "-q".into(), config.bitrate_mbps.to_string(),
         "-k".into(), "h264".into(),
+        "-c".into(), "mp4".into(),
         "-ac".into(), "aac".into(),
         "-f".into(), config.framerate.to_string(),
         "-o".into(), output_dir.into(),
@@ -68,6 +69,12 @@ mod tests {
     fn build_args_uses_cbr() {
         let args = build_gsr_args(&cfg(), "/tmp/cb.sh", "/home/u/Videos/Clips");
         assert!(args.windows(2).any(|w| w[0] == "-bm" && w[1] == "cbr"));
+    }
+
+    #[test]
+    fn build_args_uses_mp4_container() {
+        let args = build_gsr_args(&cfg(), "/tmp/cb.sh", "/home/u/Videos/Clips");
+        assert!(args.windows(2).any(|w| w[0] == "-c" && w[1] == "mp4"));
     }
 
     #[test]
