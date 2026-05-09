@@ -246,6 +246,268 @@ pub fn run(start_hidden: bool) {
                 Rc::new(RefCell::new(crate::clips::BufferController::new(initial_cfg)))
             };
 
+            // -------------------------------------------------------------
+            // Wizard actions (Phase 3 Task 3.5)
+            // -------------------------------------------------------------
+            //
+            // Each action is registered against the GApplication so the
+            // wizard buttons (which reference `app.<name>` action names) can
+            // dispatch into Rust closures. Widget references and shared state
+            // (clips_page, buffer, resources) are captured via Rc clones so
+            // closures can outlive `connect_activate`.
+
+            // app.gsr-install — kick off async install, stream progress to
+            // the Page 1 status label. Polls the install-progress receiver
+            // on a glib timer (every 100 ms) and flips the Next button to
+            // enabled once installation completes successfully.
+            {
+                let clips_page = window.clips_page();
+                let install_action = gtk::gio::ActionEntry::builder("gsr-install")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        let rx = crate::clips::gsr_install::install();
+                        clips_page.wizard.install_status_label.set_visible(true);
+                        clips_page
+                            .wizard
+                            .install_status_label
+                            .set_label("Starting install…");
+                        let label = clips_page.wizard.install_status_label.clone();
+                        let next_btn = clips_page.wizard.install_next_btn.clone();
+                        glib::timeout_add_local(Duration::from_millis(100), move || {
+                            while let Ok(evt) = rx.try_recv() {
+                                use crate::clips::gsr_install::InstallProgress;
+                                match evt {
+                                    InstallProgress::Started => {
+                                        label.set_label("Starting install…");
+                                    }
+                                    InstallProgress::Status(s) => label.set_label(&s),
+                                    InstallProgress::Done => {
+                                        label.set_label("Installed.");
+                                        next_btn.set_sensitive(true);
+                                        return glib::ControlFlow::Break;
+                                    }
+                                    InstallProgress::Failed { reason } => {
+                                        label.set_label(&format!("Install failed: {reason}"));
+                                        // Next stays disabled — user can retry.
+                                        return glib::ControlFlow::Break;
+                                    }
+                                }
+                            }
+                            glib::ControlFlow::Continue
+                        });
+                    })
+                    .build();
+                app.add_action_entries([install_action]);
+            }
+
+            // app.gsr-open-in-bazaar — opens appstream:// URL via xdg-open.
+            {
+                let bazaar_action = gtk::gio::ActionEntry::builder("gsr-open-in-bazaar")
+                    .activate(|_app: &adw::Application, _action, _param| {
+                        if let Err(e) = crate::clips::gsr_install::open_in_bazaar() {
+                            log::warn!("open_in_bazaar failed: {e}");
+                        }
+                    })
+                    .build();
+                app.add_action_entries([bazaar_action]);
+            }
+
+            // app.gsr-copy-cli — copy the terminal install command to the
+            // system clipboard so the user can paste it into a shell.
+            {
+                let win_for_copy = window.clone();
+                let copy_action = gtk::gio::ActionEntry::builder("gsr-copy-cli")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        let display = gtk::prelude::WidgetExt::display(&win_for_copy.window);
+                        let clipboard = display.clipboard();
+                        clipboard.set_text(crate::clips::gsr_install::GSR_TERMINAL_INSTALL_COMMAND);
+                    })
+                    .build();
+                app.add_action_entries([copy_action]);
+            }
+
+            // app.wizard-next — advance the wizard's internal step or, on
+            // Page 3 Done, transition the page state to Empty (browser).
+            // Pressing Next on Page 2 also flips onboarding_complete = true
+            // so subsequent app launches skip directly to the browser.
+            {
+                let buffer_for_next = buffer.clone();
+                let clips_page = window.clips_page();
+                let next_action = gtk::gio::ActionEntry::builder("wizard-next")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        use crate::clips::WizardStep;
+                        match clips_page.current_wizard_step() {
+                            WizardStep::InstallGsr => {
+                                clips_page.set_wizard_step(WizardStep::PickScreen);
+                            }
+                            WizardStep::PickScreen => {
+                                if let Err(e) = crate::clips::settings::mark_onboarding_complete()
+                                {
+                                    log::warn!(
+                                        "failed to persist onboarding_complete: {e}"
+                                    );
+                                }
+                                clips_page.set_wizard_step(WizardStep::Settings);
+                            }
+                            WizardStep::Settings => {
+                                clips_page.set_state(crate::clips::PageState::Empty);
+                            }
+                        }
+                        // Buffer is held captured for symmetry with future
+                        // expansions (e.g., flushing settings to it on Done).
+                        let _ = &buffer_for_next;
+                    })
+                    .build();
+                app.add_action_entries([next_action]);
+            }
+
+            // app.setup-clips — open the ScreenCast portal picker, save the
+            // restore token, notify the BufferController, and update Page 2
+            // of the wizard.
+            //
+            // The async portal call is driven on the GLib main context via
+            // spawn_future_local so we don't block the GTK event loop while
+            // the user is interacting with the portal dialog.
+            {
+                let clips_page = window.clips_page();
+                let buffer_for_setup = buffer.clone();
+                let resources_for_setup = resources.clone();
+                let setup_action = gtk::gio::ActionEntry::builder("setup-clips")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        let clips_page = clips_page.clone();
+                        let buffer_for_setup = buffer_for_setup.clone();
+                        let resources_for_setup = resources_for_setup.clone();
+                        glib::spawn_future_local(async move {
+                            match crate::clips::portal::pick_screencast_source().await {
+                                Ok(token) => {
+                                    if let Err(e) = crate::clips::portal::save_token(&token) {
+                                        log::warn!("save_token failed: {e}");
+                                    }
+                                    // Notify BufferController. Looked up at
+                                    // call time so a recreated backend
+                                    // handle (future) is picked up.
+                                    let cmd_tx = resources_for_setup
+                                        .borrow()
+                                        .as_ref()
+                                        .and_then(|r| {
+                                            r.clip_backend.as_ref().map(|h| h.sender())
+                                        });
+                                    if let Some(tx) = cmd_tx {
+                                        buffer_for_setup
+                                            .borrow_mut()
+                                            .on_portal_pick_complete(token, &tx);
+                                    } else {
+                                        log::warn!(
+                                            "no clip backend available to receive portal pick"
+                                        );
+                                    }
+                                    // Update wizard Page 2.
+                                    clips_page.wizard.screen_picked_label.set_visible(true);
+                                    clips_page
+                                        .wizard
+                                        .screen_picked_label
+                                        .set_label("Screen picked.");
+                                    clips_page.wizard.screen_next_btn.set_sensitive(true);
+                                }
+                                Err(e) => {
+                                    log::warn!("portal pick failed: {e}");
+                                }
+                            }
+                        });
+                    })
+                    .build();
+                app.add_action_entries([setup_action]);
+            }
+
+            // app.pick-clip-storage — folder picker for the clips storage
+            // path. Stub for now; full implementation comes in a later
+            // phase. Registered so the Page 3 button doesn't error out.
+            {
+                let pick_storage_action =
+                    gtk::gio::ActionEntry::builder("pick-clip-storage")
+                        .activate(|_app: &adw::Application, _action, _param| {
+                            log::info!(
+                                "app.pick-clip-storage invoked (stub — not yet implemented)"
+                            );
+                        })
+                        .build();
+                app.add_action_entries([pick_storage_action]);
+            }
+
+            // GSR-install detection poll. If the user installs GSR via
+            // Bazaar / a terminal while sitting on Page 1, this timer
+            // notices and enables the Next button. The in-app install
+            // path enables Next via its own progress watcher; whichever
+            // finishes first wins.
+            {
+                let clips_page = window.clips_page();
+                glib::timeout_add_seconds_local(2, move || {
+                    if matches!(
+                        clips_page.current_wizard_step(),
+                        crate::clips::WizardStep::InstallGsr
+                    ) && crate::clips::gsr_install::is_installed()
+                    {
+                        clips_page.wizard.install_next_btn.set_sensitive(true);
+                        clips_page.wizard.install_status_label.set_visible(true);
+                        clips_page
+                            .wizard
+                            .install_status_label
+                            .set_label("Installed.");
+                    }
+                    glib::ControlFlow::Continue
+                });
+            }
+
+            // Auto-resume: jump to the first incomplete wizard step (or
+            // skip the wizard entirely) based on persisted state.
+            //
+            //   onboarding_complete + GSR + token → skip wizard, go to
+            //                                       browser (Empty state).
+            //   GSR missing                       → Page 1 (install).
+            //   GSR present but no token          → Page 2 (pick screen),
+            //                                       enable Page 1 Next.
+            //   GSR + token but flag not set      → treat as complete
+            //                                       (user pressed Next on
+            //                                       Page 2 in a prior run
+            //                                       but didn't reach Done).
+            {
+                let clip_settings = crate::clips::settings::load();
+                let token = crate::clips::portal::load_token();
+                let gsr_ok = crate::clips::gsr_install::is_installed();
+
+                if clip_settings.onboarding_complete && gsr_ok && token.is_some() {
+                    if let Some(t) = token {
+                        let cmd_tx = resources
+                            .borrow()
+                            .as_ref()
+                            .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
+                        if let Some(tx) = cmd_tx {
+                            buffer.borrow_mut().on_portal_pick_complete(t, &tx);
+                        }
+                    }
+                    window.clips_page().set_state(crate::clips::PageState::Empty);
+                } else if !gsr_ok {
+                    window
+                        .clips_page()
+                        .set_wizard_step(crate::clips::WizardStep::InstallGsr);
+                } else if token.is_none() {
+                    window
+                        .clips_page()
+                        .set_wizard_step(crate::clips::WizardStep::PickScreen);
+                    // Already past page 1 — keep its Next enabled too in case
+                    // the user navigates back.
+                    window
+                        .clips_page()
+                        .wizard
+                        .install_next_btn
+                        .set_sensitive(true);
+                } else {
+                    if let Err(e) = crate::clips::settings::mark_onboarding_complete() {
+                        log::warn!("failed to persist onboarding_complete: {e}");
+                    }
+                    window.clips_page().set_state(crate::clips::PageState::Empty);
+                }
+            }
+
             // Clip backend event poll. Drains BackendEvents into the
             // BufferController so its state stays in sync with the backend
             // thread (Armed / Disarmed / Saved / errors).
