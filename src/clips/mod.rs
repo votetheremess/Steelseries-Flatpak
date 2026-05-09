@@ -8,6 +8,7 @@ pub mod gsr_install;
 pub mod hotkey;
 pub mod indicator;
 pub mod library;
+pub mod notifications;
 pub mod portal;
 pub mod settings;
 pub mod thumbnail;

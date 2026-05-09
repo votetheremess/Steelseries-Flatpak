@@ -668,6 +668,31 @@ pub fn run(start_hidden: bool) {
                 app.add_action_entries([pick_storage_action]);
             }
 
+            // app.show-clip(s: path) — invoked from the saved-clip toast
+            // (when the window is visible) or the desktop notification (when
+            // hidden). The parameter is the absolute path to the saved clip.
+            // We present the window and switch to the Clips tab so the user
+            // lands on the new clip. Selecting the specific item in the
+            // GridView is intentionally deferred — selection-by-filename in
+            // a `gio::ListStore`-backed GridView is non-trivial and the
+            // tab-level navigation already gives the user direct access to
+            // the freshly-saved clip (which appears at the top of the grid
+            // after the next reconcile, normally within the next 100 ms).
+            {
+                let win_for_show = window.clone();
+                let show_action = gtk::gio::ActionEntry::builder("show-clip")
+                    .parameter_type(Some(&String::static_variant_type()))
+                    .activate(move |_app: &adw::Application, _action, param| {
+                        let path = param.and_then(|p| p.get::<String>()).unwrap_or_default();
+                        log::info!("app.show-clip activated for {path:?}");
+                        win_for_show.window.set_visible(true);
+                        win_for_show.window.present();
+                        win_for_show.show_clips_tab();
+                    })
+                    .build();
+                app.add_action_entries([show_action]);
+            }
+
             // app.rebind-clip-hotkey — re-open the GlobalShortcuts portal
             // dialog so the user can change the chord bound to save-clip.
             // ashpd 0.10 has no `ConfigureShortcuts` API, so the workaround
@@ -848,11 +873,23 @@ pub fn run(start_hidden: bool) {
             // refreshes the dashboard's clip-status badge so the user sees
             // live state transitions (Idle → Arming → Armed → Saving →
             // Armed) without hunting for the Clips tab.
+            //
+            // On `Saved` events we additionally:
+            //   1. Spawn a worker to extract a thumbnail via ffmpeg (~50–100 ms).
+            //   2. Post back to the GTK main thread to dispatch a toast (when
+            //      the window is visible) or a desktop notification (when
+            //      hidden) — see `clips::notifications::notify_saved`.
+            //   3. If the user has a disk cap configured, also spawn a
+            //      retention worker that deletes oldest clips until under cap
+            //      and refreshes the Clips browser model afterwards.
             let resources_for_clips = resources.clone();
             let buf_for_events = buffer.clone();
             let window_for_indicator = window.clone();
+            let app_for_clips = app.clone();
+            let window_for_clips = window.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
                 let mut state_changed = false;
+                let mut saved_paths: Vec<std::path::PathBuf> = Vec::new();
                 if let Some(res) = resources_for_clips.borrow().as_ref() {
                     if let (Some(rx), Some(tx)) = (
                         res.clip_events.as_ref(),
@@ -863,6 +900,9 @@ pub fn run(start_hidden: bool) {
                             match rx.try_recv() {
                                 Ok(evt) => {
                                     log::info!("clip event: {evt:?}");
+                                    if let crate::clips::BackendEvent::Saved { path, .. } = &evt {
+                                        saved_paths.push(path.clone());
+                                    }
                                     buf.on_backend_event(&evt, &tx);
                                     state_changed = true;
                                 }
@@ -880,6 +920,13 @@ pub fn run(start_hidden: bool) {
                         buf.state(),
                         buf.current_game().map(|g| g.name.as_str()),
                     );
+                }
+                // Dispatch saved-clip notifications and retention. Done after
+                // releasing the resources borrow above so the worker threads
+                // we spawn can re-borrow if they need to (none currently do,
+                // but the discipline makes adding new state lookups safer).
+                for saved_path in saved_paths {
+                    dispatch_saved_clip(&app_for_clips, &window_for_clips, saved_path);
                 }
                 glib::ControlFlow::Continue
             });
@@ -1105,6 +1152,76 @@ fn handle_event(event: &HidEvent, window: &ChatMixWindow) {
             log::debug!("Unknown: feature=0x{feature:02x} value=0x{value:02x}");
         }
     }
+}
+
+/// Spawn a worker to extract a thumbnail for a freshly saved clip and post
+/// back to the GTK main thread to dispatch the saved-clip notification.
+///
+/// Called from the BackendEvent poll handler when we see a `Saved` event.
+/// `ensure_thumbnail` shells out to ffmpeg (~50–100 ms) so we can't run it
+/// on the GTK main thread without stutter. We use the same std::sync::mpsc
+/// + glib timer pattern the rest of the app uses (HID listener, tray, clip
+/// backend) — the worker writes the thumbnail path through a one-shot
+/// channel, a 50 ms glib timer drains it on the main thread and dispatches
+/// the toast / notification.
+fn dispatch_saved_clip(
+    app: &adw::Application,
+    window: &Rc<ChatMixWindow>,
+    saved_path: std::path::PathBuf,
+) {
+    use std::sync::mpsc;
+    // Pull out the bare ApplicationWindow up front. The `Rc<ChatMixWindow>`
+    // wrapper is `!Send` and would block the worker thread spawn, but the
+    // raw GObject window inside is fine to clone — we only ever use it on
+    // the main thread inside `notify_saved`.
+    let app_for_notify = app.clone();
+    let window_for_notify = window.window.clone();
+
+    let saved_for_thread = saved_path.clone();
+    let (tx, rx) = mpsc::channel::<Option<std::path::PathBuf>>();
+    std::thread::spawn(move || {
+        let storage_dir = saved_for_thread
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        let filename = saved_for_thread
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let thumb = if storage_dir.as_os_str().is_empty() {
+            None
+        } else {
+            crate::clips::thumbnail::ensure_thumbnail(&storage_dir, &filename)
+                .map_err(|e| log::warn!("thumbnail extract failed for {filename}: {e}"))
+                .ok()
+        };
+        let _ = tx.send(thumb);
+    });
+    // Drain the one-shot channel from the main thread. We can't move `rx`
+    // into a `timeout_add_local` closure that returns ControlFlow::Continue,
+    // so the closure consumes `rx` and returns Break the moment it gets a
+    // result (or the sender drops, which means the worker died). The 50 ms
+    // tick is short enough that even back-to-back saves feel instant.
+    let saved_for_main = saved_path;
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        match rx.try_recv() {
+            Ok(thumb) => {
+                crate::clips::notifications::notify_saved(
+                    &app_for_notify,
+                    &window_for_notify,
+                    &saved_for_main,
+                    thumb.as_deref(),
+                );
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                log::warn!("dispatch_saved_clip: worker disconnected");
+                glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 /// Present an AlertDialog with a screenshot of the persisted capture target.

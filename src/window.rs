@@ -44,6 +44,12 @@ struct Widgets {
     clips_indicator: crate::clips::StatusIndicator,
     mixer: Option<MixerWidgets>,
     clips: Option<Rc<crate::clips::ClipsPage>>,
+    /// Sidebar Clips toggle button. Held so `show_clips_tab()` can flip it
+    /// active, which triggers the bound `connect_toggled` handler that
+    /// switches the content stack — the same path the user takes when
+    /// clicking the sidebar themselves. Set during `ChatMixWindow::new`
+    /// after the sidebar is built.
+    clips_sidebar_btn: Option<gtk::ToggleButton>,
 }
 
 fn battery_icon(percent: u8) -> (&'static str, bool) {
@@ -112,12 +118,22 @@ impl ChatMixWindow {
 
         content_area.append(&stack);
 
-        // Build sidebar and wire to stack
+        // Build sidebar and wire to stack. The clips toggle button is held
+        // on `Widgets` so `show_clips_tab()` (called from the `app.show-clip`
+        // GAction handler in app.rs) can flip it active programmatically.
         let sidebar = build_sidebar(&stack);
-        root.append(&sidebar);
+        widgets.clips_sidebar_btn = Some(sidebar.clips_btn.clone());
+        root.append(&sidebar.container);
         root.append(&content_area);
 
-        window.set_content(Some(&root));
+        // Wrap the entire root in an AdwToastOverlay so saved-clip toasts
+        // (Phase 7 Task 7.1) can be presented from `clips::notifications`.
+        // Structure becomes: Window → ToastOverlay → root: Box → [sidebar | content].
+        // `find_toast_overlay` in `clips::notifications` walks the descendant
+        // chain to locate the overlay at notification time.
+        let toast_overlay = adw::ToastOverlay::new();
+        toast_overlay.set_child(Some(&root));
+        window.set_content(Some(&toast_overlay));
 
         let css = gtk::CssProvider::new();
         css.load_from_string(
@@ -227,6 +243,19 @@ impl ChatMixWindow {
             .expect("clips page is always set during window construction")
     }
 
+    /// Switch the content stack to the Clips tab.
+    ///
+    /// Called from the `app.show-clip` GAction handler when the user clicks
+    /// "Show" on a clip-saved toast/notification. Activating the sidebar
+    /// toggle button triggers the same `connect_toggled` handler the user's
+    /// own click goes through, so the stack switches and the radio-group
+    /// state is consistent with the visible page.
+    pub fn show_clips_tab(&self) {
+        if let Some(btn) = self.inner.borrow().clips_sidebar_btn.as_ref() {
+            btn.set_active(true);
+        }
+    }
+
     /// Update the dashboard's clip-status badge. Driven from the backend
     /// event poll in `app.rs` after each `BufferController::on_backend_event`
     /// + after the auto-resume block at startup so the badge reflects the
@@ -267,7 +296,12 @@ fn apply_critical_class(image: &gtk::Image, critical: bool) {
 // Sidebar rail
 // ---------------------------------------------------------------------------
 
-fn build_sidebar(stack: &gtk::Stack) -> gtk::Widget {
+struct SidebarResult {
+    container: gtk::Widget,
+    clips_btn: gtk::ToggleButton,
+}
+
+fn build_sidebar(stack: &gtk::Stack) -> SidebarResult {
     let rail = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -319,7 +353,10 @@ fn build_sidebar(stack: &gtk::Stack) -> gtk::Widget {
     container.append(&rail);
     container.append(&gtk::Separator::new(gtk::Orientation::Vertical));
 
-    container.upcast()
+    SidebarResult {
+        container: container.upcast(),
+        clips_btn,
+    }
 }
 
 fn sidebar_button(icon_name: &str, tooltip: &str) -> gtk::ToggleButton {
@@ -422,6 +459,7 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
         clips_indicator: status_result.clips_indicator,
         mixer: None,
         clips: None,
+        clips_sidebar_btn: None,
     };
 
     (scroll.upcast(), widgets)
