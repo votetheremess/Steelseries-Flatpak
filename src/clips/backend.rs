@@ -132,6 +132,24 @@ pub fn save_fifo_path(storage_dir: &PathBuf) -> PathBuf {
 
 /// Extract the bundled save-callback script into `<storage>/.arctis/`.
 /// Idempotent (size-mismatch check, mirrors the HRIR/Lucide-icon pattern).
+///
+/// THREAT MODEL (security H-2): a same-uid attacker (e.g. another
+/// process the user accidentally launched, or a co-resident workload
+/// on a shared user account) could observe `create_dir_all` of
+/// `<storage>/.arctis/` and race in to plant a symlink at
+/// `<storage>/.arctis/save_callback.sh` pointing at any writable file
+/// in the user's filesystem (e.g. `~/.bashrc` or
+/// `~/.config/autostart/*.desktop`). Without `O_NOFOLLOW`, our
+/// subsequent `OpenOptions::open` would follow that symlink and
+/// `mode(0o755)` would mark the redirected target executable, then
+/// our content write would clobber it with the bundled save-callback
+/// shell script — effectively letting the attacker swap arbitrary
+/// files for an executable shell script of their choosing.
+///
+/// Defense: open with `O_NOFOLLOW` so symlinks fail with `ELOOP`
+/// rather than being followed. If we hit `ELOOP`, remove the symlink
+/// and retry once (the attacker may have planted it between the
+/// `metadata` check and our open).
 pub fn ensure_save_callback(storage_dir: &PathBuf) -> std::io::Result<PathBuf> {
     let dir = fixtures_dir(storage_dir);
     fs::create_dir_all(&dir)?;
@@ -142,8 +160,26 @@ pub fn ensure_save_callback(storage_dir: &PathBuf) -> std::io::Result<PathBuf> {
     };
     if needs_write {
         let mut opts = fs::OpenOptions::new();
-        opts.create(true).truncate(true).write(true).mode(0o755);
-        let mut f = opts.open(&path)?;
+        opts.create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o755)
+            .custom_flags(libc::O_NOFOLLOW);
+        let mut f = match opts.open(&path) {
+            Ok(f) => f,
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                // Path was a symlink — remove and retry once. Defends
+                // against an attacker who plants a symlink between
+                // `create_dir_all` and `open`.
+                log::warn!(
+                    "ensure_save_callback: refusing to follow symlink at {}; removing and retrying",
+                    path.display()
+                );
+                let _ = fs::remove_file(&path);
+                opts.open(&path)?
+            }
+            Err(e) => return Err(e),
+        };
         std::io::Write::write_all(&mut f, SAVE_CALLBACK_BYTES)?;
     } else {
         // Defensive: re-set 0o755 even when content was unchanged. Cheap, prevents
