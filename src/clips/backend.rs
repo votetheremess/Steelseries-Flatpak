@@ -145,6 +145,13 @@ pub fn ensure_save_callback(storage_dir: &PathBuf) -> std::io::Result<PathBuf> {
         opts.create(true).truncate(true).write(true).mode(0o755);
         let mut f = opts.open(&path)?;
         std::io::Write::write_all(&mut f, SAVE_CALLBACK_BYTES)?;
+    } else {
+        // Defensive: re-set 0o755 even when content was unchanged. Cheap, prevents
+        // the silent-failure case where a stray chmod -x leaves the file unexecutable
+        // and GSR's -sc callback never fires.
+        let mut perms = fs::metadata(&path)?.permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&path, perms)?;
     }
     Ok(path)
 }
@@ -158,6 +165,9 @@ pub fn ensure_save_fifo(storage_dir: &PathBuf) -> std::io::Result<PathBuf> {
         // mkfifo via libc — no shell-out for a single syscall.
         let cstr = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // Owner-only mode (0o600). The GSR Flatpak runs as the same uid as our app, so
+        // it can read/write the FIFO. No other process should access it; constraining
+        // the mode prevents stray writers from corrupting the save-path stream.
         let rc = unsafe { libc::mkfifo(cstr.as_ptr(), 0o600) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
