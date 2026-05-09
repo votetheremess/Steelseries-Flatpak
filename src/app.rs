@@ -451,6 +451,27 @@ pub fn run(start_hidden: bool) {
                 app.add_action_entries([reset_action]);
             }
 
+            // app.test-clip-capture — proactive xdg-portal #1371 mitigation.
+            // Triggers the Screenshot portal (which shares consent with the
+            // ScreenCast portal we already used) and shows the captured
+            // image in a dialog so the user can verify their persisted
+            // capture target without saving an actual clip.
+            {
+                let app_for_test = app.clone();
+                let test_action = gtk::gio::ActionEntry::builder("test-clip-capture")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        let app_for_async = app_for_test.clone();
+                        glib::MainContext::default().spawn_local(async move {
+                            match crate::clips::portal::screenshot_current_target().await {
+                                Ok(path) => show_test_capture_dialog(&app_for_async, &path),
+                                Err(e) => log::warn!("test capture failed: {e}"),
+                            }
+                        });
+                    })
+                    .build();
+                app.add_action_entries([test_action]);
+            }
+
             // app.pick-clip-storage — folder picker for the clips storage
             // path. Stub for now; full implementation comes in a later
             // phase. Registered so the Page 3 button doesn't error out.
@@ -768,5 +789,26 @@ fn handle_event(event: &HidEvent, window: &ChatMixWindow) {
         HidEvent::Unknown { feature, value } => {
             log::debug!("Unknown: feature=0x{feature:02x} value=0x{value:02x}");
         }
+    }
+}
+
+/// Present an AlertDialog with a screenshot of the persisted capture target.
+/// Used by the `app.test-clip-capture` action (xdg-portal #1371 mitigation).
+fn show_test_capture_dialog(app: &adw::Application, image_path: &std::path::Path) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Capture source preview")
+        .body(
+            "This is the screen the clip buffer will record. \
+             If wrong, click Reset in settings.",
+        )
+        .build();
+    let pic = gtk::Picture::for_filename(image_path);
+    pic.set_height_request(360);
+    pic.set_width_request(640);
+    dialog.set_extra_child(Some(&pic));
+    dialog.add_response("close", "Close");
+    dialog.set_default_response(Some("close"));
+    if let Some(window) = app.active_window() {
+        dialog.present(Some(&window));
     }
 }

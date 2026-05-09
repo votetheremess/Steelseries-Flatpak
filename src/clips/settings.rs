@@ -123,9 +123,9 @@ pub fn mark_onboarding_complete() -> std::io::Result<()> {
 }
 
 /// Build the Clips PreferencesGroup for the Settings page. Currently exposes
-/// the Capture source row (Reset button). The Test button is added in Task
-/// 3.7 and the gpu-screen-recorder Reinstall row in Task 3.8. Other clip
-/// settings (buffer length, bitrate, storage path, etc.) come in Phase 6.
+/// the Capture source row (Test + Reset buttons). The gpu-screen-recorder
+/// Reinstall row is added in Task 3.8. Other clip settings (buffer length,
+/// bitrate, storage path, etc.) come in Phase 6.
 pub fn build_clips_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder().title("Clips").build();
 
@@ -133,12 +133,18 @@ pub fn build_clips_group() -> adw::PreferencesGroup {
         .title("Capture source")
         .subtitle("Pick the screen recorded by the clip buffer")
         .build();
-    let reset_btn = gtk::Button::builder()
-        .label("Reset")
+    let row_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
         .valign(gtk::Align::Center)
         .build();
+    let test_btn = gtk::Button::builder().label("Test").build();
+    test_btn.set_action_name(Some("app.test-clip-capture"));
+    let reset_btn = gtk::Button::builder().label("Reset").build();
     reset_btn.set_action_name(Some("app.reset-clips-capture"));
-    reset_row.add_suffix(&reset_btn);
+    row_box.append(&test_btn);
+    row_box.append(&reset_btn);
+    reset_row.add_suffix(&row_box);
     group.add(&reset_row);
 
     group
