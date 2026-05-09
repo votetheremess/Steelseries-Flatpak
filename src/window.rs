@@ -3,13 +3,30 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
+use std::sync::mpsc::Sender;
+
 use crate::audio::{persistence, sinks};
 use crate::autostart;
+use crate::clips::settings::ClipSettings;
+use crate::clips::{BufferController, ClipCommand};
 use crate::eq::model::{Band, EqTarget, SpatialState, NUM_BANDS};
 use crate::hid::protocol::NoiseMode;
 use crate::mixer::MixerWidgets;
 
 const PLACEHOLDER: &str = "—";
+
+/// Hooks the clips Settings page needs to live-react to user changes.
+///
+/// Built once in `app.rs` (after the buffer controller and clip backend
+/// thread exist) and passed into `ChatMixWindow::new` so the settings
+/// widgets can update both persisted state and the running buffer config
+/// in one shot.
+pub struct ClipsSettingsContext {
+    pub clip_settings: Rc<RefCell<ClipSettings>>,
+    pub buffer: Rc<RefCell<BufferController>>,
+    pub cmd_tx: Sender<ClipCommand>,
+    pub headset_sink_monitor: String,
+}
 
 pub struct ChatMixWindow {
     pub window: adw::ApplicationWindow,
@@ -46,6 +63,7 @@ impl ChatMixWindow {
         on_reroute: Option<Rc<dyn Fn(&str, &str)>>,
         on_mic_reroute: Option<Rc<dyn Fn(&str)>>,
         headset_sink: Option<String>,
+        clips_settings_ctx: Option<ClipsSettingsContext>,
     ) -> Self {
         let window = adw::ApplicationWindow::builder()
             .application(app)
@@ -89,7 +107,7 @@ impl ChatMixWindow {
             &build_placeholder_page("Engine", "lucide-sliders-horizontal-symbolic", "Coming soon"),
             Some("engine"),
         );
-        stack.add_named(&build_settings_page(app), Some("settings"));
+        stack.add_named(&build_settings_page(app, clips_settings_ctx), Some("settings"));
 
         content_area.append(&stack);
 
@@ -506,7 +524,10 @@ fn build_device_card() -> (adw::PreferencesGroup, (adw::ActionRow, adw::ActionRo
 // Settings page
 // ---------------------------------------------------------------------------
 
-fn build_settings_page(app: &adw::Application) -> gtk::Widget {
+fn build_settings_page(
+    app: &adw::Application,
+    clips_settings_ctx: Option<ClipsSettingsContext>,
+) -> gtk::Widget {
     let page = adw::PreferencesPage::new();
 
     // General
@@ -530,8 +551,18 @@ fn build_settings_page(app: &adw::Application) -> gtk::Widget {
     general_group.add(&autostart_row);
     page.add(&general_group);
 
-    // Clips
-    page.add(&crate::clips::settings::build_clips_group());
+    // Clips — only buildable if we have the runtime hooks. The pipeline
+    // can fail to initialize on first launch (no headset, missing
+    // permissions, etc.); in that case we skip the Clips section rather
+    // than show settings the user can't actually act on.
+    if let Some(ctx) = clips_settings_ctx {
+        page.add(&crate::clips::settings::build_clips_group(
+            ctx.clip_settings,
+            ctx.buffer,
+            ctx.cmd_tx,
+            ctx.headset_sink_monitor,
+        ));
+    }
 
     // Data
     let data_group = adw::PreferencesGroup::builder().title("Data").build();

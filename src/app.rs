@@ -172,6 +172,55 @@ pub fn run(start_hidden: bool) {
                 .as_ref()
                 .map(|r| r.headset_sink.clone());
 
+            // Headset-monitor name for the clip pipeline's audio capture.
+            // `<headset_sink>.monitor` is the PipeWire convention.
+            let headset_sink_monitor = headset_sink
+                .as_deref()
+                .map(|s| format!("{s}.monitor"))
+                .unwrap_or_default();
+
+            // Load persisted clip settings once, share with both the buffer
+            // controller (initial CaptureConfig seed) and the settings
+            // widgets (live editing). Each settings widget mutates this
+            // shared cell and re-saves to disk.
+            let clip_settings = Rc::new(RefCell::new(crate::clips::settings::load()));
+
+            // Build the BufferController seeded from saved settings. The
+            // portal restore token is wired in later via the auto-resume
+            // / wizard actions — until then the controller stays in
+            // Uninitialized and never sends StartReplay.
+            let buffer = {
+                let mut initial_cfg = crate::clips::settings::cfg_from_settings(
+                    &clip_settings.borrow(),
+                    &headset_sink_monitor,
+                );
+                // settings::cfg_from_settings doesn't know about a portal
+                // token; preserve the None default. The auto-resume block
+                // below feeds the persisted token in via on_portal_pick_complete.
+                initial_cfg.portal_restore_token = None;
+                let mut buf = crate::clips::BufferController::new(initial_cfg);
+                // Copy controller-level (non-CaptureConfig) flags too.
+                buf.auto_arm = clip_settings.borrow().auto_arm;
+                buf.always_armed = clip_settings.borrow().always_armed;
+                Rc::new(RefCell::new(buf))
+            };
+
+            // Build the clips-settings hook bundle, but only if the clip
+            // backend exists (init_pipeline may have skipped it on
+            // headless/error paths). Settings page silently omits the
+            // Clips group when this is None — the user can recover by
+            // restarting once the device is connected.
+            let clips_settings_ctx = resources
+                .borrow()
+                .as_ref()
+                .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()))
+                .map(|tx| crate::window::ClipsSettingsContext {
+                    clip_settings: clip_settings.clone(),
+                    buffer: buffer.clone(),
+                    cmd_tx: tx,
+                    headset_sink_monitor: headset_sink_monitor.clone(),
+                });
+
             let window = ChatMixWindow::new(
                 app,
                 on_eq_apply,
@@ -179,6 +228,7 @@ pub fn run(start_hidden: bool) {
                 on_reroute,
                 on_mic_reroute,
                 headset_sink,
+                clips_settings_ctx,
             );
 
             // Hide on close, keep the process running
@@ -229,22 +279,6 @@ pub fn run(start_hidden: bool) {
                 }
                 glib::ControlFlow::Continue
             });
-
-            // Build the BufferController seeded with the user's headset sink
-            // monitor and default Videos/Clips output dir. The portal restore
-            // token is wired in later (Phase 3) — until then the controller
-            // stays in Uninitialized and never sends StartReplay.
-            let buffer = {
-                let mut initial_cfg = crate::clips::CaptureConfig::default();
-                if let Some(res) = resources.borrow().as_ref() {
-                    initial_cfg.headset_sink_monitor = format!("{}.monitor", res.headset_sink);
-                }
-                initial_cfg.output_dir = std::path::PathBuf::from(
-                    std::env::var("HOME").unwrap_or_default(),
-                )
-                .join("Videos/Clips");
-                Rc::new(RefCell::new(crate::clips::BufferController::new(initial_cfg)))
-            };
 
             // -------------------------------------------------------------
             // Wizard actions (Phase 3 Task 3.5)
@@ -340,6 +374,23 @@ pub fn run(start_hidden: bool) {
                         let display = gtk::prelude::WidgetExt::display(&win_for_copy.window);
                         let clipboard = display.clipboard();
                         clipboard.set_text(crate::clips::gsr_install::GSR_TERMINAL_INSTALL_COMMAND);
+                    })
+                    .build();
+                app.add_action_entries([copy_action]);
+            }
+
+            // app.copy-clip-hotkey-cmd — copy the dbus-send command that
+            // triggers `save-clip` to the system clipboard. Lets users
+            // bind the save action from any external shortcut daemon
+            // (sxhkd, AutoKey, hyprbinds, …) without having to remember
+            // the exact GAction wire format.
+            {
+                let win_for_copy = window.clone();
+                let copy_action = gtk::gio::ActionEntry::builder("copy-clip-hotkey-cmd")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        let display = gtk::prelude::WidgetExt::display(&win_for_copy.window);
+                        let clipboard = display.clipboard();
+                        clipboard.set_text(crate::clips::settings::save_clip_dbus_command());
                     })
                     .build();
                 app.add_action_entries([copy_action]);
