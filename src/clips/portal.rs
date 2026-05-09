@@ -4,19 +4,25 @@ use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SourceType},
     PersistMode,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const PORTAL_TOKEN_FILE: &str = "clips_portal.txt";
 
-fn token_path() -> PathBuf {
+fn default_config_root() -> PathBuf {
     let home = std::env::var_os("HOME").expect("HOME");
-    PathBuf::from(home)
-        .join(".config/arctis-chatmix")
-        .join(PORTAL_TOKEN_FILE)
+    PathBuf::from(home).join(".config")
+}
+
+fn token_path_with_root(root: &Path) -> PathBuf {
+    root.join("arctis-chatmix").join(PORTAL_TOKEN_FILE)
 }
 
 pub fn load_token() -> Option<String> {
-    let path = token_path();
+    load_token_from(&default_config_root())
+}
+
+fn load_token_from(root: &Path) -> Option<String> {
+    let path = token_path_with_root(root);
     match std::fs::read_to_string(&path) {
         Ok(s) => {
             let trimmed = s.trim().to_string();
@@ -54,7 +60,11 @@ pub fn load_token() -> Option<String> {
 }
 
 pub fn save_token(token: &str) -> std::io::Result<()> {
-    let path = token_path();
+    save_token_to(&default_config_root(), token)
+}
+
+fn save_token_to(root: &Path, token: &str) -> std::io::Result<()> {
+    let path = token_path_with_root(root);
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(&path, token)?;
     log::info!(
@@ -66,7 +76,11 @@ pub fn save_token(token: &str) -> std::io::Result<()> {
 }
 
 pub fn clear_token() -> std::io::Result<()> {
-    let path = token_path();
+    clear_token_in(&default_config_root())
+}
+
+fn clear_token_in(root: &Path) -> std::io::Result<()> {
+    let path = token_path_with_root(root);
     if path.exists() {
         std::fs::remove_file(path)
     } else {
@@ -147,12 +161,24 @@ pub async fn screenshot_current_target() -> ashpd::Result<PathBuf> {
 mod token_tests {
     use super::*;
 
+    /// Round-trips through a per-test tempdir instead of `$HOME/.config/arctis-chatmix/`.
+    /// Earlier versions of this test wrote/cleared the user's real `clips_portal.txt`,
+    /// which silently wiped their persisted screen-pick token on every `cargo test` run.
     #[test]
     fn token_round_trip() {
+        let temp = std::env::temp_dir().join(format!(
+            "arctis-portal-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
         let token = "test-token-12345";
-        save_token(token).unwrap();
-        assert_eq!(load_token().as_deref(), Some(token));
-        clear_token().unwrap();
-        assert!(load_token().is_none());
+        save_token_to(&temp, token).unwrap();
+        assert_eq!(load_token_from(&temp).as_deref(), Some(token));
+        clear_token_in(&temp).unwrap();
+        assert!(load_token_from(&temp).is_none());
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }
