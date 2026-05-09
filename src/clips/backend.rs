@@ -277,24 +277,15 @@ pub fn spawn_gsr(args: &[String], fifo_path: &PathBuf) -> std::io::Result<Child>
         // Pass the FIFO path as an env var into the sandbox.
         .arg(format!("--env=ARCTIS_CHATMIX_SAVE_FIFO={}", fifo_path.display()))
         .arg("com.dec05eba.gpu_screen_recorder")
-        // `--` separates flatpak-run options from args forwarded to the
-        // contained command. Defensive: GSR's leading-dash flags (-r, -w,
-        // -a, ...) should pass through, but the explicit boundary protects
-        // against future flatpak versions interpreting them as run options.
-        .arg("--")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     // Child dies if we die. Must be set after fork in the child only.
-    // Note: `pre_exec` is itself an unsafe fn, but the closure body does NOT inherit
-    // outer `unsafe` context — the call to libc::prctl needs its own inner unsafe block.
     unsafe {
         cmd.pre_exec(|| {
-            let rc = unsafe {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0)
-            };
+            let rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0);
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());
             }
