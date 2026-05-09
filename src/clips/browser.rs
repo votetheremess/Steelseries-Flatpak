@@ -985,6 +985,7 @@ fn show_delete_dialog(
     dialog.set_close_response("cancel");
 
     let parent = parent_window_of(anchor);
+    let anchor_for_response: gtk::Widget = anchor.clone().upcast();
     dialog.connect_response(None, move |_dlg, response| {
         if response != "delete" {
             return;
@@ -992,6 +993,15 @@ fn show_delete_dialog(
         let clip_path = storage_dir.join(&filename);
         if let Err(e) = std::fs::remove_file(&clip_path) {
             log::warn!("delete failed: {}: {e}", clip_path.display());
+            // Surface the failure so the user knows the click didn't
+            // succeed silently. Common cases this hits: the user
+            // deleted the file in another file manager between
+            // dialog-open and confirm (NotFound), or the storage dir
+            // is on a read-only mount (PermissionDenied).
+            surface_failure(
+                &anchor_for_response,
+                &format!("Couldn't delete clip: {e}"),
+            );
             return;
         }
         // Best-effort: remove the cached thumbnail too. If absent, ignore.
