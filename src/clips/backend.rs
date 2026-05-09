@@ -268,7 +268,7 @@ pub fn send_signal(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
 use std::io::{BufRead, BufReader};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration as StdDuration;
+use std::time::Duration;
 
 use crate::clips::{BackendEvent, ClipCommand};
 
@@ -340,7 +340,7 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
     loop {
         // Drain any pending commands (blocking with a short timeout so we can
         // also poll the child's exit status).
-        match cmd_rx.recv_timeout(StdDuration::from_millis(200)) {
+        match cmd_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(ClipCommand::StartReplay { config }) => {
                 if let Err(e) = arm(&mut active, &mut active_config, &config, &evt_tx) {
                     let _ = evt_tx.send(BackendEvent::Error {
@@ -460,7 +460,7 @@ fn disarm(active: &mut Option<ActiveCapture>) {
             if let Ok(Some(_)) = a.child.try_wait() {
                 return;
             }
-            thread::sleep(StdDuration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
         }
         // Force.
         let _ = a.child.kill();
@@ -504,7 +504,7 @@ fn run_fifo_reader(evt_tx: Sender<BackendEvent>) {
             Ok(f) => f,
             Err(e) => {
                 log::warn!("clip-fifo-reader: open failed: {e}; sleeping");
-                thread::sleep(StdDuration::from_secs(1));
+                thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };

@@ -12,10 +12,9 @@ pub mod thumbnail;
 pub use browser::build_clips_page;
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 /// Commands sent from GTK main thread → backend thread.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ClipCommand {
     /// Begin replay-mode capture with the given config.
     StartReplay { config: CaptureConfig },
@@ -35,7 +34,7 @@ pub enum ClipCommand {
 }
 
 /// Events sent from backend thread → GTK main thread.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum BackendEvent {
     Armed,
     Disarmed,
