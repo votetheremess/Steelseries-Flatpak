@@ -525,9 +525,9 @@ fn build_page3_settings() -> (gtk::Widget, gtk::Button, gtk::Scale, gtk::Label, 
     // shortcut picker. We don't try to capture chords in-app — that's the
     // OS-level UX the portal owns.
     //
-    // The chord label is currently static ("Super+Shift+R") because we
-    // don't track post-bind chord changes; future work could subscribe to
-    // the GlobalShortcuts portal's ShortcutsChanged signal to keep this
+    // The chord label is currently static ("Alt+S") because we don't
+    // track post-bind chord changes; future work could subscribe to the
+    // GlobalShortcuts portal's ShortcutsChanged signal to keep this
     // live, but that's out of scope for the v1 polish pass.
     // ------------------------------------------------------------------
     let hotkey_row = gtk::Box::builder()
@@ -542,7 +542,7 @@ fn build_page3_settings() -> (gtk::Widget, gtk::Button, gtk::Scale, gtk::Label, 
     hotkey_row.append(&hotkey_label);
     hotkey_row.append(&gtk::Box::builder().hexpand(true).build());
     let hotkey_btn = gtk::Button::builder()
-        .label("Super+Shift+R")
+        .label("Alt+S")
         .css_classes(["pill"])
         .build();
     hotkey_btn.set_action_name(Some("app.rebind-clip-hotkey"));

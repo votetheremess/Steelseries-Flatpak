@@ -326,7 +326,7 @@ pub fn build_clips_group(
     // ------------------------------------------------------------------
     let hotkey_row = adw::ActionRow::builder()
         .title("Hotkey")
-        .subtitle("Suggested: Super+Shift+R (manage in System Settings → Shortcuts)")
+        .subtitle("Suggested: Alt+S (manage in System Settings → Shortcuts)")
         .build();
     let rebind_btn = gtk::Button::builder()
         .label("Rebind…")

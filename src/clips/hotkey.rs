@@ -26,7 +26,7 @@ use gtk::prelude::IsA;
 pub fn suggested_bindings() -> Vec<NewShortcut> {
     vec![
         NewShortcut::new("save-clip", "Save the last N seconds of gameplay")
-            .preferred_trigger(Some("LOGO+SHIFT+R")),
+            .preferred_trigger(Some("ALT+S")),
         NewShortcut::new("save-clip-short", "Save the last 30 seconds")
             .preferred_trigger(Some("LOGO+SHIFT+1")),
         NewShortcut::new("save-clip-medium", "Save the last 60 seconds")
