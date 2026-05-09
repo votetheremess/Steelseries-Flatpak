@@ -260,10 +260,26 @@ pub fn run(start_hidden: bool) {
             // the Page 1 status label. Polls the install-progress receiver
             // on a glib timer (every 100 ms) and flips the Next button to
             // enabled once installation completes successfully.
+            //
+            // Guarded with `install_in_progress` so a double-click (or a
+            // user mashing the Install button while flatpak is still
+            // running) is a no-op rather than spawning a second flatpak
+            // install thread + second progress timer (which would race on
+            // the shared status label / Next button).
             {
-                let clips_page = window.clips_page();
+                let clips_page = window.clips_page().clone();
+                let install_in_progress = Rc::new(Cell::new(false));
+                let install_in_progress_for_action = install_in_progress.clone();
                 let install_action = gtk::gio::ActionEntry::builder("gsr-install")
                     .activate(move |_app: &adw::Application, _action, _param| {
+                        if install_in_progress_for_action.get() {
+                            log::info!(
+                                "gsr-install: already in progress, ignoring duplicate click"
+                            );
+                            return;
+                        }
+                        install_in_progress_for_action.set(true);
+                        let in_progress = install_in_progress_for_action.clone();
                         let rx = crate::clips::gsr_install::install();
                         clips_page.wizard.install_status_label.set_visible(true);
                         clips_page
@@ -283,11 +299,13 @@ pub fn run(start_hidden: bool) {
                                     InstallProgress::Done => {
                                         label.set_label("Installed.");
                                         next_btn.set_sensitive(true);
+                                        in_progress.set(false);
                                         return glib::ControlFlow::Break;
                                     }
                                     InstallProgress::Failed { reason } => {
                                         label.set_label(&format!("Install failed: {reason}"));
                                         // Next stays disabled — user can retry.
+                                        in_progress.set(false);
                                         return glib::ControlFlow::Break;
                                     }
                                 }
