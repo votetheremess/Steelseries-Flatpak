@@ -458,6 +458,96 @@ pub fn run(start_hidden: bool) {
                 app.add_action_entries([setup_action]);
             }
 
+            // app.save-clip[-short|-medium|-long] — driven by the
+            // GlobalShortcuts portal in Phase 4 Task 4.2 (and exposed as
+            // GApplication actions so the portal listener — and any future
+            // in-app button — can trigger them via activate_action()).
+            //
+            // Each handler asks the BufferController to send the
+            // corresponding ClipCommand. The bare `save-clip` uses the
+            // existing on_save_hotkey path (full buffer length); the three
+            // duration variants share on_save_hotkey_duration so the backend
+            // can pick SIGRTMIN+1/2/3 for GSR. All four are state-machine
+            // safe — they no-op outside the Armed state.
+            {
+                let buffer_for_save = buffer.clone();
+                let resources_for_save = resources.clone();
+                let save_action = gtk::gio::ActionEntry::builder("save-clip")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        let cmd_tx = resources_for_save
+                            .borrow()
+                            .as_ref()
+                            .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
+                        if let Some(tx) = cmd_tx {
+                            buffer_for_save.borrow_mut().on_save_hotkey(&tx);
+                        } else {
+                            log::warn!("no clip backend available for save-clip");
+                        }
+                    })
+                    .build();
+                app.add_action_entries([save_action]);
+            }
+            {
+                let buffer_for_save = buffer.clone();
+                let resources_for_save = resources.clone();
+                let save_action = gtk::gio::ActionEntry::builder("save-clip-short")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        let cmd_tx = resources_for_save
+                            .borrow()
+                            .as_ref()
+                            .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
+                        if let Some(tx) = cmd_tx {
+                            buffer_for_save
+                                .borrow_mut()
+                                .on_save_hotkey_duration(crate::clips::ClipCommand::SaveClipShort, &tx);
+                        } else {
+                            log::warn!("no clip backend available for save-clip-short");
+                        }
+                    })
+                    .build();
+                app.add_action_entries([save_action]);
+            }
+            {
+                let buffer_for_save = buffer.clone();
+                let resources_for_save = resources.clone();
+                let save_action = gtk::gio::ActionEntry::builder("save-clip-medium")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        let cmd_tx = resources_for_save
+                            .borrow()
+                            .as_ref()
+                            .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
+                        if let Some(tx) = cmd_tx {
+                            buffer_for_save
+                                .borrow_mut()
+                                .on_save_hotkey_duration(crate::clips::ClipCommand::SaveClipMedium, &tx);
+                        } else {
+                            log::warn!("no clip backend available for save-clip-medium");
+                        }
+                    })
+                    .build();
+                app.add_action_entries([save_action]);
+            }
+            {
+                let buffer_for_save = buffer.clone();
+                let resources_for_save = resources.clone();
+                let save_action = gtk::gio::ActionEntry::builder("save-clip-long")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        let cmd_tx = resources_for_save
+                            .borrow()
+                            .as_ref()
+                            .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
+                        if let Some(tx) = cmd_tx {
+                            buffer_for_save
+                                .borrow_mut()
+                                .on_save_hotkey_duration(crate::clips::ClipCommand::SaveClipLong, &tx);
+                        } else {
+                            log::warn!("no clip backend available for save-clip-long");
+                        }
+                    })
+                    .build();
+                app.add_action_entries([save_action]);
+            }
+
             // app.reset-clips-capture — clears the persisted portal token,
             // disarms the buffer if currently capturing, and returns the
             // Clips page to the onboarding wizard (PickScreen step, since

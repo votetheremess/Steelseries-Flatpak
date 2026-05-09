@@ -94,6 +94,21 @@ impl BufferController {
         }
     }
 
+    /// User pressed a fixed-duration save hotkey. `duration_cmd` must be one
+    /// of `ClipCommand::SaveClipShort/Medium/Long`. Behaves identically to
+    /// `on_save_hotkey` but forwards the explicit variant so the backend can
+    /// signal GSR with the matching `SIGRTMIN+N`.
+    pub fn on_save_hotkey_duration(
+        &mut self,
+        duration_cmd: ClipCommand,
+        cmd_tx: &Sender<ClipCommand>,
+    ) {
+        if matches!(self.state, BufferState::Armed) {
+            let _ = cmd_tx.send(duration_cmd);
+            self.state = BufferState::Saving;
+        }
+    }
+
     /// Backend event arrived from backend thread.
     pub fn on_backend_event(&mut self, evt: &BackendEvent, cmd_tx: &Sender<ClipCommand>) {
         match evt {
@@ -261,6 +276,27 @@ mod tests {
         b.on_save_hotkey(&tx);
         assert_eq!(b.state(), BufferState::Saving);
         assert!(matches!(rx.try_recv(), Ok(ClipCommand::SaveClip)));
+    }
+
+    #[test]
+    fn save_hotkey_duration_in_armed_sends_specific_variant() {
+        let (tx, rx) = channel();
+        let mut b = BufferController::new(cfg());
+        b.on_portal_pick_complete("t".into(), &tx);
+        b.on_game_started(dg(42), &tx);
+        let _ = rx.try_recv(); // consume StartReplay
+        b.on_backend_event(&BackendEvent::Armed, &tx);
+        assert_eq!(b.state(), BufferState::Armed);
+        b.on_save_hotkey_duration(ClipCommand::SaveClipMedium, &tx);
+        assert_eq!(b.state(), BufferState::Saving);
+        assert!(matches!(rx.try_recv(), Ok(ClipCommand::SaveClipMedium)));
+
+        // Non-armed state ignores the duration variant just like the bare
+        // save hotkey does.
+        let (tx2, rx2) = channel();
+        let mut b2 = BufferController::new(cfg());
+        b2.on_save_hotkey_duration(ClipCommand::SaveClipShort, &tx2);
+        assert!(rx2.try_recv().is_err());
     }
 
     #[test]
