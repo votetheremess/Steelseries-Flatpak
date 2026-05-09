@@ -41,6 +41,7 @@ struct Widgets {
     spare_battery_label: gtk::Label,
     spare_battery_icon: gtk::Image,
     balance_scale: gtk::Scale,
+    clips_indicator: crate::clips::StatusIndicator,
     mixer: Option<MixerWidgets>,
     clips: Option<Rc<crate::clips::ClipsPage>>,
 }
@@ -153,7 +154,14 @@ impl ChatMixWindow {
              .mixer-ch-aux scale trough highlight    { background-color: rgba(242,140,64,0.85); } \
              .mixer-ch-mic scale trough highlight    { background-color: rgba(179,102,230,0.85); } \
              .mixer-device-dropdown { font-size: 75%; } \
-             .mixer-device-dropdown > button { min-height: 0; padding-top: 4px; padding-bottom: 4px; }"
+             .mixer-device-dropdown > button { min-height: 0; padding-top: 4px; padding-bottom: 4px; } \
+             .clip-indicator { padding: 4px 10px; border-radius: 8px; \
+               background-color: alpha(currentColor, 0.08); } \
+             .clip-indicator label { font-size: 90%; } \
+             .clip-indicator .dot-armed { color: rgb(77,204,179); } \
+             .clip-indicator .dot-saving { color: rgb(242,205,64); } \
+             .clip-indicator .dot-error  { color: rgb(230,77,77); } \
+             .clip-indicator .dot-setup  { color: alpha(currentColor, 0.5); }"
         );
         gtk::style_context_add_provider_for_display(
             &gtk::prelude::WidgetExt::display(&window),
@@ -217,6 +225,19 @@ impl ChatMixWindow {
             .clips
             .clone()
             .expect("clips page is always set during window construction")
+    }
+
+    /// Update the dashboard's clip-status badge. Driven from the backend
+    /// event poll in `app.rs` after each `BufferController::on_backend_event`
+    /// + after the auto-resume block at startup so the badge reflects the
+    /// initial buffer state without flicker.
+    pub fn set_clips_state(
+        &self,
+        state: crate::clips::BufferState,
+        game: Option<&str>,
+    ) {
+        let w = self.inner.borrow();
+        w.clips_indicator.set_state(state, game);
     }
 
     pub fn set_battery(&self, headset: u8, spare: u8) {
@@ -352,12 +373,15 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
     let (status_card, status_result) = build_status_card();
     let (device_card, dev_widgets) = build_device_card();
 
-    // SizeGroup forces all rows to match the tallest (Device card's ActionRows)
+    // SizeGroup forces all rows to match the tallest (Device card's ActionRows).
+    // The clips_row participates so the indicator's padding doesn't create a
+    // shorter trailing row that breaks the card's vertical rhythm.
     let row_height = gtk::SizeGroup::new(gtk::SizeGroupMode::Vertical);
     row_height.add_widget(&dev_widgets.0);
     row_height.add_widget(&dev_widgets.1);
     row_height.add_widget(&status_result.battery_row);
     row_height.add_widget(&status_result.chatmix_row);
+    row_height.add_widget(&status_result.clips_row);
 
     // Also match the cards themselves for any sub-pixel rounding
     let card_height = gtk::SizeGroup::new(gtk::SizeGroupMode::Vertical);
@@ -395,6 +419,7 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
         spare_battery_label: status_result.spare_battery_label,
         spare_battery_icon: status_result.spare_battery_icon,
         balance_scale: status_result.balance_scale,
+        clips_indicator: status_result.clips_indicator,
         mixer: None,
         clips: None,
     };
@@ -402,7 +427,7 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
     (scroll.upcast(), widgets)
 }
 
-// -- Status card (battery + chatmix) --
+// -- Status card (battery + chatmix + clip indicator) --
 
 struct StatusResult {
     headset_battery_label: gtk::Label,
@@ -410,8 +435,10 @@ struct StatusResult {
     spare_battery_label: gtk::Label,
     spare_battery_icon: gtk::Image,
     balance_scale: gtk::Scale,
+    clips_indicator: crate::clips::StatusIndicator,
     battery_row: adw::ActionRow,
     chatmix_row: gtk::ListBoxRow,
+    clips_row: gtk::ListBoxRow,
 }
 
 fn build_status_card() -> (adw::PreferencesGroup, StatusResult) {
@@ -481,14 +508,34 @@ fn build_status_card() -> (adw::PreferencesGroup, StatusResult) {
         .build();
     group.add(&chatmix_row);
 
+    // Clip status badge — sits below the ChatMix slider. Wrapped in a
+    // non-activatable ListBoxRow so it picks up the same row padding /
+    // separator styling as the rows above without being clickable.
+    let clips_indicator = crate::clips::build_status_indicator();
+    let clips_holder = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .halign(gtk::Align::Center)
+        .margin_top(4)
+        .margin_bottom(4)
+        .build();
+    clips_holder.append(&clips_indicator.root);
+    let clips_row = gtk::ListBoxRow::builder()
+        .child(&clips_holder)
+        .activatable(false)
+        .selectable(false)
+        .build();
+    group.add(&clips_row);
+
     let result = StatusResult {
         headset_battery_label,
         headset_battery_icon,
         spare_battery_label,
         spare_battery_icon,
         balance_scale,
+        clips_indicator,
         battery_row,
         chatmix_row,
+        clips_row,
     };
     (group, result)
 }

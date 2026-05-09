@@ -6,6 +6,7 @@ pub mod buffer;
 pub mod detector;
 pub mod gsr_install;
 pub mod hotkey;
+pub mod indicator;
 pub mod library;
 pub mod portal;
 pub mod settings;
@@ -14,6 +15,7 @@ pub mod thumbnail;
 pub use browser::{build_clips_page, ClipsPage, PageState, WizardStep};
 pub use buffer::{BufferController, BufferState};
 pub use detector::{DetectedGame, DetectorEvent, GameDetector};
+pub use indicator::{build_status_indicator, StatusIndicator};
 
 use std::path::PathBuf;
 

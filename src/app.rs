@@ -844,10 +844,15 @@ pub fn run(start_hidden: bool) {
 
             // Clip backend event poll. Drains BackendEvents into the
             // BufferController so its state stays in sync with the backend
-            // thread (Armed / Disarmed / Saved / errors).
+            // thread (Armed / Disarmed / Saved / errors). Each tick also
+            // refreshes the dashboard's clip-status badge so the user sees
+            // live state transitions (Idle → Arming → Armed → Saving →
+            // Armed) without hunting for the Clips tab.
             let resources_for_clips = resources.clone();
             let buf_for_events = buffer.clone();
+            let window_for_indicator = window.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
+                let mut state_changed = false;
                 if let Some(res) = resources_for_clips.borrow().as_ref() {
                     if let (Some(rx), Some(tx)) = (
                         res.clip_events.as_ref(),
@@ -859,6 +864,7 @@ pub fn run(start_hidden: bool) {
                                 Ok(evt) => {
                                     log::info!("clip event: {evt:?}");
                                     buf.on_backend_event(&evt, &tx);
+                                    state_changed = true;
                                 }
                                 Err(TryRecvError::Empty) => break,
                                 Err(TryRecvError::Disconnected) => {
@@ -868,8 +874,28 @@ pub fn run(start_hidden: bool) {
                         }
                     }
                 }
+                if state_changed {
+                    let buf = buf_for_events.borrow();
+                    window_for_indicator.set_clips_state(
+                        buf.state(),
+                        buf.current_game().map(|g| g.name.as_str()),
+                    );
+                }
                 glib::ControlFlow::Continue
             });
+
+            // Seed the indicator with the buffer's initial state so the
+            // badge reflects auto-resume / Uninitialized correctly without
+            // waiting for the first BackendEvent (which only fires once
+            // GSR is armed — could be never if the user is just sitting
+            // on the dashboard).
+            {
+                let buf = buffer.borrow();
+                window.set_clips_state(
+                    buf.state(),
+                    buf.current_game().map(|g| g.name.as_str()),
+                );
+            }
 
             // Battery query: send once immediately, then refresh periodically
             if let Some(writer) = writer {
@@ -895,11 +921,15 @@ pub fn run(start_hidden: bool) {
             // Game detector: scan /proc every 2 seconds, feed the debouncing
             // GameDetector, and forward state-change events into the
             // BufferController. The controller is responsible for deciding
-            // whether to actually arm (it stays in Uninitialized until the
-            // portal pick lands in Phase 3, so no StartReplay is sent yet).
+            // whether to actually arm. Detector-driven state changes don't
+            // generate BackendEvents (game enter/exit only mutates
+            // `current_game` + sends StartReplay/StopReplay), so we have to
+            // refresh the indicator inline here too — without this, the
+            // badge would only update on Armed/Saved/etc.
             let detector_state = Rc::new(RefCell::new(crate::clips::GameDetector::new()));
             let buf_for_detector = buffer.clone();
             let resources_for_detector = resources.clone();
+            let window_for_detector = window.clone();
             glib::timeout_add_seconds_local(2, move || {
                 let games = crate::clips::detector::scan_once();
                 let evts = detector_state.borrow_mut().tick(&games);
@@ -922,6 +952,11 @@ pub fn run(start_hidden: bool) {
                             }
                         }
                     }
+                    let buf = buf_for_detector.borrow();
+                    window_for_detector.set_clips_state(
+                        buf.state(),
+                        buf.current_game().map(|g| g.name.as_str()),
+                    );
                 }
                 glib::ControlFlow::Continue
             });
