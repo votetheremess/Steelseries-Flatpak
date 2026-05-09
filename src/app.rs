@@ -512,15 +512,31 @@ pub fn run(start_hidden: bool) {
             // timer notices and enables the Next button. The in-app install
             // path enables Next via its own progress watcher; whichever
             // finishes first wins.
+            //
+            // Stops polling once we're past Page 1 (no GSR-install detection
+            // is possible from any other wizard step, and the alternative —
+            // running a flatpak query forever — both leaks memory and
+            // creates a fork-storm). Bidirectional too: if GSR is detected
+            // as uninstalled mid-poll, Next is disabled again.
+            //
+            // Note: if the user later does Reset capture source and returns
+            // to the wizard, the wizard moves to PickScreen (not InstallGsr),
+            // so this timer doesn't get re-spawned. That's fine — GSR is
+            // presumably still installed from the original onboarding, and
+            // arm()'s missing-GSR check still catches the rare case where
+            // it isn't.
             {
                 let clips_page = window.clips_page();
                 glib::timeout_add_seconds_local(2, move || {
-                    if matches!(
+                    if !matches!(
                         clips_page.current_wizard_step(),
                         crate::clips::WizardStep::InstallGsr
-                    ) && crate::clips::gsr_install::is_installed()
-                    {
-                        clips_page.wizard.install_next_btn.set_sensitive(true);
+                    ) {
+                        return glib::ControlFlow::Break;
+                    }
+                    let installed = crate::clips::gsr_install::is_installed();
+                    clips_page.wizard.install_next_btn.set_sensitive(installed);
+                    if installed {
                         clips_page.wizard.install_status_label.set_visible(true);
                         clips_page
                             .wizard
