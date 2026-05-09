@@ -261,14 +261,27 @@ use std::os::unix::process::CommandExt;
 /// PR_SET_PDEATHSIG so it dies if we die. Sets ARCTIS_CHATMIX_SAVE_FIFO via
 /// `--env=` so the callback script (run inside the Flatpak sandbox) sees it.
 ///
+/// `--command=gpu-screen-recorder` is required: the Flatpak's default
+/// command is the GUI (`gpu-screen-recorder-ui`); without this flag, our
+/// CLI args land in the GUI and pop a window over the user's game.
+///
 /// Returns the Child handle for the `flatpak` wrapper process. Signals sent to
 /// this PID are forwarded by Flatpak's bwrap into the contained GSR process.
 pub fn spawn_gsr(args: &[String], fifo_path: &PathBuf) -> std::io::Result<Child> {
     let mut cmd = Command::new("flatpak");
     cmd.arg("run")
+        // Select the headless CLI binary inside the Flatpak instead of the
+        // default GUI command. Must come BEFORE the app id (it's a
+        // flatpak-run option, not a contained-command arg).
+        .arg("--command=gpu-screen-recorder")
         // Pass the FIFO path as an env var into the sandbox.
         .arg(format!("--env=ARCTIS_CHATMIX_SAVE_FIFO={}", fifo_path.display()))
         .arg("com.dec05eba.gpu_screen_recorder")
+        // `--` separates flatpak-run options from args forwarded to the
+        // contained command. Defensive: GSR's leading-dash flags (-r, -w,
+        // -a, ...) should pass through, but the explicit boundary protects
+        // against future flatpak versions interpreting them as run options.
+        .arg("--")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
