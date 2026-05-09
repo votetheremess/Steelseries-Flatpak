@@ -414,15 +414,39 @@ fn build_clip_card() -> (gtk::Box, CardWidgets) {
     (card, CardWidgets { image, title })
 }
 
-fn bind_label_only(widgets: &CardWidgets, clip: &ClipObject) {
+fn bind_clip_card(widgets: &CardWidgets, clip: &ClipObject) {
     let meta = clip.meta();
+    let storage_dir = clip.storage_dir();
     let game = if meta.game_name.is_empty() {
         "Untitled"
     } else {
         meta.game_name.as_str()
     };
     widgets.title.set_label(game);
-    // Picture left blank in this task; thumbnail wiring lands in Task 5.4c.
+
+    // Spawn a worker thread to extract the thumbnail via ffmpeg, then hop
+    // back to the GTK main thread to set the picture's filename.
+    //
+    // We use a `SendWeakRef` instead of a plain `WeakRef<gtk::Picture>`
+    // because `gtk::Picture` is `!Send` (GTK widgets are bound to the main
+    // thread), and `WeakRef<T>` requires `T: Send + Sync` to itself be
+    // `Send`. `SendWeakRef` allows the weak reference to cross threads
+    // and panics if dereferenced off the original thread — but we only
+    // upgrade it inside the `MainContext::default().invoke(...)` closure,
+    // which runs back on the main thread, so the invariant holds.
+    let filename = meta.filename;
+    let storage_for_worker = storage_dir;
+    let img_weak: glib::SendWeakRef<gtk::Picture> = widgets.image.downgrade().into();
+    std::thread::spawn(move || {
+        if let Ok(thumb) = crate::clips::thumbnail::ensure_thumbnail(&storage_for_worker, &filename)
+        {
+            glib::MainContext::default().invoke(move || {
+                if let Some(img) = img_weak.upgrade() {
+                    img.set_filename(Some(&thumb));
+                }
+            });
+        }
+    });
 }
 
 fn loaded_page() -> gtk::Widget {
@@ -480,7 +504,7 @@ fn loaded_page() -> gtk::Widget {
             .item()
             .and_then(|o| o.downcast::<ClipObject>().ok())
             .expect("model item must be a ClipObject");
-        bind_label_only(&widgets, &clip);
+        bind_clip_card(&widgets, &clip);
     });
 
     let grid = gtk::GridView::builder()
