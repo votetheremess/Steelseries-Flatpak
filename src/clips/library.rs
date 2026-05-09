@@ -1,6 +1,6 @@
 //! Clip metadata index, directory scan, filename sanitization.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -80,6 +80,93 @@ pub fn resolve_collision(dir: &Path, base: &str, ext: &str) -> String {
     format!("{base}-{}.{ext}", std::process::id())
 }
 
+const INDEX_FILENAME: &str = "clips_index.txt";
+
+fn index_path() -> PathBuf {
+    let home = std::env::var_os("HOME").expect("HOME");
+    PathBuf::from(home)
+        .join(".config/arctis-chatmix")
+        .join(INDEX_FILENAME)
+}
+
+/// Serialize a clip meta into one tab-separated index line.
+pub fn serialize_meta(m: &ClipMeta) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}",
+        m.filename, m.duration_ms, m.game_name, m.created_unix, m.bitrate_kbps, m.resolution
+    )
+}
+
+/// Parse one index line. Returns `None` on malformed input.
+pub fn parse_meta(line: &str) -> Option<ClipMeta> {
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    Some(ClipMeta {
+        filename: parts[0].to_string(),
+        duration_ms: parts[1].parse().ok()?,
+        game_name: parts[2].to_string(),
+        created_unix: parts[3].parse().ok()?,
+        bitrate_kbps: parts[4].parse().ok()?,
+        resolution: parts[5].to_string(),
+    })
+}
+
+/// Load the on-disk clip index. Missing or unreadable file -> empty list.
+/// Malformed lines are silently skipped.
+pub fn load_index() -> Vec<ClipMeta> {
+    let p = index_path();
+    let s = std::fs::read_to_string(p).unwrap_or_default();
+    s.lines().filter_map(parse_meta).collect()
+}
+
+/// Persist the clip index. Creates the parent directory if it doesn't exist.
+pub fn save_index(items: &[ClipMeta]) -> std::io::Result<()> {
+    let p = index_path();
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body: String = items
+        .iter()
+        .map(serialize_meta)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(p, body)
+}
+
+/// Scan the storage dir, reconcile with the index, return the reconciled list.
+/// - Removes index entries whose `.mp4` files no longer exist on disk.
+/// - Adds entries for `.mp4` files not yet indexed (with default metadata —
+///   ffprobe-augmented later in a worker thread).
+pub fn reconcile(storage_dir: &Path) -> Vec<ClipMeta> {
+    let mut indexed = load_index();
+    let on_disk: std::collections::HashSet<String> = std::fs::read_dir(storage_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".mp4"))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+
+    indexed.retain(|m| on_disk.contains(&m.filename));
+    let known: std::collections::HashSet<String> =
+        indexed.iter().map(|m| m.filename.clone()).collect();
+    for filename in &on_disk {
+        if !known.contains(filename) {
+            indexed.push(ClipMeta {
+                filename: filename.clone(),
+                duration_ms: 0,
+                game_name: String::new(),
+                created_unix: 0,
+                bitrate_kbps: 0,
+                resolution: String::new(),
+            });
+        }
+    }
+    indexed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +203,35 @@ mod tests {
         let resolved = resolve_collision(&dir, &base, "mp4");
         assert_eq!(resolved, format!("{base}-2.mp4"));
         let _ = std::fs::remove_file(dir.join(format!("{base}.mp4")));
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    fn meta() -> ClipMeta {
+        ClipMeta {
+            filename: "2026-05-08-1934-Apex-Legends.mp4".into(),
+            duration_ms: 60000,
+            game_name: "Apex Legends".into(),
+            created_unix: 1715000000,
+            bitrate_kbps: 25000,
+            resolution: "1920x1080".into(),
+        }
+    }
+
+    #[test]
+    fn round_trip_one_entry() {
+        let m = meta();
+        let line = serialize_meta(&m);
+        let parsed = parse_meta(&line);
+        assert_eq!(parsed, Some(m));
+    }
+
+    #[test]
+    fn parse_rejects_malformed() {
+        assert!(parse_meta("not enough tabs").is_none());
+        assert!(parse_meta("a\tb\tc\td\te").is_none());
     }
 }
