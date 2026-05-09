@@ -104,11 +104,17 @@ pub fn parse_acf_name(contents: &str) -> Option<String> {
                 continue;
             }
             let mut value = String::new();
+            let mut prev = ' ';
             for c in chars {
-                if c == '"' {
+                if c == '"' && prev != '\\' {
                     return Some(value);
                 }
+                // Strip backslash before quote (consume escape).
+                if c == '"' && prev == '\\' {
+                    value.pop(); // remove the backslash we already pushed
+                }
                 value.push(c);
+                prev = c;
             }
         }
     }
@@ -159,6 +165,12 @@ mod acf_tests {
     fn parse_handles_extra_whitespace() {
         let acf = r#""name"        "Counter-Strike 2""#;
         assert_eq!(parse_acf_name(acf).as_deref(), Some("Counter-Strike 2"));
+    }
+
+    #[test]
+    fn parse_name_with_escaped_quotes() {
+        let acf = r#""name"   "Devil May Cry: \"Special Edition\"""#;
+        assert_eq!(parse_acf_name(acf).as_deref(), Some(r#"Devil May Cry: "Special Edition""#));
     }
 }
 
