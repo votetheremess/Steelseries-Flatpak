@@ -521,10 +521,18 @@ pub fn run(start_hidden: bool) {
             //   GSR missing                       → Page 1 (install).
             //   GSR present but no token          → Page 2 (pick screen),
             //                                       enable Page 1 Next.
-            //   GSR + token but flag not set      → treat as complete
-            //                                       (user pressed Next on
-            //                                       Page 2 in a prior run
-            //                                       but didn't reach Done).
+            //   GSR + token + flag NOT set        → user reached Page 2
+            //                                       last session but never
+            //                                       pressed Next. Connect
+            //                                       buffer with the
+            //                                       persisted token (so
+            //                                       auto-arm works
+            //                                       immediately) AND show
+            //                                       Page 2 with a hint so
+            //                                       they confirm the pick.
+            //                                       Don't silently flip
+            //                                       onboarding_complete —
+            //                                       wait for user's Next.
             {
                 let clip_settings = crate::clips::settings::load();
                 let token = crate::clips::portal::load_token();
@@ -557,10 +565,34 @@ pub fn run(start_hidden: bool) {
                         .install_next_btn
                         .set_sensitive(true);
                 } else {
-                    if let Err(e) = crate::clips::settings::mark_onboarding_complete() {
-                        log::warn!("failed to persist onboarding_complete: {e}");
+                    // GSR installed + token present + onboarding flag false.
+                    // The user reached Page 2 last session but never pressed
+                    // Next. Connect the buffer with the persisted token (so
+                    // auto-arm works immediately) AND show the wizard at
+                    // PickScreen for explicit user confirmation. Don't
+                    // silently flip onboarding_complete — wait for the
+                    // user's Next click.
+                    if let Some(t) = token {
+                        let cmd_tx = resources
+                            .borrow()
+                            .as_ref()
+                            .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
+                        if let Some(tx) = cmd_tx {
+                            buffer.borrow_mut().on_portal_pick_complete(t, &tx);
+                        }
                     }
-                    window.clips_page().set_state(crate::clips::PageState::Empty);
+                    let cp = window.clips_page();
+                    cp.set_wizard_step(crate::clips::WizardStep::PickScreen);
+                    cp.wizard.screen_picked_label.set_visible(true);
+                    cp.wizard.screen_picked_label.set_label(
+                        "Previously picked — click Next to keep, or Pick screen to change.",
+                    );
+                    cp.wizard.screen_next_btn.set_sensitive(true);
+                    // Already past page 1 — keep its Next enabled too in
+                    // case the user navigates back.
+                    cp.wizard.install_next_btn.set_sensitive(true);
+                    // Onboarding state remains incomplete until user
+                    // confirms via Next.
                 }
             }
 
