@@ -313,7 +313,6 @@ pub fn spawn_backend() -> (BackendHandle, Receiver<BackendEvent>) {
 
 struct ActiveCapture {
     child: Child,
-    stdout_lines: Vec<String>, // last few lines for error context
 }
 
 fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
@@ -342,7 +341,7 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
         // also poll the child's exit status).
         match cmd_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(ClipCommand::StartReplay { config }) => {
-                if let Err(e) = arm(&mut active, &mut active_config, &config, &evt_tx) {
+                if let Err(e) = arm(&mut active, &mut active_config, &config) {
                     let _ = evt_tx.send(BackendEvent::Error {
                         context: "StartReplay".into(),
                         message: e.to_string(),
@@ -370,7 +369,7 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
             }
             Ok(ClipCommand::Reconfigure { config }) => {
                 disarm(&mut active);
-                if let Err(e) = arm(&mut active, &mut active_config, &config, &evt_tx) {
+                if let Err(e) = arm(&mut active, &mut active_config, &config) {
                     let _ = evt_tx.send(BackendEvent::Error {
                         context: "Reconfigure".into(),
                         message: e.to_string(),
@@ -401,7 +400,7 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
                     if consecutive_failures < 2 {
                         if let Some(cfg) = active_config.clone() {
                             log::info!("clip-backend: auto-restart attempt 1");
-                            if let Err(e) = arm(&mut active, &mut active_config, &cfg, &evt_tx) {
+                            if let Err(e) = arm(&mut active, &mut active_config, &cfg) {
                                 let _ = evt_tx.send(BackendEvent::Error {
                                     context: "auto-restart".into(),
                                     message: e.to_string(),
@@ -429,7 +428,6 @@ fn arm(
     active: &mut Option<ActiveCapture>,
     active_config: &mut Option<CaptureConfig>,
     config: &CaptureConfig,
-    _evt_tx: &Sender<BackendEvent>,
 ) -> std::io::Result<()> {
     if active.is_some() {
         return Ok(()); // already armed; idempotent
@@ -443,7 +441,7 @@ fn arm(
         config.output_dir.to_str().unwrap(),
     );
     let child = spawn_gsr(&args, &fifo)?;
-    *active = Some(ActiveCapture { child, stdout_lines: Vec::new() });
+    *active = Some(ActiveCapture { child });
     *active_config = Some(config.clone());
     Ok(())
 }
