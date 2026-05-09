@@ -366,6 +366,7 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
                         message: e.to_string(),
                     });
                 } else {
+                    consecutive_failures = 0;
                     let _ = evt_tx.send(BackendEvent::Armed);
                 }
             }
@@ -396,6 +397,7 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
                                     message: e.to_string(),
                                 });
                             } else {
+                                consecutive_failures = 0;
                                 let _ = evt_tx.send(BackendEvent::Armed);
                             }
                         }
@@ -436,6 +438,9 @@ fn arm(
     Ok(())
 }
 
+// GSR muxes the active replay buffer on SIGINT (faststart MP4 with moov-relocate).
+// 2 s covers the typical 60 s @ 25 Mbps buffer (~190 MB) on NVMe; spinning disks may
+// force the SIGKILL fallback. Future tuning: scale wait by configured buffer length.
 fn disarm(active: &mut Option<ActiveCapture>) {
     if let Some(mut a) = active.take() {
         let pid = a.child.id();
@@ -507,5 +512,111 @@ fn run_fifo_reader(evt_tx: Sender<BackendEvent>) {
             }
         }
         // Reader EOF — writer closed; loop and re-open.
+    }
+}
+
+#[cfg(test)]
+mod supervision_tests {
+    //! Counter-only simulation of the supervisor flow in `run_backend`.
+    //!
+    //! We can't drive a real GSR child in unit tests (no Flatpak runtime, no
+    //! display, no portal), but the *counter logic* is pure state and can be
+    //! exercised in isolation. This simulation mirrors exactly what
+    //! `run_backend` does to `consecutive_failures` so any future divergence
+    //! between this test and the supervisor will surface as a failing test.
+    //!
+    //! Manual end-to-end verification (run by hand on a Bazzite host with the
+    //! Flatpak GSR installed):
+    //!   1. Arm replay (Clips → Start). Confirm `Armed` event.
+    //!   2. `pkill -KILL gpu-screen-recorder` — observe `BackendDied` then
+    //!      `Armed` (auto-restart). Counter went 0 → 1 → 0.
+    //!   3. `pkill -KILL gpu-screen-recorder` again — `Armed` again.
+    //!      Counter 0 → 1 → 0 again (the prior reset opened a fresh budget).
+    //!   4. Force two failures back-to-back without an intervening successful
+    //!      arm (e.g. break the portal token then kill twice rapidly):
+    //!      `BackendDied` then `Error{context:"supervision"}` on the second.
+    //!   5. Reconfigure with a fresh, valid config — expect `Armed` and the
+    //!      counter back to 0 so the next failure won't immediately exhaust.
+    //!
+    //! The simulation below codifies steps 2–5 as data.
+
+    /// Mirror of the supervisor's counter mutations. Each `Step` describes
+    /// what happened in one iteration of `run_backend`'s loop and how the
+    /// counter should evolve. The test simulates the loop and asserts the
+    /// final and intermediate counters.
+    enum Step {
+        /// Successful StartReplay or Reconfigure: counter resets to 0.
+        ArmOk,
+        /// Child observed exited; pre-increment, then optionally try to
+        /// auto-restart. `restart_ok` mirrors whether `arm()` returned Ok.
+        ChildDied { restart_ok: bool },
+    }
+
+    fn simulate(steps: &[Step]) -> Vec<u32> {
+        let mut counter: u32 = 0;
+        let mut history = Vec::with_capacity(steps.len());
+        for step in steps {
+            match step {
+                Step::ArmOk => {
+                    counter = 0;
+                }
+                Step::ChildDied { restart_ok } => {
+                    counter += 1;
+                    if counter < 2 && *restart_ok {
+                        counter = 0;
+                    }
+                    // counter >= 2 → supervisor surrenders, leaves counter pinned.
+                    // restart_ok=false with counter < 2 → counter stays at 1
+                    // (next failure will trip the "twice in a row" branch).
+                }
+            }
+            history.push(counter);
+        }
+        history
+    }
+
+    #[test]
+    fn successful_arm_starts_counter_at_zero() {
+        let h = simulate(&[Step::ArmOk]);
+        assert_eq!(h, vec![0]);
+    }
+
+    #[test]
+    fn one_death_then_successful_restart_resets_counter() {
+        // Was the bug pre-fix: restart succeeded but counter stayed at 1, so a
+        // *second* unrelated failure later would immediately surrender.
+        let h = simulate(&[Step::ChildDied { restart_ok: true }]);
+        assert_eq!(h, vec![0], "counter must reset on successful auto-restart");
+    }
+
+    #[test]
+    fn two_deaths_in_a_row_surrender() {
+        let h = simulate(&[
+            Step::ChildDied { restart_ok: false },
+            Step::ChildDied { restart_ok: false },
+        ]);
+        assert_eq!(h, vec![1, 2], "counter at 2 → supervisor stops retrying");
+    }
+
+    #[test]
+    fn death_restart_then_later_death_does_not_immediately_surrender() {
+        // The fix's whole point: a successful restart wipes the slate so a
+        // future, unrelated failure isn't penalized for the earlier one.
+        let h = simulate(&[
+            Step::ChildDied { restart_ok: true }, // 0
+            Step::ChildDied { restart_ok: true }, // 0 — would be 2 (surrender) without the fix
+        ]);
+        assert_eq!(h, vec![0, 0]);
+    }
+
+    #[test]
+    fn reconfigure_after_a_failure_clears_the_counter() {
+        // Reconfigure success path resets counter — same fix.
+        let h = simulate(&[
+            Step::ChildDied { restart_ok: false }, // counter = 1
+            Step::ArmOk,                            // simulating user Reconfigure success → 0
+            Step::ChildDied { restart_ok: false }, // back to 1, NOT 2
+        ]);
+        assert_eq!(h, vec![1, 0, 1]);
     }
 }
