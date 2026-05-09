@@ -83,6 +83,7 @@ dependencies = [
  "ashpd",
  "base64",
  "env_logger",
+ "futures-util",
  "gtk4",
  "ksni",
  "libadwaita",

@@ -617,20 +617,55 @@ pub fn run(start_hidden: bool) {
                 app.add_action_entries([pick_storage_action]);
             }
 
-            // app.rebind-clip-hotkey — hotkey rebinder for the clips save
-            // shortcut. Stub for now; full implementation lands in Phase 4
-            // alongside the global-shortcuts portal wiring. Registered so
-            // the Page 3 "Change…" button doesn't fail with an unknown
-            // action.
+            // app.rebind-clip-hotkey — re-open the GlobalShortcuts portal
+            // dialog so the user can change the chord bound to save-clip.
+            // ashpd 0.10 has no `ConfigureShortcuts` API, so the workaround
+            // is to fire off a fresh bind_shortcuts call: KDE's portal
+            // re-displays its picker for any unconfirmed/changed bindings,
+            // which is the closest thing to a "rebind" affordance we get.
+            // Existing activations from the startup session keep flowing.
             {
                 let rebind_action = gtk::gio::ActionEntry::builder("rebind-clip-hotkey")
                     .activate(|_app: &adw::Application, _action, _param| {
-                        log::info!(
-                            "app.rebind-clip-hotkey invoked (stub — Phase 4)"
-                        );
+                        glib::MainContext::default().spawn_local(async move {
+                            if let Err(e) = crate::clips::hotkey::rebind_shortcuts().await {
+                                log::warn!("rebind_shortcuts failed: {e}");
+                            }
+                        });
                     })
                     .build();
                 app.add_action_entries([rebind_action]);
+            }
+
+            // GlobalShortcuts portal listener. Spawned on the glib main
+            // context so the future's !Send constraints (it forwards into
+            // app.activate_action, which touches the GApplication) are
+            // satisfied. Runs forever; if the portal session dies, the
+            // future returns and we log it — the user can retry by
+            // triggering app.rebind-clip-hotkey, which spawns a fresh
+            // session.
+            {
+                let app_for_hotkey = app.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let app_for_cb = app_for_hotkey.clone();
+                    let result = crate::clips::hotkey::run_global_shortcuts(move |id| {
+                        let action_name = match id {
+                            "save-clip" => "save-clip",
+                            "save-clip-short" => "save-clip-short",
+                            "save-clip-medium" => "save-clip-medium",
+                            "save-clip-long" => "save-clip-long",
+                            other => {
+                                log::debug!("ignoring unknown shortcut id: {other}");
+                                return;
+                            }
+                        };
+                        app_for_cb.activate_action(action_name, None);
+                    })
+                    .await;
+                    if let Err(e) = result {
+                        log::warn!("GlobalShortcuts portal listener exited: {e}");
+                    }
+                });
             }
 
             // GSR-install detection poll. If the user installs GSR via the
