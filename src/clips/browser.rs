@@ -105,9 +105,10 @@ pub struct WizardWidgets {
     pub pick_screen_btn: gtk::Button,
     pub screen_next_btn: gtk::Button,
     // Page 3
-    pub hotkey_label: gtk::Label,
-    pub buffer_scale: gtk::Scale,
-    pub storage_label: gtk::Label,
+    pub hotkey_btn: gtk::Button,
+    pub clip_length_scale: gtk::Scale,
+    pub clip_length_label: gtk::Label,
+    pub storage_btn: gtk::Button,
 }
 
 impl WizardWidgets {
@@ -144,6 +145,17 @@ impl WizardWidgets {
     pub fn show_screen_not_picked_state(&self) {
         self.pick_screen_btn.set_visible(true);
         self.screen_next_btn.set_visible(false);
+    }
+
+    /// Update the storage-folder button label on Page 3 to the basename of
+    /// the supplied path. Falls back to "Clips" if the path has no usable
+    /// final component (e.g. root, empty path).
+    pub fn update_storage_label(&self, path: &std::path::Path) {
+        let basename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Clips".to_string());
+        self.storage_btn.set_label(&basename);
     }
 }
 
@@ -265,7 +277,8 @@ fn build_wizard() -> WizardWidgets {
     let (page1, install_status_label, install_btn, install_manually_btn, install_next_btn) =
         build_page1_install();
     let (page2, screen_picked_label, pick_screen_btn, screen_next_btn) = build_page2_screen();
-    let (page3, hotkey_label, buffer_scale, storage_label) = build_page3_settings();
+    let (page3, hotkey_btn, clip_length_scale, clip_length_label, storage_btn) =
+        build_page3_settings();
 
     stack.add_named(&page1, Some("wizard-1-install"));
     stack.add_named(&page2, Some("wizard-2-screen"));
@@ -282,9 +295,10 @@ fn build_wizard() -> WizardWidgets {
         screen_picked_label,
         pick_screen_btn,
         screen_next_btn,
-        hotkey_label,
-        buffer_scale,
-        storage_label,
+        hotkey_btn,
+        clip_length_scale,
+        clip_length_label,
+        storage_btn,
     }
 }
 
@@ -466,7 +480,7 @@ fn build_page2_screen() -> (gtk::Widget, gtk::Label, gtk::Button, gtk::Button) {
     (page.upcast(), screen_picked_label, pick_screen_btn, screen_next_btn)
 }
 
-fn build_page3_settings() -> (gtk::Widget, gtk::Label, gtk::Scale, gtk::Label) {
+fn build_page3_settings() -> (gtk::Widget, gtk::Button, gtk::Scale, gtk::Label, gtk::Button) {
     let page = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .margin_top(16)
@@ -491,64 +505,119 @@ fn build_page3_settings() -> (gtk::Widget, gtk::Label, gtk::Scale, gtk::Label) {
     title.add_css_class("title-1");
     center_box.append(&title);
 
-    let body = gtk::Label::new(Some(
-        "All settings have sensible defaults. Tweak now \
-         or later in Settings.",
-    ));
-    body.set_wrap(true);
-    body.set_max_width_chars(50);
-    body.set_xalign(0.5);
-    body.set_justify(gtk::Justification::Center);
-    center_box.append(&body);
+    // Container for the three setting rows. Vertical spacing(12) gives the
+    // visible gap between cards so each row reads as its own surface (vs.
+    // the old flat row layout). width_request(500) keeps the cards a
+    // consistent fixed width — full-stretch on the centered wizard layout
+    // looks awkward because the column has no other anchor to align to.
+    let rows_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .width_request(500)
+        .halign(gtk::Align::Center)
+        .build();
 
-    // Hotkey row
+    // ------------------------------------------------------------------
+    // Row 1: Save hotkey. Layout: [label]   [keybind button]
+    //
+    // The right-hand button's label IS the current chord. Clicking it
+    // triggers `app.rebind-clip-hotkey` which re-opens the KDE portal's
+    // shortcut picker. We don't try to capture chords in-app — that's the
+    // OS-level UX the portal owns.
+    //
+    // The chord label is currently static ("Super+Shift+R") because we
+    // don't track post-bind chord changes; future work could subscribe to
+    // the GlobalShortcuts portal's ShortcutsChanged signal to keep this
+    // live, but that's out of scope for the v1 polish pass.
+    // ------------------------------------------------------------------
     let hotkey_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+        .spacing(16)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(16)
+        .margin_end(16)
+        .css_classes(["card"])
         .build();
     hotkey_row.append(&gtk::Label::new(Some("Save hotkey")));
-    let hotkey_label = gtk::Label::new(Some("Super+Shift+R"));
-    hotkey_label.set_hexpand(true);
-    hotkey_label.set_xalign(1.0);
-    hotkey_row.append(&hotkey_label);
-    let rebind_btn = gtk::Button::builder().label("Change…").build();
-    rebind_btn.set_action_name(Some("app.rebind-clip-hotkey"));
-    hotkey_row.append(&rebind_btn);
-    center_box.append(&hotkey_row);
-
-    // Buffer length scale
-    let buffer_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(4)
+    hotkey_row.append(&gtk::Box::builder().hexpand(true).build());
+    let hotkey_btn = gtk::Button::builder()
+        .label("Super+Shift+R")
+        .css_classes(["pill"])
         .build();
-    buffer_row.append(
-        &gtk::Label::builder()
-            .label("Buffer length (seconds)")
-            .xalign(0.0)
-            .build(),
-    );
-    let buffer_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 30.0, 300.0, 5.0);
-    buffer_scale.set_value(60.0);
-    buffer_scale.set_draw_value(true);
-    buffer_scale.set_value_pos(gtk::PositionType::Right);
-    buffer_row.append(&buffer_scale);
-    center_box.append(&buffer_row);
+    hotkey_btn.set_action_name(Some("app.rebind-clip-hotkey"));
+    hotkey_row.append(&hotkey_btn);
+    rows_box.append(&hotkey_row);
 
-    // Storage path row
+    // ------------------------------------------------------------------
+    // Row 2: Clip length. Layout: [label]   [scale]   [value label]
+    //
+    // The display name is "Clip length" but the underlying setting is
+    // `buffer_length` (kept for backward compatibility with persisted
+    // configs). The scale's built-in value display is hidden and we draw
+    // a separate right-aligned label so digits don't jiggle as the user
+    // drags — `width_request(50)` + `xalign(1.0)` keeps the layout stable.
+    // ------------------------------------------------------------------
+    let clip_length_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(16)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(16)
+        .margin_end(16)
+        .css_classes(["card"])
+        .build();
+    clip_length_row.append(&gtk::Label::new(Some("Clip length")));
+    clip_length_row.append(&gtk::Box::builder().width_request(8).build());
+    let clip_length_scale =
+        gtk::Scale::with_range(gtk::Orientation::Horizontal, 30.0, 300.0, 5.0);
+    clip_length_scale.set_value(60.0);
+    clip_length_scale.set_hexpand(true);
+    clip_length_scale.set_draw_value(false);
+    clip_length_row.append(&clip_length_scale);
+    clip_length_row.append(&gtk::Box::builder().width_request(8).build());
+    let clip_length_label = gtk::Label::builder()
+        .label("60s")
+        .width_request(50)
+        .xalign(1.0)
+        .build();
+    clip_length_row.append(&clip_length_label);
+    {
+        let value_label = clip_length_label.clone();
+        clip_length_scale.connect_value_changed(move |s| {
+            value_label.set_label(&format!("{}s", s.value() as u32));
+        });
+    }
+    rows_box.append(&clip_length_row);
+
+    // ------------------------------------------------------------------
+    // Row 3: Save clips to. Layout: [label]   [folder-name button]
+    //
+    // The right-hand button's label is the basename of the saved folder
+    // (e.g. "Clips"). Initial label is "Clips" (default storage path
+    // basename); app.rs reapplies via `update_storage_label` once
+    // ClipSettings is loaded so the wizard reflects user-customised paths.
+    // ------------------------------------------------------------------
     let storage_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+        .spacing(16)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(16)
+        .margin_end(16)
+        .css_classes(["card"])
         .build();
     storage_row.append(&gtk::Label::new(Some("Save clips to")));
-    let storage_label = gtk::Label::new(Some("~/Videos/Clips"));
-    storage_label.set_hexpand(true);
-    storage_label.set_xalign(1.0);
-    storage_label.set_ellipsize(gtk::pango::EllipsizeMode::Start);
-    storage_row.append(&storage_label);
-    let pick_storage_btn = gtk::Button::builder().label("Pick folder").build();
-    pick_storage_btn.set_action_name(Some("app.pick-clip-storage"));
-    storage_row.append(&pick_storage_btn);
-    center_box.append(&storage_row);
+    storage_row.append(&gtk::Box::builder().hexpand(true).build());
+    let storage_btn = gtk::Button::builder()
+        .label("Clips")
+        .css_classes(["pill"])
+        .build();
+    storage_btn.set_action_name(Some("app.pick-clip-storage"));
+    storage_row.append(&storage_btn);
+    rows_box.append(&storage_row);
+
+    center_box.append(&rows_box);
 
     // Done button
     let done_btn = gtk::Button::builder()
@@ -562,7 +631,13 @@ fn build_page3_settings() -> (gtk::Widget, gtk::Label, gtk::Scale, gtk::Label) {
 
     page.append(&center_box);
 
-    (page.upcast(), hotkey_label, buffer_scale, storage_label)
+    (
+        page.upcast(),
+        hotkey_btn,
+        clip_length_scale,
+        clip_length_label,
+        storage_btn,
+    )
 }
 
 fn empty_page() -> gtk::Widget {

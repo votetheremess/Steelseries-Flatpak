@@ -11,8 +11,10 @@
 //! callers spawn this on `glib::MainContext::default().spawn_local(...)`
 //! at app startup so the future runs forever and the bindings stay alive.
 
+use ashpd::WindowIdentifier;
 use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
 use futures_util::StreamExt;
+use gtk::prelude::IsA;
 
 /// Suggested shortcut bindings.
 ///
@@ -73,15 +75,32 @@ where
 /// shortcut IDs are already taken or when the user has not yet confirmed
 /// them, giving the user a path to change the chord.
 ///
+/// `parent` is the window the portal dialog should be modal to. When
+/// running OUTSIDE a Flatpak sandbox, the portal needs the parent window
+/// identifier to derive the calling app's identity (it can't read
+/// `/proc/<pid>/root/.flatpak-info` because the file doesn't exist for
+/// host-installed binaries). Passing `None` triggers
+/// `org.freedesktop.portal.Error.NotAllowed: An app id is required` on
+/// KDE's xdg-desktop-portal-kde when the caller is not Flatpak-packaged.
+/// Inside a Flatpak (final shipping target), either form works because
+/// the portal reads the app id from the sandbox metadata.
+///
 /// This is fire-and-forget — the existing `run_global_shortcuts` listener
 /// from the original session keeps running and continues receiving
 /// activations. If the user picks a different chord, the portal updates
 /// the binding under the same session.
-pub async fn rebind_shortcuts() -> ashpd::Result<()> {
+pub async fn rebind_shortcuts(
+    parent: Option<&impl IsA<gtk::Native>>,
+) -> ashpd::Result<()> {
     let proxy = GlobalShortcuts::new().await?;
     let session = proxy.create_session().await?;
+    let identifier = if let Some(p) = parent {
+        WindowIdentifier::from_native(p).await
+    } else {
+        None
+    };
     proxy
-        .bind_shortcuts(&session, &suggested_bindings(), None)
+        .bind_shortcuts(&session, &suggested_bindings(), identifier.as_ref())
         .await?;
     Ok(())
 }

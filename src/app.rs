@@ -245,6 +245,23 @@ pub fn run(start_hidden: bool) {
                 .clips_page()
                 .set_storage_dir(clip_settings.borrow().storage_path.clone());
 
+            // Seed the wizard Page 3 widgets with the persisted settings
+            // so a returning user lands on their previous values (clip
+            // length, storage folder name) rather than the build-time
+            // defaults. The hotkey button label stays static for now —
+            // see the comment in build_page3_settings.
+            {
+                let cp = window.clips_page();
+                let s = clip_settings.borrow();
+                cp.wizard
+                    .clip_length_scale
+                    .set_value(s.buffer_length as f64);
+                cp.wizard
+                    .clip_length_label
+                    .set_label(&format!("{}s", s.buffer_length));
+                cp.wizard.update_storage_label(&s.storage_path);
+            }
+
             // Hide on close, keep the process running
             window.window.connect_close_request(move |w| {
                 w.set_visible(false);
@@ -897,14 +914,15 @@ pub fn run(start_hidden: bool) {
                                     ) {
                                         log::warn!("clip settings save failed: {e}");
                                     }
-                                    // Mirror the new path into the wizard
-                                    // Page 3 label so the user sees it
-                                    // confirmed inline.
+                                    // Mirror the new folder name into the
+                                    // wizard Page 3 button so the user sees
+                                    // their pick confirmed inline. Only the
+                                    // basename — full paths blow out the
+                                    // narrow card.
                                     window
                                         .clips_page()
                                         .wizard
-                                        .storage_label
-                                        .set_label(&path.display().to_string());
+                                        .update_storage_label(&path);
                                     // Update the browser dir so the next
                                     // reconcile lands on the new folder.
                                     window.clips_page().set_storage_dir(path.clone());
@@ -963,11 +981,49 @@ pub fn run(start_hidden: bool) {
             // which is the closest thing to a "rebind" affordance we get.
             // Existing activations from the startup session keep flowing.
             {
+                let win_for_rebind = window.clone();
                 let rebind_action = gtk::gio::ActionEntry::builder("rebind-clip-hotkey")
-                    .activate(|_app: &adw::Application, _action, _param| {
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        // The activate handler is `Fn`, so we have to
+                        // clone per-call. Cheap (Rc + GObject ref bumps).
+                        let win_for_async = win_for_rebind.clone();
+                        let parent = win_for_rebind.window.clone();
                         glib::MainContext::default().spawn_local(async move {
-                            if let Err(e) = crate::clips::hotkey::rebind_shortcuts().await {
-                                log::warn!("rebind_shortcuts failed: {e}");
+                            // Pass the parent window so the portal can
+                            // resolve our app id from xdg-foreign. Without
+                            // this, KDE's portal returns NotAllowed when
+                            // we're running outside a Flatpak (the
+                            // standard dev-mode launch).
+                            match crate::clips::hotkey::rebind_shortcuts(Some(&parent)).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    let msg = e.to_string();
+                                    if msg.contains("NotAllowed") || msg.contains("app id") {
+                                        // Surface as a toast — the only
+                                        // real fix is "install as a
+                                        // Flatpak", which we can't do
+                                        // from here. Tell the user how
+                                        // to work around it for now.
+                                        if let Some(overlay) =
+                                            crate::clips::notifications::find_toast_overlay(
+                                                &win_for_async.window,
+                                            )
+                                        {
+                                            overlay.add_toast(
+                                                adw::Toast::builder()
+                                                    .title(
+                                                        "Rebinding requires the app to be installed as a Flatpak. \
+                                                         For now, change the shortcut in System Settings.",
+                                                    )
+                                                    .timeout(8)
+                                                    .build(),
+                                            );
+                                        }
+                                        log::warn!("rebind_shortcuts portal rejected: {msg}");
+                                    } else {
+                                        log::warn!("rebind_shortcuts failed: {msg}");
+                                    }
+                                }
                             }
                         });
                     })
