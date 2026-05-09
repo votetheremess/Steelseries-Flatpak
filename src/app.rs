@@ -797,11 +797,16 @@ fn handle_event(event: &HidEvent, window: &ChatMixWindow) {
 /// Present an AlertDialog with a screenshot of the persisted capture target.
 /// Used by the `app.test-clip-capture` action (xdg-portal #1371 mitigation).
 fn show_test_capture_dialog(app: &adw::Application, image_path: &std::path::Path) {
+    // Note: the Screenshot portal does NOT consult ScreenCast's restore_token.
+    // It has its own consent and may pick a different screen on multi-monitor
+    // setups. The body text reflects this honestly so we don't lie to the user.
     let dialog = adw::AlertDialog::builder()
         .heading("Capture source preview")
         .body(
-            "This is the screen the clip buffer will record. \
-             If wrong, click Reset in settings.",
+            "This is a system screenshot. On multi-monitor setups it may \
+             differ from the actual capture target — to verify the real \
+             target, save a brief test clip and check which screen was \
+             captured.",
         )
         .build();
     let pic = gtk::Picture::for_filename(image_path);
