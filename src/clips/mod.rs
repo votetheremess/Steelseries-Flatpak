@@ -6,6 +6,7 @@ pub mod buffer;
 pub mod detector;
 pub mod hotkey;
 pub mod library;
+pub mod portal;
 pub mod settings;
 pub mod thumbnail;
 
