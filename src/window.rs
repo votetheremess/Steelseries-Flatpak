@@ -81,10 +81,7 @@ impl ChatMixWindow {
         );
         widgets.mixer = mixer_widgets;
         stack.add_named(&eq_page, Some("eq"));
-        stack.add_named(
-            &build_placeholder_page("Clips", "lucide-clapperboard-symbolic", "Coming soon"),
-            Some("clips"),
-        );
+        stack.add_named(&crate::clips::build_clips_page(), Some("clips"));
         stack.add_named(
             &build_placeholder_page("Engine", "lucide-sliders-horizontal-symbolic", "Coming soon"),
             Some("engine"),
@@ -235,8 +232,7 @@ fn build_sidebar(stack: &gtk::Stack) -> gtk::Widget {
     let eq_btn = sidebar_button("lucide-audio-lines-symbolic", "Equalizer");
     eq_btn.set_group(Some(&home_btn));
 
-    let clips_btn = sidebar_button("lucide-clapperboard-symbolic", "Clips (coming soon)");
-    clips_btn.set_sensitive(false);
+    let clips_btn = sidebar_button("lucide-clapperboard-symbolic", "Clips");
     clips_btn.set_group(Some(&home_btn));
 
     let engine_btn = sidebar_button("lucide-sliders-horizontal-symbolic", "Engine (coming soon)");

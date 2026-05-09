@@ -9,6 +9,8 @@ pub mod library;
 pub mod settings;
 pub mod thumbnail;
 
+pub use browser::build_clips_page;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
