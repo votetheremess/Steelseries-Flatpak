@@ -6,23 +6,31 @@
 //! panel exposes one row per track with a volume slider (in dB), a Mute
 //! toggle, and a Solo toggle, plus a Preview / Export action bar.
 //!
-//! Slider semantics (informational — interpretation lives in the Export
-//! pipeline, Task 7.4):
+//! Slider semantics:
 //!   * Volume slider reads in dB (-60..+6, default 0). The Export pipeline
 //!     converts this to a linear gain via 10^(db/20) before passing to the
 //!     ffmpeg `volume` filter. Muting forces 0; if any row is soloed, only
 //!     soloed rows are audible (others are forced to 0).
 //!
-//! Preview / Export wiring lands in Tasks 7.3 / 7.4 — at the skeleton stage
-//! the buttons are present but unhandled, and the on_exported callback
-//! sits on the panel constructor for forward compatibility.
+//! Preview pipeline: opens the original clip in the user's default video
+//! player via `xdg-open`. Slider values do NOT apply to the preview — only
+//! to Export. See the Preview button comment for the GStreamer alternative
+//! we deferred.
+//!
+//! Export pipeline: spawns `ffmpeg -filter_complex` in a worker thread,
+//! mixing all 6 input tracks into a fresh track 0 while preserving the
+//! original per-source tracks unchanged. Output is `<stem>-remix.mp4` in
+//! the same directory.
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::sync::mpsc;
 
 use adw::prelude::*;
+use gtk::glib;
 
 /// Display labels for each of the 6 audio tracks in a saved clip. Index 0
 /// is the GSR-produced mix-down; indices 1..5 are the per-source tracks.
@@ -37,11 +45,6 @@ const DB_MAX: f64 = 6.0;
 /// Threshold below which we treat a track as effectively muted in the
 /// linear-gain conversion. -50 dB is ~0.003 linear — inaudible against
 /// any other track and not worth the floating-point precision noise.
-///
-/// Used by `linear_gain_for` (consumed by Task 7.4 Export). Marked
-/// dead-code-allowed at the skeleton stage so the panel-only commit
-/// (Task 7.2) builds without warning churn.
-#[allow(dead_code)]
 const DB_SILENT_THRESHOLD: f64 = -50.0;
 
 /// Per-track UI state, shared between the slider/toggle widgets and the
@@ -60,11 +63,6 @@ struct TrackState {
 ///   * If any row is soloed and this row isn't, gain is 0.
 ///   * Otherwise the dB value is converted to linear via 10^(db/20),
 ///     clamped to 0 below DB_SILENT_THRESHOLD.
-///
-/// Skeleton-stage dead-code-allowed: the production caller is the Export
-/// pipeline (Task 7.4); the function is exercised by tests in the
-/// meantime.
-#[allow(dead_code)]
 fn linear_gain_for(states: &[TrackState; 6], idx: usize) -> f64 {
     let any_solo = states.iter().any(|s| s.solo);
     let s = states[idx];
@@ -85,13 +83,14 @@ fn linear_gain_for(states: &[TrackState; 6], idx: usize) -> f64 {
 /// `root` is the top-level box that callers append into the page-level
 /// Stack's `remix` slot. `state` is the live per-track mix; signal handlers
 /// inside the panel update it on every slider/toggle change, and the
-/// Export pipeline (Task 7.4) reads from it on click.
+/// Export-button click reads from it.
 pub struct RemixPanel {
     pub root: gtk::Box,
-    /// Live mix state. Tasks 7.3 / 7.4 read from this on Preview / Export
-    /// click; the field is kept on the public struct so future API
-    /// extensions (e.g. preset save/load) can introspect or mutate the
-    /// mix without going through the widget tree.
+    /// Live mix state. The Export click handler reads from this; kept on
+    /// the public struct so future API extensions (e.g. preset save/load)
+    /// can introspect or mutate the mix without going through the widget
+    /// tree. Currently no external reader, but cheaper to leave in place
+    /// than to remove and re-add later.
     #[allow(dead_code)]
     state: Rc<RefCell<[TrackState; 6]>>,
 }
@@ -103,21 +102,15 @@ pub struct RemixPanel {
 /// Callbacks:
 ///   * `on_close` — fires when the user clicks the panel's Close button.
 ///     Caller should pop the stack back to the loaded grid.
-///   * `on_exported` — fires after a successful Export (Task 7.4). Caller
-///     should refresh the grid model so the new `*-remix.mp4` shows up.
-///     Currently parked: at the skeleton stage the Export button is
-///     unhandled, so the callback never runs. Kept on the API so the
-///     Task 7.4 wiring doesn't require re-threading callsites.
+///   * `on_exported` — fires on the GTK main thread after a successful
+///     Export. Caller should refresh the grid model so the new
+///     `*-remix.mp4` shows up. The exported file's path is passed for
+///     any post-export side effects (e.g. notifications).
 pub fn build_remix_panel(
     clip_path: &Path,
     on_close: impl Fn() + 'static,
     on_exported: impl Fn(PathBuf) + 'static,
 ) -> RemixPanel {
-    // The on_exported callback is wired up in Task 7.4; at the skeleton
-    // stage the Export click is a no-op. Suppress the unused-variable
-    // warning explicitly so the compiler doesn't need the `_` prefix
-    // (which would change the public API name later).
-    let _ = on_exported;
     let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
@@ -209,11 +202,101 @@ pub fn build_remix_panel(
         });
     }
 
-    // Export button — wired in Task 7.4.
+    // Export button — spawns ffmpeg in a worker thread (10–30 s for a
+    // 60 s clip on a modern desktop), drains the result via mpsc +
+    // glib::timeout_add_local, and on success hands the new path to
+    // `on_exported` so the caller can refresh the grid. The button label
+    // flips to "Exporting…" while running and disables itself; both Cell
+    // guard + sensitive flip protect against double-click.
     let export_btn = gtk::Button::builder()
         .label("Export")
         .css_classes(["suggested-action"])
         .build();
+    {
+        let path_for_export = clip_path.to_path_buf();
+        let state_for_export = state.clone();
+        let btn_weak: glib::SendWeakRef<gtk::Button> = export_btn.downgrade().into();
+        // Box `on_exported` once into an Rc so each timer-tick clone is
+        // cheap and the closure stays !Send-friendly. (`MainContext::
+        // invoke` would require Send, so we use the existing project
+        // pattern of a Send-mpsc + glib::timeout_add_local drain.)
+        let on_exported = Rc::new(on_exported);
+        // Re-entrancy guard: if the user double-clicks Export, the
+        // second click is a no-op until the first ffmpeg has finished.
+        // The primary defence is `set_sensitive(false)` below, but
+        // `Cell<bool>` protects against any signal-routing edge case
+        // (e.g. a queued click delivered after our sensitivity flip but
+        // before ffmpeg returns).
+        let running = Rc::new(Cell::new(false));
+
+        export_btn.connect_clicked(move |btn| {
+            if running.get() {
+                return;
+            }
+            running.set(true);
+            btn.set_sensitive(false);
+            btn.set_label("Exporting…");
+
+            let states_snapshot = *state_for_export.borrow();
+            let output_path = remix_output_path(&path_for_export);
+
+            let (tx, rx) = mpsc::channel::<std::io::Result<PathBuf>>();
+            let input_for_thread = path_for_export.clone();
+            let output_for_thread = output_path.clone();
+            std::thread::spawn(move || {
+                let result = export_remix(
+                    &input_for_thread,
+                    &output_for_thread,
+                    &states_snapshot,
+                )
+                .map(|()| output_for_thread);
+                let _ = tx.send(result);
+            });
+
+            // Drain on the main thread. Restoring the button label /
+            // sensitivity is the priority — the on_exported callback
+            // is best-effort (it should never fail in practice, but if
+            // the GridView model has been swapped out from under us
+            // we don't want a stuck "Exporting…" button).
+            let on_exported_for_drain = on_exported.clone();
+            let btn_weak_for_drain = btn_weak.clone();
+            let running_for_drain = running.clone();
+            glib::timeout_add_local(
+                std::time::Duration::from_millis(100),
+                move || match rx.try_recv() {
+                    Ok(Ok(out_path)) => {
+                        if let Some(b) = btn_weak_for_drain.upgrade() {
+                            b.set_label("Export");
+                            b.set_sensitive(true);
+                        }
+                        running_for_drain.set(false);
+                        on_exported_for_drain(out_path);
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(e)) => {
+                        log::warn!("remix export failed: {e}");
+                        if let Some(b) = btn_weak_for_drain.upgrade() {
+                            b.set_label("Export");
+                            b.set_sensitive(true);
+                        }
+                        running_for_drain.set(false);
+                        glib::ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        log::warn!("remix export: worker disconnected");
+                        if let Some(b) = btn_weak_for_drain.upgrade() {
+                            b.set_label("Export");
+                            b.set_sensitive(true);
+                        }
+                        running_for_drain.set(false);
+                        glib::ControlFlow::Break
+                    }
+                },
+            );
+        });
+    }
+
     action_bar.append(&preview_btn);
     action_bar.append(&export_btn);
     root.append(&action_bar);
@@ -276,10 +359,6 @@ fn build_track_row(label: &str, idx: usize, state: Rc<RefCell<[TrackState; 6]>>)
 /// as the input. `with_extension` and `with_file_name` get clobbered when
 /// the original stem already contains dots (e.g. `cs2.2026-05-09.mp4`),
 /// so we work directly with the file_stem.
-///
-/// Used by the Export pipeline (Task 7.4); kept here in the skeleton so
-/// it's exercised by tests immediately rather than landing untested.
-#[allow(dead_code)]
 fn remix_output_path(input: &Path) -> PathBuf {
     let stem = input
         .file_stem()
@@ -287,6 +366,97 @@ fn remix_output_path(input: &Path) -> PathBuf {
         .unwrap_or_else(|| "clip".to_string());
     let parent = input.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!("{stem}-remix.mp4"))
+}
+
+/// Spawn ffmpeg with -filter_complex to mix all 6 input audio tracks into
+/// a fresh track 0, preserving original tracks 1–5 unchanged. Per-track
+/// volumes / mute / solo are baked into the filter_complex graph.
+///
+/// The dB→linear conversion happens here (not in the slider handler) so
+/// the UI stays in user-friendly dB units throughout. See `linear_gain_for`
+/// for the mute/solo rules.
+///
+/// Track count assumption: we always pass 6 inputs to amix. If the source
+/// file has fewer (e.g. GSR was configured without per-source tracks),
+/// ffmpeg's amix prints a warning and skips the missing tracks. The Phase 8
+/// verification item will tighten this with an ffprobe step if it turns
+/// out to bite users.
+///
+/// Argument quoting: `-filter_complex` takes a single string argument.
+/// We pass it as `args(["-filter_complex", &filter_str])` — Command's
+/// args API doesn't go through a shell, so we don't need to escape
+/// internal quotes / semicolons / spaces.
+fn export_remix(
+    input: &Path,
+    output: &Path,
+    states: &[TrackState; 6],
+) -> std::io::Result<()> {
+    // Build filter_complex: each input track gets a volume filter, then
+    // amix sums them into [mix].
+    //
+    // `[0:a:0]volume=V0[a0]; [0:a:1]volume=V1[a1]; … [a0][a1]…amix=…`
+    let mut filter = String::new();
+    let mut inputs = String::new();
+    for i in 0..6 {
+        let gain = linear_gain_for(states, i);
+        // ffmpeg's `volume` filter accepts a non-negative float; format
+        // with 6 decimal digits to preserve quiet-end precision (e.g.
+        // -40 dB → 0.01 — a 2-digit format would round it).
+        filter.push_str(&format!("[0:a:{i}]volume={gain:.6}[a{i}];"));
+        inputs.push_str(&format!("[a{i}]"));
+    }
+    filter.push_str(&format!(
+        "{inputs}amix=inputs=6:duration=longest:dropout_transition=0[mix]"
+    ));
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-i"])
+        .arg(input)
+        .args([
+            "-filter_complex",
+            &filter,
+            "-map",
+            "0:v:0",
+            "-map",
+            "[mix]",
+            "-map",
+            "0:a:1",
+            "-map",
+            "0:a:2",
+            "-map",
+            "0:a:3",
+            "-map",
+            "0:a:4",
+            "-map",
+            "0:a:5",
+            "-c:v",
+            "copy",
+            "-c:a:0",
+            "aac",
+            "-b:a:0",
+            "192k",
+            "-c:a:1",
+            "copy",
+            "-c:a:2",
+            "copy",
+            "-c:a:3",
+            "copy",
+            "-c:a:4",
+            "copy",
+            "-c:a:5",
+            "copy",
+        ])
+        .arg(output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "ffmpeg export failed: {status:?}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
