@@ -4,6 +4,53 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::glib;
+use gtk::glib::subclass::prelude::*;
+
+mod clip_object {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    use gtk::glib;
+    use gtk::glib::subclass::prelude::*;
+
+    use crate::clips::library::ClipMeta;
+
+    #[derive(Default)]
+    pub struct ClipObjectImpl {
+        pub meta: RefCell<ClipMeta>,
+        pub storage_dir: RefCell<PathBuf>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for ClipObjectImpl {
+        const NAME: &'static str = "ArctisClipObject";
+        type Type = super::ClipObject;
+    }
+
+    impl ObjectImpl for ClipObjectImpl {}
+}
+
+glib::wrapper! {
+    pub struct ClipObject(ObjectSubclass<clip_object::ClipObjectImpl>);
+}
+
+impl ClipObject {
+    pub fn new(meta: crate::clips::library::ClipMeta, storage_dir: std::path::PathBuf) -> Self {
+        let obj: Self = glib::Object::new();
+        *obj.imp().meta.borrow_mut() = meta;
+        *obj.imp().storage_dir.borrow_mut() = storage_dir;
+        obj
+    }
+
+    pub fn meta(&self) -> crate::clips::library::ClipMeta {
+        self.imp().meta.borrow().clone()
+    }
+
+    pub fn storage_dir(&self) -> std::path::PathBuf {
+        self.imp().storage_dir.borrow().clone()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageState {
@@ -365,5 +412,38 @@ impl ClipsPage {
 
     pub fn widget(&self) -> &gtk::Widget {
         self.root.upcast_ref()
+    }
+}
+
+#[cfg(test)]
+mod object_tests {
+    //! Round-trip test for the `ClipObject` GLib subclass.
+    //!
+    //! Marked `#[ignore]` because `gtk::init()` must succeed for the type
+    //! system to register the subclass, and that fails in headless CI
+    //! environments without a display server. The test is preserved for
+    //! manual verification:
+    //!
+    //!   distrobox enter fedora-dev -- cargo test \
+    //!       clips::browser::object_tests -- --ignored
+    //!
+    //! Since the subclass logic is purely RefCell + clone (no GTK behavior
+    //! beyond the type registration), running this on a developer machine
+    //! with a session bus is sufficient — there is no value in gating the
+    //! whole CI pipeline on it.
+    use super::*;
+    use crate::clips::library::ClipMeta;
+
+    #[test]
+    #[ignore]
+    fn clip_object_round_trips_meta() {
+        gtk::init().ok();
+        let mut m = ClipMeta::default();
+        m.filename = "test.mp4".into();
+        m.duration_ms = 60_000;
+        let dir = std::path::PathBuf::from("/tmp");
+        let obj = ClipObject::new(m.clone(), dir.clone());
+        assert_eq!(obj.meta(), m);
+        assert_eq!(obj.storage_dir(), dir);
     }
 }
