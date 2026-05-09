@@ -19,6 +19,7 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -162,15 +163,53 @@ pub fn build_remix_panel(
     }
 
     // ---- Action bar -----------------------------------------------------
-    // Buttons are present at the skeleton stage but unhandled. Tasks 7.3
-    // and 7.4 wire them up.
     let action_bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
         .margin_top(12)
         .halign(gtk::Align::End)
         .build();
-    let preview_btn = gtk::Button::builder().label("Preview").build();
+
+    // Preview button — opens the original clip in the user's default
+    // video player via `xdg-open`. The slider values are NOT applied to
+    // this preview; the tooltip explains that Export is the only place
+    // that respects the mix.
+    //
+    // V1 simplification: real per-track preview requires a GStreamer
+    // pipeline (qtdemux ! 6× decodebin ! 6× volume ! audiomixer !
+    // autoaudiosink) assembled via gst::parse_launch with current slider
+    // values. That adds gstreamer-rs as a heavyweight dep (multi-MB
+    // transitive tree) and ~50–100 lines of pipeline assembly code with
+    // nontrivial pad-add / decodebin async timing — too much weight for
+    // a v1 nice-to-have. See `docs/superpowers/plans/2026-05-08-
+    // clipping-system.md` Task 7.3 for the canonical pipeline string;
+    // a future polish pass can replace this fallback in place.
+    let preview_btn = gtk::Button::builder()
+        .label("Preview")
+        .tooltip_text(
+            "Opens the original clip in your default video player. \
+             Slider adjustments apply to Export only.",
+        )
+        .build();
+    {
+        let path_for_preview = clip_path.to_path_buf();
+        preview_btn.connect_clicked(move |_| {
+            if let Err(e) = Command::new("xdg-open")
+                .arg(&path_for_preview)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                log::warn!(
+                    "remix preview: xdg-open failed for {}: {e}",
+                    path_for_preview.display()
+                );
+            }
+        });
+    }
+
+    // Export button — wired in Task 7.4.
     let export_btn = gtk::Button::builder()
         .label("Export")
         .css_classes(["suggested-action"])
@@ -178,7 +217,6 @@ pub fn build_remix_panel(
     action_bar.append(&preview_btn);
     action_bar.append(&export_btn);
     root.append(&action_bar);
-    let _ = clip_path; // referenced by Tasks 7.3 / 7.4 wiring.
 
     RemixPanel { root, state }
 }
