@@ -399,8 +399,28 @@ pub fn run(start_hidden: bool) {
                         glib::spawn_future_local(async move {
                             match crate::clips::portal::pick_screencast_source().await {
                                 Ok(token) => {
+                                    if token.is_empty() {
+                                        // Portal succeeded but returned no
+                                        // persistent token. Surface as a
+                                        // try-again rather than saving an
+                                        // empty token (which would later
+                                        // round-trip to "no token" and
+                                        // re-trigger the picker anyway).
+                                        log::warn!(
+                                            "portal returned empty restore token; \
+                                             treating as try-again"
+                                        );
+                                        clips_page.wizard.screen_picked_label.set_visible(true);
+                                        clips_page.wizard.screen_picked_label.set_label(
+                                            "Picker returned no persistent token \
+                                             — try again.",
+                                        );
+                                        clips_page.wizard.screen_next_btn.set_sensitive(false);
+                                        return;
+                                    }
                                     if let Err(e) = crate::clips::portal::save_token(&token) {
                                         log::warn!("save_token failed: {e}");
+                                        return;
                                     }
                                     // Notify BufferController. Looked up at
                                     // call time so a recreated backend
