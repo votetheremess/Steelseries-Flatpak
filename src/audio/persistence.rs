@@ -284,12 +284,20 @@ pub fn clear_saved() -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 const MIXER_ROUTING_FILE: &str = "mixer_routing.txt";
+const VOLUMES_FILE: &str = "volumes.txt";
 
 fn mixer_routing_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
     Some(base.join(CONFIG_DIR).join(MIXER_ROUTING_FILE))
+}
+
+fn volumes_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join(CONFIG_DIR).join(VOLUMES_FILE))
 }
 
 /// Load saved mixer routing: channel_name → device_name.
@@ -332,5 +340,63 @@ pub fn save_mixer_routing_entry(channel: &str, device: &str) {
 
     if let Err(e) = fs::write(&path, content) {
         log::warn!("Failed to save mixer routing: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Volume persistence for virtual sinks + mic source
+// ---------------------------------------------------------------------------
+//
+// Our 4 virtual sinks + mic source are destroyed and recreated on every app
+// launch (VirtualSinks::create), so PipeWire's own state store doesn't carry
+// their volumes across restarts. We save them ourselves.
+//
+// NOT saved on purpose:
+//   - Game / Chat — volumes are set by the ChatMix HID dial every event;
+//     saving user-slider values would create a confusing override vs the dial.
+//   - Master — that's the physical headset sink; its volume is managed by
+//     PipeWire's own state persistence (WirePlumber), no need to duplicate.
+
+/// Load saved volumes: PipeWire node name → volume percent (0..=100).
+pub fn load_volumes() -> HashMap<String, u32> {
+    let Some(path) = volumes_path() else {
+        return HashMap::new();
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let channel = parts.next()?.to_string();
+            let pct: u32 = parts.next()?.trim().parse().ok()?;
+            Some((channel, pct.min(100)))
+        })
+        .collect()
+}
+
+/// Save a single volume entry (merge with existing file). `channel` is the
+/// PipeWire node name (e.g. `SteelSeries_Music`, `SteelSeries_Mic`).
+pub fn save_volume_entry(channel: &str, volume_percent: u32) {
+    let Some(path) = volumes_path() else {
+        log::warn!("Could not determine volumes path");
+        return;
+    };
+
+    let mut volumes = load_volumes();
+    volumes.insert(channel.to_string(), volume_percent.min(100));
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let content: String = volumes
+        .iter()
+        .map(|(ch, v)| format!("{ch}\t{v}\n"))
+        .collect();
+
+    if let Err(e) = fs::write(&path, content) {
+        log::warn!("Failed to save volumes: {e}");
     }
 }

@@ -136,17 +136,12 @@ pub fn build_eq_page(
         .build();
     tab_box.add_css_class("linked");
 
-    let mut first_sink_tab = true;
     for &target in EqTarget::ALL {
         let btn = gtk::ToggleButton::builder()
             .label(target.label())
             .build();
 
         btn.set_group(Some(&mixer_btn));
-        if first_sink_tab {
-            btn.set_active(true);
-            first_sink_tab = false;
-        }
 
         {
             let state = state.clone();
@@ -343,6 +338,12 @@ pub fn build_eq_page(
     *content_stack_ref.borrow_mut() = Some(content_stack.clone());
 
     page.append(&content_stack);
+
+    // Default to the Mixer tab on first entry to the EQ page. Activating the
+    // button here (after all refs are populated) fires its toggle handler
+    // which flips the content stack to the mixer view and hides the EQ /
+    // spatial controls.
+    mixer_btn.set_active(true);
 
     (page.upcast(), Some(mixer_widgets))
 }

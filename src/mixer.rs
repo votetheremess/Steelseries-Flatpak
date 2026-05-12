@@ -203,6 +203,17 @@ fn build_channel_strip(
                 } else {
                     sinks::set_sink_volume(name, pct).ok();
                 }
+                // Persist only for channels whose volume isn't already owned
+                // elsewhere: Game/Chat are driven by the ChatMix HID dial, and
+                // Master is the physical headset (PipeWire/WirePlumber persists
+                // that natively). Music, Aux, and Mic get wiped every launch
+                // when we recreate the virtual sinks, so we save them here.
+                if name == sinks::MUSIC_SINK_NAME
+                    || name == sinks::AUX_SINK_NAME
+                    || name == sinks::MIC_SOURCE_NAME
+                {
+                    persistence::save_volume_entry(name, pct);
+                }
             }
         });
     }

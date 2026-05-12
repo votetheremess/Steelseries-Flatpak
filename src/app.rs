@@ -300,6 +300,21 @@ fn init_pipeline() -> Result<AppResources, String> {
     log::info!("Creating virtual ChatMix sinks...");
     let sinks = VirtualSinks::create()?;
 
+    // Restore user-set volumes for Music/Aux/Mic — those sinks get recreated
+    // above so their volumes reset to default every launch. Do this BEFORE
+    // loading the EQ filter-chains so the filter-chains see the right levels.
+    for (name, pct) in persistence::load_volumes() {
+        let result = if name == sinks::MIC_SOURCE_NAME {
+            sinks::set_source_volume(&name, pct)
+        } else {
+            sinks::set_sink_volume(&name, pct)
+        };
+        match result {
+            Ok(()) => log::info!("Restored volume: {name} = {pct}%"),
+            Err(e) => log::warn!("Failed to restore volume for {name}: {e}"),
+        }
+    }
+
     log::info!("Setting up audio routing...");
     let router = AudioRouter::create(&headset_sink)?;
 
