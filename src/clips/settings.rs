@@ -55,6 +55,12 @@ pub struct ClipSettings {
     /// wizard (i.e., picked a screen). Page 3 is optional and does not flip
     /// this flag.
     pub onboarding_complete: bool,
+    /// Last-known display string for the save-clip hotkey, as reported by the
+    /// portal's `list_shortcuts` after a successful `bind_shortcuts`. Defaults
+    /// to "ALT+S" (matching `suggested_bindings`) until the first bind
+    /// completes. Used by the dashboard Clips section to label the hotkey
+    /// hint without forcing a portal round-trip on every refresh.
+    pub save_hotkey_display: String,
 }
 
 impl Default for ClipSettings {
@@ -70,6 +76,7 @@ impl Default for ClipSettings {
                 .join("Videos/Clips"),
             disk_cap_gb: None,
             onboarding_complete: false,
+            save_hotkey_display: "ALT+S".to_string(),
         }
     }
 }
@@ -104,6 +111,7 @@ pub fn load() -> ClipSettings {
             "storage_path" => s.storage_path = PathBuf::from(v),
             "disk_cap_gb" => s.disk_cap_gb = v.parse().ok(),
             "onboarding_complete" => s.onboarding_complete = v == "1",
+            "save_hotkey_display" => s.save_hotkey_display = v.to_string(),
             _ => {}
         }
     }
@@ -137,6 +145,7 @@ pub fn save(s: &ClipSettings) -> std::io::Result<()> {
         "onboarding_complete={}\n",
         if s.onboarding_complete { 1 } else { 0 }
     ));
+    body.push_str(&format!("save_hotkey_display={}\n", s.save_hotkey_display));
     std::fs::write(path, body)
 }
 
