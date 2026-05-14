@@ -333,14 +333,10 @@ pub fn reconcile_stream_state(
             Ok(()) => log::info!("Auto-routed stream {id} → {target}"),
             Err(e) => {
                 log::warn!("Auto-route {id} → {target} failed: {e}");
-                // Roll back: use the pre-move sink from self_move_pre_sink
-                // (where the Vacant branch stashed it) so the next tick treats
-                // this as stable, not as a phantom user move.
-                let rollback = self_move_pre_sink
-                    .get(&id)
-                    .map(|(s, _)| s.clone())
-                    .unwrap_or_else(|| target.clone());
-                tracked.insert(id, rollback);
+                // Drop both maps' entries for this id. Next tick will treat it as
+                // Vacant and either retry the move or accept the stream where it
+                // ended up. Simpler and safer than guessing the rollback target.
+                tracked.remove(&id);
                 self_move_pre_sink.remove(&id);
             }
         }
