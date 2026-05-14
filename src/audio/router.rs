@@ -117,10 +117,24 @@ impl AudioRouter {
         // re-attach via stable IDs after a hotplug — handled by
         // check_mic_hotplug). `saved_routing` no longer contains a "mic" key.
         let preferred_mic = super::persistence::load_mixer_routing_mic();
-        let mic_source = preferred_mic
-            .as_ref()
-            .map(|p| p.node_name.clone())
-            .or_else(|| find_headset_source().ok());
+        let mic_source = {
+            let preferred_node = preferred_mic.as_ref().map(|p| p.node_name.clone());
+            match preferred_node {
+                Some(node) => {
+                    // If the preferred device is online, use it. Otherwise fall through
+                    // to the headset mic — the hotplug check will reattach when the
+                    // preferred device appears.
+                    let available = super::sinks::list_physical_sources();
+                    if available.iter().any(|(name, ..)| name == &node) {
+                        Some(node)
+                    } else {
+                        log::info!("Preferred mic {node} not online at startup; falling back to headset mic");
+                        find_headset_source().ok()
+                    }
+                }
+                None => find_headset_source().ok(),
+            }
+        };
 
         let (mic_linked, current_mic_source) = match mic_source.as_deref() {
             Some(source) => match link_mic_source(source) {
