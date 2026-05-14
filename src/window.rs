@@ -489,6 +489,145 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
     (scroll.upcast(), widgets)
 }
 
+// -- Clips section (row 1, full-width) --
+//
+// Sits on its own row beneath the Status / Device cards. Shows the live
+// indicator at the top and a compact action row underneath: Save / Pause
+// buttons on the left, recording-duration + hotkey-hint labels on the right.
+// Owned by `Widgets.clips_section` so the action handler in app.rs and the
+// backend-event poll can both refresh it in lockstep with state changes.
+
+pub struct ClipsSectionWidgets {
+    pub indicator: crate::clips::StatusIndicator,
+    pub save_button: gtk::Button,
+    pub pause_button: gtk::Button,
+    pub duration_label: gtk::Label,
+    pub hotkey_label: gtk::Label,
+}
+
+impl ClipsSectionWidgets {
+    /// Refresh the pause button (label + sensitivity), the duration hint,
+    /// and the hotkey hint. The indicator itself updates via the separate
+    /// `set_clips_state` path so the action handler doesn't need a game
+    /// name to call refresh.
+    pub fn refresh(
+        &self,
+        buffer_state: crate::clips::buffer::BufferState,
+        user_paused: bool,
+        settings: &crate::clips::settings::ClipSettings,
+    ) {
+        use crate::clips::buffer::BufferState as S;
+        let (base_label, sensitive) = match buffer_state {
+            S::Uninitialized => ("Pause Recording", false),
+            S::Idle | S::Arming | S::Armed => ("Pause Recording", true),
+            S::Saving => ("Pause Recording", false),
+            S::ErrorState => ("Pause Recording", false),
+            S::Paused => ("Resume Recording", true),
+        };
+        // `user_paused` takes precedence on the label: even if the state
+        // briefly says Idle (after a Pause → Resume race), the button copy
+        // tracks intent.
+        let label = if user_paused { "Resume Recording" } else { base_label };
+        self.pause_button.set_label(label);
+        self.pause_button.set_sensitive(sensitive);
+
+        // Duration label — round to the nicest unit at the breakpoints.
+        let secs = settings.buffer_length;
+        let text = if secs < 60 {
+            format!("Recording last {secs} seconds")
+        } else if secs < 3600 {
+            format!("Recording last {} minutes", (secs as f64 / 60.0).round() as u32)
+        } else {
+            format!(
+                "Recording last {} hour{}",
+                secs / 3600,
+                if secs >= 7200 { "s" } else { "" }
+            )
+        };
+        self.duration_label.set_label(&text);
+
+        // Hotkey label — falls back to the suggested default if the portal
+        // hasn't filled in the display string yet.
+        let hk = if settings.save_hotkey_display.is_empty() {
+            "Hotkey: ALT+S".to_string()
+        } else {
+            format!("Hotkey: {}", settings.save_hotkey_display)
+        };
+        self.hotkey_label.set_label(&hk);
+    }
+}
+
+fn build_clips_section() -> (adw::PreferencesGroup, ClipsSectionWidgets) {
+    let group = adw::PreferencesGroup::builder().title("Clips").build();
+
+    // Row 1: status indicator (re-used widget — clones share the underlying
+    // GObject so `set_state` from elsewhere updates the same dot/label).
+    let indicator = crate::clips::build_status_indicator();
+    let indicator_holder = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .halign(gtk::Align::Center)
+        .margin_top(8)
+        .margin_bottom(4)
+        .build();
+    indicator_holder.append(&indicator.root);
+    let row_indicator = gtk::ListBoxRow::builder()
+        .child(&indicator_holder)
+        .activatable(false)
+        .selectable(false)
+        .build();
+    group.add(&row_indicator);
+
+    // Row 2: action row — Save / Pause buttons on the left, duration +
+    // hotkey hints on the right.
+    let action_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_start(15)
+        .margin_end(15)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+
+    let save_button = gtk::Button::builder().label("Save Clip Now").build();
+    save_button.add_css_class("suggested-action");
+    save_button.set_action_name(Some("app.save-clip"));
+    action_box.append(&save_button);
+
+    let pause_button = gtk::Button::builder().label("Pause Recording").build();
+    pause_button.set_action_name(Some("app.pause-recording-toggle"));
+    pause_button.set_tooltip_text(Some(
+        "Pause recording. The last N seconds of recording will be lost.",
+    ));
+    action_box.append(&pause_button);
+
+    let spacer = gtk::Box::builder().hexpand(true).build();
+    action_box.append(&spacer);
+
+    let duration_label = gtk::Label::builder().label("Recording last 60 seconds").build();
+    duration_label.add_css_class("dim-label");
+    action_box.append(&duration_label);
+
+    let hotkey_label = gtk::Label::builder().label("Hotkey: ALT+S").build();
+    hotkey_label.add_css_class("dim-label");
+    action_box.append(&hotkey_label);
+
+    let row_action = gtk::ListBoxRow::builder()
+        .child(&action_box)
+        .activatable(false)
+        .selectable(false)
+        .build();
+    group.add(&row_action);
+
+    let widgets = ClipsSectionWidgets {
+        indicator,
+        save_button,
+        pause_button,
+        duration_label,
+        hotkey_label,
+    };
+    (group, widgets)
+}
+
 // -- Status card (battery + chatmix + clip indicator) --
 
 struct StatusResult {
