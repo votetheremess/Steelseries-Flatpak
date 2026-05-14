@@ -1644,10 +1644,16 @@ fn create_pw_node_with_volume(
 
     // Existing props string composition continues, with channel_volumes_section
     // appended inside the `props = { ... }` block.
+    // IMPORTANT: include all existing props the original create_pw_node sets,
+    // most critically `object.linger=true` which makes the node persist
+    // beyond the pw-cli client session. Without it, the virtual sinks vanish
+    // when pw-cli exits and the entire pipeline collapses.
     let props = format!(
-        "node.name={name} node.description=\"{description}\" \
+        "factory.name=support.null-audio-sink \
+         node.name={name} node.description=\"{description}\" \
          media.class={media_class} audio.position=[{position}] \
-         monitor.channel-volumes=true monitor.passthrough=true{channel_volumes_section}",
+         monitor.channel-volumes=true monitor.passthrough=true \
+         object.linger=true{channel_volumes_section}",
     );
 
     let output = Command::new("pw-cli")
@@ -1676,7 +1682,15 @@ In `src/app.rs` region 3, the apply-volumes loop added in Task A9 is now redunda
 distrobox enter fedora-dev -- bash -c 'cd /var/home/admin/Documents/Code/SteelseriesFlatpak-routing-volume && cargo build 2>&1 | tail -5 && cargo test 2>&1 | tail -10'
 ```
 
-Expected: clean. Then run `pactl set-source-volume SteelSeries_Mic 70%` in the live app, quit, relaunch, and confirm `pactl get-source-volume SteelSeries_Mic` returns 70%. If still wrong, this code path is itself buggy — escalate to team lead.
+Expected: clean. **Critical sanity-check**: PipeWire's adapter factory accepts node-property and stream-property keys, but `channelVolumes` is a SPA_PROP and may be silently ignored when passed as a node-creation factory property. Run the live app, then in another shell:
+
+```bash
+pw-cli i <node-id-of-SteelSeries_Mic> | grep -i volume
+```
+
+If `channelVolumes` is missing or all zeros, the H_B fallback is itself broken — switch to a two-step approach: create the node without channelVolumes (the existing create_pw_node), then immediately after, run `pw-cli s <node-id> Props '{ channelVolumes: [linear, linear] }'` from Rust via Command::new. This requires capturing the node-id from `pw-cli create-node` output. If both approaches fail, escalate to team lead.
+
+Otherwise (volume honored): `pactl set-source-volume SteelSeries_Mic 70%` in the live app, quit, relaunch, and confirm `pactl get-source-volume SteelSeries_Mic` returns 70%.
 
 - [ ] **Step 5: Commit**
 
@@ -1782,6 +1796,29 @@ fn maybe_arm_respects_user_paused() {
     bc.user_paused_set(false);
     assert!(bc.should_arm(), "should_arm reflects always_armed when not paused");
 }
+
+#[test]
+fn resume_when_always_armed_re_arms_immediately() {
+    use std::sync::mpsc::channel;
+    let (tx, rx) = channel();
+    let mut bc = BufferController::new(CaptureConfig::default());
+    bc.has_portal_pick = true;
+    bc.always_armed = true;
+    bc.pause();
+    assert_eq!(bc.state(), BufferState::Paused);
+    bc.resume(&tx);
+    assert_eq!(bc.state(), BufferState::Arming, "resume must re-evaluate maybe_arm");
+    assert!(matches!(rx.try_recv(), Ok(ClipCommand::StartReplay { .. })));
+}
+
+#[test]
+fn pause_from_uninitialized_is_a_noop() {
+    let mut bc = BufferController::new(CaptureConfig::default());
+    // has_portal_pick = false → state stays Uninitialized
+    bc.pause();
+    assert_eq!(bc.state(), BufferState::Uninitialized, "pause must not strand the user");
+    assert!(!bc.user_paused());
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1825,14 +1862,25 @@ pub fn user_paused_set(&mut self, v: bool) {
 }
 
 pub fn pause(&mut self) {
+    // Guard: pausing from Uninitialized / ErrorState would strand the user.
+    // The button is insensitive in those states (per B6 refresh), but the
+    // GAction can still be activated via D-Bus; guard defensively.
+    if matches!(self.state, BufferState::Uninitialized | BufferState::ErrorState) {
+        return;
+    }
     self.user_paused = true;
     self.pending_reconfigure = false;
     self.state = BufferState::Paused;
 }
 
-pub fn resume(&mut self) {
+pub fn resume(&mut self, cmd_tx: &Sender<ClipCommand>) {
     self.user_paused = false;
     self.state = BufferState::Idle;
+    // Re-evaluate the arm conditions. If a game is already running and
+    // auto_arm (or always_armed) is on, we want to transition straight to
+    // Arming rather than wait for the next on_game_started event — which
+    // may never come because the detector only fires on transitions.
+    self.maybe_arm(cmd_tx);
 }
 
 pub fn should_arm(&self) -> bool {
@@ -2000,13 +2048,14 @@ Around `hotkey.rs:130`.
 
 - [ ] **Step 2: Add the list_shortcuts read-back after a successful bind**
 
-After the `proxy.bind_shortcuts(&session, &shortcuts, identifier.as_ref()).await?;` line, add:
+After the `bind_result?;` line at `src/clips/hotkey.rs:137` (where the existing `bindings` variable is bound and `bind_result` consumed), add:
 
 ```rust
 // Read back the portal's display string for the bound chord and persist.
-match proxy.list_shortcuts(&session).await {
-    Ok(req) => {
-        if let Ok(resp) = req.response() {
+use ashpd::desktop::global_shortcuts::ListShortcutsOptions;
+match proxy.list_shortcuts(&session, ListShortcutsOptions::default()).await {
+    Ok(req) => match req.response() {
+        Ok(resp) => {
             if let Some(s) = resp.shortcuts().iter().find(|s| s.id() == "save-clip") {
                 let display = s.trigger_description().to_string();
                 if let Some(cell) = settings_cell.as_ref() {
@@ -2015,10 +2064,13 @@ match proxy.list_shortcuts(&session).await {
                 }
             }
         }
-    }
-    Err(e) => log::warn!("list_shortcuts after bind failed: {e}"),
+        Err(e) => log::warn!("list_shortcuts response decode failed: {e}"),
+    },
+    Err(e) => log::warn!("list_shortcuts call failed: {e}"),
 }
 ```
+
+`list_shortcuts` in ashpd 0.11.1 requires both `session: &Session<Self>` and `options: ListShortcutsOptions` arguments. The default `ListShortcutsOptions` has no required fields. Variable naming in the existing code uses `bindings` for the `Vec<NewShortcut>` argument passed to `bind_shortcuts`; that's separate from the per-`Shortcut` items returned by `list_shortcuts`.
 
 The `settings_cell: Option<Rc<RefCell<ClipSettings>>>` must be threaded into `run_global_shortcuts` (around `src/clips/hotkey.rs:114`) and `rebind_shortcuts` (likewise). Update their callers in `src/app.rs:1017` and `src/app.rs:1107` — both are within Implementer B's **second declared `app.rs` region** (see "Coordination point" below). Pass `Some(settings_cell.clone())` where `settings_cell` is the same `Rc<RefCell<ClipSettings>>` the existing `clips_settings_ctx_partial` already carries.
 
@@ -2218,7 +2270,7 @@ pub struct Widgets {
 }
 ```
 
-Source `clips_indicator: clips_section_widgets.indicator.clone()` (or a shared `Rc` — Implementer B picks). Initialize as `clips_section: Some(clips_section_widgets)` in `build_dashboard_page`'s return.
+Source `clips_indicator: clips_section_widgets.indicator.clone()`. The `StatusIndicator` is `#[derive(Clone)]` (verified at `src/clips/indicator.rs:35`) with all fields being GObject refs (`gtk::Widget`, `gtk::Label`, `gtk::Image`, `gtk::Button`) — Clone is reference-clone via the underlying GObject refcount, so the cloned indicator and the one in `ClipsSectionWidgets` share the same widget tree. Mutating one (via `set_state`) updates both. Initialize as `clips_section: Some(clips_section_widgets)` in `build_dashboard_page`'s return.
 
 Add a public accessor on `ChatMixWindow`:
 
@@ -2288,7 +2340,11 @@ Insert after the `app.add_action_entries([save_action]);` for `save-clip`:
                 buffer.borrow_mut().pause();
                 let _ = cmd_tx.send(crate::clips::ClipCommand::PauseRecording);
             } else {
-                buffer.borrow_mut().resume();
+                buffer.borrow_mut().resume(&cmd_tx);
+                // resume() may have already sent StartReplay via maybe_arm;
+                // additionally send ResumeRecording to clear the supervisor's
+                // restart-attempts limiter so a long-paused state doesn't
+                // count against the rolling window.
                 let _ = cmd_tx.send(crate::clips::ClipCommand::ResumeRecording);
             }
             // Refresh the clips section UI via the public accessor on ChatMixWindow.
