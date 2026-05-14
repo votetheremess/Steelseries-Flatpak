@@ -1002,19 +1002,26 @@ pub fn run(start_hidden: bool) {
             // Existing activations from the startup session keep flowing.
             {
                 let win_for_rebind = window.clone();
+                let settings_for_rebind = clip_settings.clone();
                 let rebind_action = gtk::gio::ActionEntry::builder("rebind-clip-hotkey")
                     .activate(move |_app: &adw::Application, _action, _param| {
                         // The activate handler is `Fn`, so we have to
                         // clone per-call. Cheap (Rc + GObject ref bumps).
                         let win_for_async = win_for_rebind.clone();
                         let parent = win_for_rebind.window.clone();
+                        let settings_for_async = settings_for_rebind.clone();
                         glib::MainContext::default().spawn_local(async move {
                             // Pass the parent window so the portal can
                             // resolve our app id from xdg-foreign. Without
                             // this, KDE's portal returns NotAllowed when
                             // we're running outside a Flatpak (the
                             // standard dev-mode launch).
-                            match crate::clips::hotkey::rebind_shortcuts(Some(&parent)).await {
+                            match crate::clips::hotkey::rebind_shortcuts(
+                                Some(&parent),
+                                Some(settings_for_async),
+                            )
+                            .await
+                            {
                                 Ok(()) => {}
                                 Err(e) => {
                                     let msg = e.to_string();
@@ -1076,6 +1083,7 @@ pub fn run(start_hidden: bool) {
             {
                 let app_for_hotkey = app.clone();
                 let parent_for_hotkey = window.window.clone();
+                let settings_for_hotkey = clip_settings.clone();
                 glib::MainContext::default().spawn_local(async move {
                     // Construct the AppID from the existing constant. The
                     // unwrap is justified: APP_ID is a compile-time literal
@@ -1119,6 +1127,7 @@ pub fn run(start_hidden: bool) {
                             };
                             app_for_cb.activate_action(action_name, None);
                         },
+                        Some(settings_for_hotkey),
                     )
                     .await;
                     if let Err(e) = result {

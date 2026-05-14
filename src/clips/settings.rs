@@ -326,12 +326,13 @@ pub fn build_clips_group(
     // ------------------------------------------------------------------
     // Hotkey row (current binding + Rebind button).
     //
-    // The actual binding is owned by KDE's GlobalShortcuts portal; we don't
-    // know the user's current chord at runtime (ashpd 0.10 has no
-    // `list_shortcuts` API). We display the suggested default — which is
-    // also what KDE persists if the user just clicks "Save" in the bind
-    // dialog without changes — and let the Rebind button re-open the
-    // portal picker if they want to switch chords.
+    // The actual binding is owned by KDE's GlobalShortcuts portal. ashpd
+    // 0.11.1 exposes `list_shortcuts`, which we call after `bind_shortcuts`
+    // to persist the portal's display string into `save_hotkey_display`
+    // (used by the dashboard Clips section's hotkey hint).
+    // `ConfigureShortcuts` is still a portal-level API not available, so
+    // the Rebind button re-opens the picker by firing a fresh bind
+    // request.
     // ------------------------------------------------------------------
     let hotkey_row = adw::ActionRow::builder()
         .title("Hotkey")

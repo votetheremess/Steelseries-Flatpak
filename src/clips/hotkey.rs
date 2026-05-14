@@ -11,10 +11,15 @@
 //! callers spawn this on `glib::MainContext::default().spawn_local(...)`
 //! at app startup so the future runs forever and the bindings stay alive.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use ashpd::WindowIdentifier;
 use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
 use futures_util::StreamExt;
 use gtk::prelude::IsA;
+
+use crate::clips::settings::ClipSettings;
 
 /// Suggested shortcut bindings.
 ///
@@ -55,11 +60,20 @@ pub fn suggested_bindings() -> Vec<NewShortcut> {
 /// possible; `None` is accepted but expected to fail on host-installed
 /// builds.
 ///
+/// `settings_cell` is the shared in-memory settings cell. When provided,
+/// `list_shortcuts` is called after a successful bind and the portal's
+/// reported `trigger_description` for the `save-clip` chord is persisted
+/// to `save_hotkey_display`, so the dashboard Clips section can label the
+/// hotkey hint without a portal round-trip on every refresh. Callers that
+/// don't care about the display string (or don't have a settings cell
+/// handy) pass `None`.
+///
 /// Returns when the portal session ends (which usually means the portal
 /// daemon died — caller may want to log or surface this).
 pub async fn run_global_shortcuts<F>(
     parent: Option<&impl IsA<gtk::Native>>,
     mut on_shortcut: F,
+    settings_cell: Option<Rc<RefCell<ClipSettings>>>,
 ) -> ashpd::Result<()>
 where
     F: FnMut(&str) + 'static,
@@ -74,6 +88,12 @@ where
     proxy
         .bind_shortcuts(&session, &suggested_bindings(), identifier.as_ref())
         .await?;
+
+    // Read back the portal's display string for the bound `save-clip` chord
+    // and persist. ashpd 0.11.1's `list_shortcuts` takes a single session
+    // argument; ListShortcutsOptions is private to the crate.
+    persist_save_hotkey_display(&proxy, &session, settings_cell.as_ref()).await;
+
     let mut stream = proxy.receive_activated().await?;
     while let Some(activation) = stream.next().await {
         on_shortcut(activation.shortcut_id());
@@ -82,11 +102,12 @@ where
 }
 
 /// Re-open the binding dialog by creating a fresh session and re-binding
-/// the suggested shortcuts. ashpd 0.10 doesn't expose the (proposed) portal
-/// `ConfigureShortcuts` method directly, so the practical workaround is to
-/// drive a new bind: KDE's portal will redisplay its picker when the
-/// shortcut IDs are already taken or when the user has not yet confirmed
-/// them, giving the user a path to change the chord.
+/// the suggested shortcuts. ashpd 0.11.1 exposes `list_shortcuts`;
+/// `ConfigureShortcuts` is still a portal-level API not available. The
+/// practical workaround for "open the picker again" is to drive a fresh
+/// bind: KDE's portal redisplays its picker when the shortcut IDs are
+/// already taken or when the user has not yet confirmed them, giving the
+/// user a path to change the chord.
 ///
 /// `parent` is the window the portal dialog should be modal to. When
 /// running OUTSIDE a Flatpak sandbox, the portal needs the parent window
@@ -101,9 +122,12 @@ where
 /// This is fire-and-forget — the existing `run_global_shortcuts` listener
 /// from the original session keeps running and continues receiving
 /// activations. If the user picks a different chord, the portal updates
-/// the binding under the same session.
+/// the binding under the same session. The new chord's display string is
+/// re-read here via `list_shortcuts` and pushed to `settings_cell` so the
+/// dashboard hint updates without waiting for an app restart.
 pub async fn rebind_shortcuts(
     parent: Option<&impl IsA<gtk::Native>>,
+    settings_cell: Option<Rc<RefCell<ClipSettings>>>,
 ) -> ashpd::Result<()> {
     let proxy = GlobalShortcuts::new().await?;
     let session = proxy.create_session().await?;
@@ -115,5 +139,33 @@ pub async fn rebind_shortcuts(
     proxy
         .bind_shortcuts(&session, &suggested_bindings(), identifier.as_ref())
         .await?;
+    persist_save_hotkey_display(&proxy, &session, settings_cell.as_ref()).await;
     Ok(())
+}
+
+/// Read the portal's `list_shortcuts` for the `save-clip` chord and persist
+/// the user-visible trigger description to `ClipSettings::save_hotkey_display`.
+/// Errors are logged at warn level; a failed read leaves the existing setting
+/// in place rather than overwriting with a guess.
+async fn persist_save_hotkey_display(
+    proxy: &GlobalShortcuts<'_>,
+    session: &ashpd::desktop::Session<'_, GlobalShortcuts<'_>>,
+    settings_cell: Option<&Rc<RefCell<ClipSettings>>>,
+) {
+    let Some(cell) = settings_cell else { return };
+    match proxy.list_shortcuts(session).await {
+        Ok(req) => match req.response() {
+            Ok(resp) => {
+                if let Some(s) = resp.shortcuts().iter().find(|s| s.id() == "save-clip") {
+                    let display = s.trigger_description().to_string();
+                    cell.borrow_mut().save_hotkey_display = display;
+                    if let Err(e) = crate::clips::settings::save(&cell.borrow()) {
+                        log::warn!("save_hotkey_display persist failed: {e}");
+                    }
+                }
+            }
+            Err(e) => log::warn!("list_shortcuts response decode failed: {e}"),
+        },
+        Err(e) => log::warn!("list_shortcuts call failed: {e}"),
+    }
 }
