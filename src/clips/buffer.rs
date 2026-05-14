@@ -19,6 +19,10 @@ pub enum BufferState {
     Saving,
     /// Backend reported error/death; user must retry.
     ErrorState,
+    /// User-initiated stop; buffer is lost. The current rolling N-second
+    /// clip is discarded when GSR receives SIGINT — there is no flush.
+    /// Resume returns to Idle and re-evaluates the arm conditions.
+    Paused,
 }
 
 pub struct BufferController {
@@ -35,6 +39,8 @@ pub struct BufferController {
     pub has_portal_pick: bool,
     /// If a config change arrived while saving, hold it and flush when `Saving → Armed`.
     pending_reconfigure: bool,
+    /// User pressed Pause; suppresses auto-arm/always-armed until Resume.
+    user_paused: bool,
 }
 
 impl BufferController {
@@ -47,6 +53,7 @@ impl BufferController {
             current_game: None,
             has_portal_pick: false,
             pending_reconfigure: false,
+            user_paused: false,
         }
     }
 
@@ -196,17 +203,81 @@ impl BufferController {
     }
 
     fn maybe_arm(&mut self, cmd_tx: &Sender<ClipCommand>) {
-        if !self.has_portal_pick {
-            return;
-        }
         if !matches!(self.state, BufferState::Idle) {
             return;
         }
-        let should_arm = self.always_armed || (self.auto_arm && self.current_game.is_some());
-        if should_arm {
-            let _ = cmd_tx.send(ClipCommand::StartReplay { config: self.config.clone() });
-            self.state = BufferState::Arming;
+        if !self.should_arm() {
+            return;
         }
+        let _ = cmd_tx.send(ClipCommand::StartReplay { config: self.config.clone() });
+        self.state = BufferState::Arming;
+    }
+
+    /// True if the buffer should be armed given the current toggles + portal
+    /// state. Used by `maybe_arm` (which gates the transition Idle → Arming)
+    /// and exposed for the Pause button's UI logic.
+    ///
+    /// `user_paused` is a hard gate: even when `always_armed` is on, an
+    /// explicit user pause must suppress arming until they resume.
+    pub fn should_arm(&self) -> bool {
+        if !self.has_portal_pick {
+            return false;
+        }
+        if self.user_paused {
+            return false;
+        }
+        self.always_armed || (self.auto_arm && self.current_game.is_some())
+    }
+
+    /// User pressed Pause from the dashboard. Tear down the active replay
+    /// session and remember the intent so re-arms are suppressed until the
+    /// user explicitly resumes.
+    ///
+    /// Guard: pausing from Uninitialized / ErrorState would strand the user
+    /// (no way back from Paused → those states via Resume). The dashboard
+    /// button is insensitive in those states, but the GAction can still be
+    /// activated via D-Bus; guard defensively here.
+    pub fn pause(&mut self) {
+        if matches!(self.state, BufferState::Uninitialized | BufferState::ErrorState) {
+            return;
+        }
+        self.user_paused = true;
+        // Drop any pending reconfigure: it would apply on the next arm, but
+        // by the time the user resumes the cached config may already be
+        // stale. Forcing a fresh reconfigure on resume keeps the path
+        // simpler.
+        self.pending_reconfigure = false;
+        self.state = BufferState::Paused;
+    }
+
+    /// User pressed Resume. Clear the pause flag and re-evaluate arm
+    /// conditions: if a game is running and auto_arm is on, transition
+    /// straight to Arming rather than wait for the next on_game_started
+    /// (which only fires on transitions and may never come).
+    pub fn resume(&mut self, cmd_tx: &Sender<ClipCommand>) {
+        self.user_paused = false;
+        self.state = BufferState::Idle;
+        self.maybe_arm(cmd_tx);
+    }
+
+    /// Read-only accessor for the user-paused flag. The dashboard's Pause
+    /// button uses this to flip its label between "Pause Recording" and
+    /// "Resume Recording".
+    pub fn user_paused(&self) -> bool {
+        self.user_paused
+    }
+
+    /// Direct setter for the user-paused flag. Primarily for tests; runtime
+    /// callers should use `pause()` / `resume()` for the full transition.
+    pub fn user_paused_set(&mut self, v: bool) {
+        self.user_paused = v;
+    }
+
+    /// Testing seam: force a particular state without driving through the
+    /// portal-pick → game-start → Armed sequence. Not for production callers.
+    #[cfg(test)]
+    pub fn set_state_for_test(&mut self, s: BufferState) {
+        self.state = s;
     }
 }
 
@@ -394,5 +465,75 @@ mod tests {
         assert_eq!(b.state(), BufferState::Armed);
         // Reconfigure should have flushed.
         assert!(matches!(rx.try_recv(), Ok(ClipCommand::Reconfigure { .. })));
+    }
+
+    #[test]
+    fn pause_from_armed_transitions_to_paused() {
+        let mut bc = BufferController::new(CaptureConfig::default());
+        bc.has_portal_pick = true;
+        bc.set_state_for_test(BufferState::Armed);
+        assert_eq!(bc.state(), BufferState::Armed);
+        bc.pause();
+        assert_eq!(bc.state(), BufferState::Paused);
+        assert!(bc.user_paused());
+    }
+
+    #[test]
+    fn resume_from_paused_to_idle() {
+        use std::sync::mpsc::channel;
+        let (tx, _rx) = channel();
+        let mut bc = BufferController::new(CaptureConfig::default());
+        bc.has_portal_pick = true;
+        bc.set_state_for_test(BufferState::Idle);  // Move out of Uninitialized
+        bc.pause();
+        assert_eq!(bc.state(), BufferState::Paused);
+        bc.resume(&tx);
+        assert_eq!(bc.state(), BufferState::Idle);
+        assert!(!bc.user_paused());
+    }
+
+    #[test]
+    fn pause_clears_pending_reconfigure() {
+        let mut bc = BufferController::new(CaptureConfig::default());
+        bc.has_portal_pick = true;
+        bc.set_state_for_test(BufferState::Armed);
+        bc.pending_reconfigure = true;
+        bc.pause();
+        assert!(!bc.pending_reconfigure);
+    }
+
+    #[test]
+    fn maybe_arm_respects_user_paused() {
+        let mut bc = BufferController::new(CaptureConfig::default());
+        bc.has_portal_pick = true;
+        bc.always_armed = true;
+        bc.user_paused_set(true);
+        assert!(!bc.should_arm(), "user_paused must suppress always_armed");
+        bc.user_paused_set(false);
+        assert!(bc.should_arm(), "should_arm reflects always_armed when not paused");
+    }
+
+    #[test]
+    fn resume_when_always_armed_re_arms_immediately() {
+        use std::sync::mpsc::channel;
+        let (tx, rx) = channel();
+        let mut bc = BufferController::new(CaptureConfig::default());
+        bc.has_portal_pick = true;
+        bc.always_armed = true;
+        bc.set_state_for_test(BufferState::Idle);  // Move out of Uninitialized
+        bc.pause();
+        assert_eq!(bc.state(), BufferState::Paused);
+        bc.resume(&tx);
+        assert_eq!(bc.state(), BufferState::Arming, "resume must re-evaluate maybe_arm");
+        assert!(matches!(rx.try_recv(), Ok(ClipCommand::StartReplay { .. })));
+    }
+
+    #[test]
+    fn pause_from_uninitialized_is_a_noop() {
+        let mut bc = BufferController::new(CaptureConfig::default());
+        // has_portal_pick = false → state stays Uninitialized
+        bc.pause();
+        assert_eq!(bc.state(), BufferState::Uninitialized, "pause must not strand the user");
+        assert!(!bc.user_paused());
     }
 }

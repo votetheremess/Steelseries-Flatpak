@@ -47,7 +47,7 @@ impl StatusIndicator {
     pub fn set_state(&self, state: BufferState, game: Option<&str>) {
         // Clear all dot color classes before re-applying — the alternative
         // (per-state diff) would be both more code and more bug-prone.
-        for cls in ["dot-armed", "dot-saving", "dot-error", "dot-setup"] {
+        for cls in ["dot-armed", "dot-saving", "dot-error", "dot-setup", "dot-paused"] {
             self.dot.remove_css_class(cls);
         }
         // Retry button is only relevant in ErrorState; hide elsewhere.
@@ -73,6 +73,10 @@ impl StatusIndicator {
             BufferState::ErrorState => {
                 self.dot.add_css_class("dot-error");
                 self.label.set_label("Capture stopped");
+            }
+            BufferState::Paused => {
+                self.dot.add_css_class("dot-paused");
+                self.label.set_label("Paused");
             }
         }
     }
