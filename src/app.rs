@@ -1,5 +1,4 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -12,6 +11,7 @@ use gtk::glib;
 use crate::audio::persistence;
 use crate::audio::router::{self, AudioRouter};
 use crate::audio::sinks::{self, VirtualSinks};
+use crate::audio::state_sync;
 use crate::eq::model::{Band, EqTarget, SpatialState, NUM_BANDS};
 use crate::hid::device::HidWriter;
 use crate::hid::{self, protocol::HidEvent};
@@ -1369,13 +1369,26 @@ pub fn run(start_hidden: bool) {
                 });
             }
 
-            // New-stream watcher: auto-route newly launched apps to saved ChatMix sinks.
-            // Seed with currently-existing IDs so the first tick doesn't re-process them
-            // (the startup restore_assignments() already handled those).
-            let seen_ids: Rc<RefCell<HashSet<u32>>> =
-                Rc::new(RefCell::new(persistence::initial_seen_ids()));
+            // Unified state-sync tick (2 s). Orchestrates three concerns in one
+            // closure on the GTK main thread:
+            //   1. Stream reconciliation — auto-route new streams to saved
+            //      sinks AND observe user-driven moves between managed sinks.
+            //   2. Mic hotplug — if the user's preferred mic just appeared,
+            //      reroute back to it.
+            //   3. Virtual-source volume capture — write through the latest
+            //      Music/Aux/Mic volumes so they survive an app restart.
+            //
+            // See docs/superpowers/specs/2026-05-13-routing-volume-clips-fixes-design.md.
+            let sync_state = Rc::new(RefCell::new(state_sync::StateSyncState::new_seeded()));
+            let sync_state_for_tick = sync_state.clone();
+            let resources_for_tick = resources.clone();
             glib::timeout_add_seconds_local(STREAM_WATCH_SECS, move || {
-                persistence::restore_new_streams(&mut seen_ids.borrow_mut());
+                let mut state = sync_state_for_tick.borrow_mut();
+                if let Some(res) = resources_for_tick.borrow().as_ref() {
+                    if let Some(router) = res.router.borrow_mut().as_mut() {
+                        state_sync::tick(&mut state, router);
+                    }
+                }
                 glib::ControlFlow::Continue
             });
 
