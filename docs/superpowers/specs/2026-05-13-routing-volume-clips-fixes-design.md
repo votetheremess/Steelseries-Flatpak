@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-13
 **Topic:** Four bug + UX fixes — app→sink persistence, mic hotplug, virtual-source volume persistence, Clips home-page section relocation/expansion
-**Status:** Revised draft (revision 3 — addresses QA round-2 + critic round-2 feedback)
+**Status:** Revised draft (revision 4 — addresses critic round-3 feedback; QA round-3 already passing at 91/100)
 **Target branch:** `clipping-system` (worktree `/var/home/admin/Documents/Code/SteelseriesFlatpak-clipping/`)
 **Authoritative bug list:** `knownbugs.txt` (issues 1–3) + user request (issue 4)
 
@@ -74,28 +74,32 @@ All four pieces share one `glib::timeout_add_seconds_local(2, ...)` callback (ma
 
 To minimize `app.rs` co-editing between the two parallel implementers, the tick body lives in a new module — `src/audio/state_sync.rs` — exporting a single orchestrator function:
 
+A `StateSyncState` struct holds the per-tick state. Implementer A may shape it as one struct or as separate maps — either is acceptable; the struct form is preferred for closure-capture cleanliness:
+
 ```rust
-pub fn tick(
-    tracked: &mut HashMap<u32, String>,
-    self_move_pre_sink: &mut HashMap<u32, String>,
-    saved_cache: &mut HashMap<String, String>,
-    last_saved_volumes: &mut HashMap<String, u32>,
-    router: &mut AudioRouter,
-);
+pub struct StateSyncState {
+    pub tracked: HashMap<u32, String>,
+    pub self_move_pre_sink: HashMap<u32, (String, Instant)>,
+    pub last_saved_volumes: HashMap<String, u32>,
+}
+
+pub fn tick(state: &mut StateSyncState, router: &mut AudioRouter);
 ```
 
 Internally `state_sync::tick` calls:
-- `persistence::reconcile_stream_state(tracked, self_move_pre_sink, saved_cache)` — Issue 1.
+- `persistence::reconcile_stream_state(&mut state.tracked, &mut state.self_move_pre_sink)` — Issue 1. `reconcile_stream_state` lives in `persistence.rs` to keep `list_sink_inputs`/`list_sinks_by_id` private (`pub(crate)` not needed). Internal helper to that module.
 - `router.check_mic_hotplug()` — Issue 2 (router calls its own internal helper using its cached `preferred_mic`).
-- `state_sync::capture_virtual_volumes(last_saved_volumes)` — Issue 3 (private to the module).
+- `state_sync::capture_virtual_volumes(&mut state.last_saved_volumes)` — Issue 3 (private function in this module).
 
-`app.rs`'s `connect_activate` closure registers the timer with a one-liner closure that calls `state_sync::tick(...)`. Implementer A owns `state_sync.rs` in full; Implementer B does not touch it. Implementer B's only `app.rs` change is registering one new GAction (`pause-recording-toggle`), discussed below.
+`app.rs`'s `connect_activate` closure registers the timer with a one-liner closure that captures one `Rc<RefCell<StateSyncState>>` and the `Rc<RefCell<Option<AudioRouter>>>` already in scope, calling `state_sync::tick(...)`. Implementer A owns `state_sync.rs` in full; Implementer B does not touch it. Implementer B's only `app.rs` change is registering one new GAction (`pause-recording-toggle`), discussed below.
 
 #### Shutdown capture (Issue 3, finale)
 
 In `app.connect_shutdown`, immediately before dropping `AppResources` (which destroys the sinks via `VirtualSinks::drop`), iterate the three virtual targets, query each volume, and write through `persistence::save_volume_entry`. This catches the user's final state at quit time — important because the periodic poll only fires every 2 seconds, and a fast change-then-quit could miss the periodic window.
 
-The existing `persistence::save_assignments()` call at shutdown **stays**, with a doc-comment justifying why: it captures any sink-input that the periodic tick missed (a stream that briefly existed within a single 2-second window — typically a notification chime). Removing it is a separate, safer change for a future cleanup pass.
+The existing `persistence::save_assignments()` call at shutdown **stays** but with one change to align with the new monotonic rule: its inner logic at `persistence.rs:109-115` currently `assignments.remove(&input.app_name)` when a stream's current sink is unmanaged. **That removal is removed.** Both paths (periodic tick + shutdown save) now agree: managed→managed updates the entry, anything else is silently ignored. This eliminates the "monotonic in tick, destructive at shutdown" inconsistency the critic flagged.
+
+The shutdown call captures any sink-input that briefly existed within a single 2-second window (e.g. notification chimes), then quits cleanly.
 
 ### Issue 4: Clips section relocation + expansion + terminology
 
@@ -135,7 +139,7 @@ ClipCommand::ResumeRecording,  // backend: clear user-paused, drive normal arm p
 
 Two variants instead of one `SetRecordingEnabled(bool)` keep the supervisor's match arms small and self-documenting. Both clear `restart_attempts` per above.
 
-The supervisor's `run_backend` command loop gains two new arms:
+The supervisor's `run_backend` command loop gains two new arms. Match the existing convention used by `StartReplay` at `backend.rs:1063` and the existing Stop/save arms at `backend.rs:1077-1096` (both clear `restart_attempts` on entry):
 
 ```rust
 Ok(ClipCommand::PauseRecording) => {
@@ -153,6 +157,8 @@ Ok(ClipCommand::ResumeRecording) => {
 ```
 
 `BufferController` flips `user_paused` on the GTK main thread (the BufferController already lives there), and re-applies arm logic from its existing tick.
+
+**Pause-while-Arming race:** if the user clicks Pause while the controller is in `Arming` (waiting for backend `Armed` ack), the backend may produce the `Armed` event after the `PauseRecording` command lands in its queue. The supervisor's `PauseRecording` handler always calls `disarm()` if `active.is_some()`, which sends SIGINT — so even if `Armed` ack happened a millisecond before, the disarm still fires and shuts down GSR. The `BufferController` flips to `Paused` state regardless of whether the intermediate `Armed` ack arrived. No special handling needed at the controller level; the existing `set_armed`/`set_arming` transitions are idempotent for re-entry.
 
 #### Pause/Resume GAction handler sketch
 
@@ -211,15 +217,36 @@ The action row uses `homogeneous = false` and `spacing = 12`. Suggested order le
 pub save_hotkey_display: String,  // human-readable; e.g. "ALT+S". Default "ALT+S".
 ```
 
-Persisted as `save_hotkey_display=...` in the existing `clips_settings.txt`. The value comes from the **portal's own `trigger_description` field** returned by `org.freedesktop.portal.GlobalShortcuts.ListShortcuts` — the user-readable chord description the portal itself displays in its UI.
+Persisted as `save_hotkey_display=...` in the existing `clips_settings.txt`. The value comes from the **portal's own `trigger_description` accessor** on the `Shortcut` response type returned by `org.freedesktop.portal.GlobalShortcuts.ListShortcuts` — the user-readable chord description the portal itself displays in its UI.
+
+**ashpd 0.11.1 API (verified against upstream docs):**
+
+```rust
+// Registration uses NewShortcut (NOT `Shortcut::new`):
+let shortcut = NewShortcut::new("save-clip", "Save the last N seconds of gameplay")
+    .preferred_trigger(Some("ALT+s"));
+proxy.bind_shortcuts(&session, &[shortcut], parent).await?;
+
+// Read back the bound chord:
+let req = proxy.list_shortcuts(&session).await?;
+let resp = req.response()?;          // Response<ListShortcuts>
+let shortcuts = resp.shortcuts();    // &[Shortcut]
+let display = shortcuts.iter()
+    .find(|s| s.id() == "save-clip")               // s.id() -> &str
+    .map(|s| s.trigger_description().to_string()); // s.trigger_description() -> &str
+```
+
+Two ashpd types are distinct: `NewShortcut` (the request shape for `bind_shortcuts`) and `Shortcut` (the response shape from `list_shortcuts`). Don't confuse them. `trigger_description()` is a method, not a field, and returns `&str` — copy with `.to_string()` to persist.
 
 Write sites for the field:
 
-- **After every successful `proxy.bind_shortcuts(...).await` call** in `src/clips/hotkey.rs`: immediately call `proxy.list_shortcuts(&session).await`, iterate the returned `Vec<Shortcut>`, find the entry whose `id == "save-clip"` (matching the `Shortcut::new("save-clip", ...)` registration), and persist its `trigger_description` (a `String`) into `ClipSettings.save_hotkey_display`. If the call fails, leave the field unchanged and default to "ALT+S" on first read.
+- **After every successful `proxy.bind_shortcuts(...).await` call** in `src/clips/hotkey.rs`: immediately call `proxy.list_shortcuts(&session).await`, run the snippet above, and persist via the existing `mark_*` pattern (mutate the shared `Rc<RefCell<ClipSettings>>` cell first, then call `settings::save(&cell.borrow())`). If the `list_shortcuts` call fails, leave the field unchanged and default to "ALT+S" on first read.
 - This covers both onboarding-page-3 binding and the Settings → Clips "Reset Hotkey" flow because both paths go through `bind_shortcuts`.
 - An optional polish — subscribe to the portal's **`ShortcutsChanged` signal** on the same session (which the existing `run_global_shortcuts` listener already holds open) and refresh `save_hotkey_display` when the user re-binds via the portal's own UI. This is filed under "deferred polish" in Risks below, not Bundle B's mandatory scope.
 
 If the field is empty at read time, fall back to the literal string "ALT+S" (the documented default). We persist our own label rather than query the portal at display time because the portal session may not be live at startup before the user opens the Clips card.
+
+Cleanup: existing stale comments at `src/clips/settings.rs:322` ("ashpd 0.10 has no `list_shortcuts` API") and `src/clips/hotkey.rs:153` ("ashpd 0.10 doesn't expose the (proposed) portal `ConfigureShortcuts` method directly") should be updated to reflect the actual dependency (0.11.1) and the newly-used API. Implementer B updates these in the same pass.
 
 #### Terminology pass
 
@@ -259,16 +286,27 @@ The new rule is **monotonic**: a move *onto* a managed sink updates / creates th
 
 `pactl move-sink-input` is generally synchronous, but the next call to `pactl list sink-inputs` can observe pre-move state for a brief window after a self-initiated move. The previous revision missed that **the pre-move sink is typically `SteelSeries_Game`** — the default sink set by `init_pipeline`, which is *managed*. So a "pre-move sink is unmanaged → safely ignored" argument doesn't hold: an Occupied branch reading `tracked = Music` (intended target) and `current_sink = Game` (stale pactl) would erroneously update the saved entry to Game, then flap back on the next tick when pactl catches up.
 
-The fix is **one-tick post-move suppression**. Add a second map `self_move_pre_sink: HashMap<u32, String>` alongside `tracked`. Behavior:
+The fix is **timestamped post-move suppression**. Add a second map alongside `tracked`:
 
-- **Vacant branch, Ok(()) case:** insert `tracked[id] = target` *and* `self_move_pre_sink[id] = <observed pre-move sink>`.
-- **Vacant branch, Err(...) case:** insert `tracked[id] = current_sink`; do not touch `self_move_pre_sink`.
+```rust
+self_move_pre_sink: HashMap<u32, (String /*pre-move sink*/, Instant /*move time*/)>
+```
+
+Behavior:
+
+- **Vacant branch, Ok(()) case:** insert `tracked[id] = target` *and* `self_move_pre_sink[id] = (observed_pre_move_sink, Instant::now())`.
+- **Vacant branch, Err(...) case:** insert `tracked[id] = pre_move_sink`; do not touch `self_move_pre_sink`.
 - **Occupied branch:** if `tracked[id] != current_sink`:
-  - If `self_move_pre_sink[id] == current_sink`: this is the eventual-consistency lag. Skip this tick's Occupied processing for the id, and **remove** the entry from `self_move_pre_sink` so the *next* divergence is processed normally (i.e., one-tick suppression only).
-  - Else: this is a genuine user-move. Apply the "only persist onto managed sinks" rule.
+  - Look up `self_move_pre_sink[id]`. If `Some((pre_sink, t))` AND `pre_sink == current_sink` AND `t.elapsed() < SUPPRESSION_WINDOW (3s)`: this is eventual-consistency lag. Skip processing. Do **not** remove the entry — let the timestamp-based expiry handle it. This lets the suppression hold across multi-tick lag.
+  - Else (no suppression entry, OR pre_sink ≠ current_sink, OR window expired): this is a real user move. Apply the "only persist onto managed sinks" rule. Remove the `self_move_pre_sink` entry if present.
+- **Tick-end maintenance:** drop entries from `self_move_pre_sink` whose `t.elapsed() ≥ SUPPRESSION_WINDOW`.
 - **Garbage collection:** at end-of-tick, drop entries from both maps for IDs not in `live_ids`.
 
-This handles the common eventual-consistency stagger without indefinitely suppressing real user moves. Two-tick or longer lag (rare) self-corrects on the next divergence.
+`SUPPRESSION_WINDOW = Duration::from_millis(3000)` — slightly more than one tick period (2 s), tight enough that a real user counter-move within 3 s of our self-move loses by 2 ticks (acceptable in practice; the user would have to move twice within 3 seconds for this to surface, and even then the third tick captures their intent). Multi-tick pactl lag of up to ~3 s is silently tolerated.
+
+#### User counter-move during the suppression window (edge case)
+
+If the user manually moves a stream back to its pre-move sink during the suppression window, we cannot tell their action apart from pactl-lag. The third tick (after the window expires) will observe `tracked ≠ current_sink AND self_move_pre_sink entry expired` and persist the user's move correctly. **Net behavior:** the user's deliberate counter-move within 3 seconds of our auto-route is captured with ≤ 4 seconds of latency. This is documented as a known limitation; users moving streams twice within 3 seconds is uncommon enough that a tighter design is out of scope.
 
 Sink-input ID reuse: PipeWire sink-input IDs can be reused after a long session. The garbage-collection pass at end-of-tick ensures that a reused ID always enters the tick as Vacant from the tick's perspective, which routes correctly via the saved entry for the new `app_name`.
 
@@ -303,7 +341,11 @@ pub fn clear_saved() -> Result<(), String>;
 #### Tick pseudocode (Issue 1 portion)
 
 ```text
-fn reconcile_stream_state(tracked, self_move_pre_sink, saved_cache):
+fn reconcile_stream_state(tracked, self_move_pre_sink):
+    // Re-read saved from disk each tick. Single-digit-KB file, page cache makes
+    // this microseconds. Avoids needing a shared cache that must be invalidated
+    // by Clear Config and other state-mutation paths.
+    saved = read_saved()
     sinks_by_id = list_sinks_by_id()
     inputs = list_sink_inputs()
     live_ids = set()
@@ -315,13 +357,13 @@ fn reconcile_stream_state(tracked, self_move_pre_sink, saved_cache):
         match tracked.entry(input.id):
             Vacant:
                 if input.app_name == "pw-cli": continue
-                if let Some(target) = saved_cache.get(&input.app_name):
+                if let Some(target) = saved.get(&input.app_name):
                     if current_sink != target:
                         let pre_move_sink = current_sink.to_string()
                         result = move_sink_input(input.id, target)
                         if result.is_ok():
                             tracked.insert(input.id, target.clone())
-                            self_move_pre_sink.insert(input.id, pre_move_sink)
+                            self_move_pre_sink.insert(input.id, (pre_move_sink, Instant::now()))
                         else:
                             tracked.insert(input.id, pre_move_sink)
                     else:
@@ -331,40 +373,46 @@ fn reconcile_stream_state(tracked, self_move_pre_sink, saved_cache):
 
             Occupied(entry):
                 if entry.get() != current_sink:
-                    if self_move_pre_sink.get(&input.id) == Some(current_sink):
-                        // Eventual-consistency stagger from a self-move one tick ago.
-                        // Skip this tick; one-tick suppression only.
-                        self_move_pre_sink.remove(&input.id);
-                    else if is_managed(current_sink):
+                    let suppress = match self_move_pre_sink.get(&input.id):
+                        Some((pre, t)) if pre == current_sink && t.elapsed() < SUPPRESSION_WINDOW => true,
+                        _ => false,
+                    };
+                    if suppress:
+                        // Eventual-consistency stagger; keep the suppression
+                        // entry — it will expire naturally.
+                        continue;
+                    if is_managed(current_sink):
                         update_saved_assignment(input.app_name, current_sink)
-                        saved_cache.insert(input.app_name.clone(), current_sink.to_string())
                         *entry.get_mut() = current_sink.to_string()
                         self_move_pre_sink.remove(&input.id)
                     // else: don't destroy saved entry on transient unmanaged move (monotonic rule)
 
-    // Garbage collect dead IDs
+    // Tick-end maintenance
+    self_move_pre_sink.retain(|_, (_, t)| t.elapsed() < SUPPRESSION_WINDOW)
     tracked.retain(|id, _| live_ids.contains(id))
     self_move_pre_sink.retain(|id, _| live_ids.contains(id))
 ```
 
-Note `saved_cache` is a `HashMap<String, String>` (app_name → sink_name) loaded once at startup from `read_saved()` and kept in memory; `update_saved_assignment` is the one path that writes the file *and* updates the cache. This removes the per-tick disk read flagged by reviewers.
+**Why re-read saved each tick rather than caching:** the prior revision proposed an in-memory `saved_cache` to avoid per-tick disk reads. Critic round-3 correctly observed that this creates a Clear-Config-cache-invalidation problem: the existing "Clear Saved Config" button at `src/window.rs:727-731` only deletes the file — if a tick-owned cache survives, the next tick re-routes from stale state and re-creates the file. Re-reading the file each tick eliminates this footgun. The saved-assignments file is single-digit-KB; on the OS's page cache it's a sub-millisecond op. The tradeoff is right.
 
 ### Issue 2 — Mic hotplug detection with stable identifier matching
 
 #### Save node-name and stable-id chain at user-pick time
 
-`mixer_routing.txt` today stores entries as `channel\tdevice_name\n`. The new design extends the `"mic"` entry to a tab-separated triple: `mic\t<node_name>\t<stable_id>\n` where `<stable_id>` is the **first non-empty value from a fallback chain**:
+`mixer_routing.txt` today stores entries as `channel\tdevice_name\n`. The new design extends the `"mic"` entry to a tab-separated **5-field record**: `mic\t<node_name>\t<product_name>\t<bus_path>\t<bluez_address>\n`. Any field that's not available at pick time is written as the literal empty string between the tabs.
 
-1. `device.product.name` — populated on most USB audio devices (USB product-string descriptor).
-2. `device.bus_path` — populated on USB and some PCI devices (kernel sysfs path), e.g. `usb-0000:00:14.0-3`. Stable across re-enumeration on the *same* port; changes when the user plugs into a different port. Acceptable: re-binding to the same port is the most common case.
-3. `api.bluez5.address` — populated on Bluetooth audio devices (the BT MAC address). Stable across A2DP↔HSP profile switches because the device's BT address doesn't change.
-4. Empty string — when no stable property is available (older / quirky USB hardware without a product-string descriptor, virtual sources). Saved entries with empty stable-id can only match by exact node-name (best-effort degradation).
+Why 5 fields and not a single fallback chain: critic round-3 correctly observed that picking `device.product.name` first is wrong for Bluetooth, where the MAC (`api.bluez5.address`) is intrinsically unique and stable across A2DP↔HSP profile switches. Two paired Sony WH-1000XM4s of the same model would collide on `product.name` but never on `api.bluez5.address`. Storing all three available properties lets the hotplug check try the most-specific identifier per device class:
 
-Backward-compatible: existing 2-field `mic` lines are treated as `<stable_id>` = empty.
+**Hotplug match priority** (computed against each available source's properties):
+1. **Exact node-name match.** Fast path; covers no-rename cases.
+2. **`api.bluez5.address` match** (if both saved and available have a non-empty value). Strongest identifier for Bluetooth devices; never collides.
+3. **`device.bus_path` match** (if both have a non-empty value). Stable per-USB-port; covers re-enumeration on the same port.
+4. **`device.product.name` match** (if both have a non-empty value). Weakest; matches across USB-port changes for unique-model devices, but collides on duplicates.
+5. **No match → no reroute.**
 
-`device.product.name` is **documented coverage: most USB audio devices, many Bluetooter audio devices**. It is *not* in the PipeWire docs' explicitly-documented `pipewire-devices(7)` property list, so we treat it as best-effort. The fallback chain ensures Bluetooth profile switches and USB-port-stable re-enumeration are also handled.
+Backward-compatible: 2-field `mic` lines (the existing format) are treated as `<product_name>` = `<bus_path>` = `<bluez_address>` = empty (only step 1 applies). Old 3-field `mic` lines (revision-1 format with just `product_name`) parse with `<bus_path>` = `<bluez_address>` = empty. Forward-compatible: future identifiers can be appended without breaking old readers.
 
-Three PipeWire properties survive different real-world transitions:
+PipeWire-property stability matrix:
 
 | Property | USB plug back into same port | USB plug into different port | BT profile switch (A2DP↔HSP) | Power cycle |
 |---|---|---|---|---|
@@ -393,19 +441,25 @@ let mut in_properties = false
 let mut current_props: HashMap<&str, String> = HashMap::new()
 
 for line in output.lines():
+    let trimmed = line.trim()
+    let is_indented = line != trimmed && !trimmed.is_empty()  // any leading whitespace
     if line.starts_with("Source #") or line.starts_with("Sink #"):
         flush_current_record_into_results()
         in_properties = false
         current_props.clear()
-    elif line.trim() == "Properties:":
+    elif trimmed == "Properties:":
         in_properties = true
+    elif trimmed.is_empty():
+        in_properties = false   // blank line exits the block
+    elif !is_indented:
+        in_properties = false   // unindented line is a new top-level field
     elif in_properties:
-        if let Some((key, value)) = line.trim().split_once(" = "):
+        if let Some((key, value)) = trimmed.split_once(" = "):
             if key in ("device.product.name", "device.bus_path", "api.bluez5.address"):
                 current_props.insert(key, value.trim_matches('"').to_string())
-        if !line.starts_with("\t"):
-            in_properties = false  // exited the block
 ```
+
+The existing `parse_device_list` at `src/audio/sinks.rs:184-228` uses a similar trim-then-strip-prefix pattern; mirror that style. `pactl list` indentation can be tabs OR spaces depending on the version; check `line != line.trim()` rather than `starts_with("\t")` to be version-robust.
 
 Implementer A may use a state machine or simpler line-prefix approach — the spec gives the shape, the implementer picks the cleanest expression.
 
@@ -417,30 +471,44 @@ When the user picks a mic from the dropdown, `reroute_mic` is called with the no
 
 ```text
 fn check_mic_hotplug(router, available_sources):
-    let Some((saved_node, saved_stable_id)) = router.preferred_mic else: return  // no preference
+    let Some(saved) = router.preferred_mic.as_ref() else: return  // no preference
+    // saved is a struct: { node_name, product_name, bus_path, bluez_address }
 
-    if router.current_mic_source == saved_node: return  // already on the exact node
+    if router.current_mic_source.as_deref() == Some(saved.node_name): return  // already on it
 
-    // Try exact node name first
-    if available_sources.iter().any(|(n, _, _, _, _)| n == saved_node):
-        router.reroute_mic(saved_node);
+    // Step 1: exact node-name match
+    if available_sources.iter().any(|s| s.node_name == saved.node_name):
+        router.reroute_mic(saved.node_name.clone());
         return
 
-    // Fallback: match by stable identifier chain.
-    // saved_stable_id was set at user-pick time using the first non-empty of:
-    //   device.product.name → device.bus_path → api.bluez5.address
-    // Compare against the same chain on each available source.
-    if !saved_stable_id.is_empty():
-        for (alt_node, _, product, bus_path, bt_addr) in available_sources:
-            let alt_stable_id = product.clone()
-                .or(bus_path.clone())
-                .or(bt_addr.clone())
-                .unwrap_or_default();
-            if alt_stable_id == saved_stable_id:
-                router.reroute_mic(alt_node);
-                return
-    // else: saved device not online; do nothing this tick
+    // Step 2: api.bluez5.address — strongest, BT-only
+    if !saved.bluez_address.is_empty():
+        if let Some(s) = available_sources.iter().find(|s|
+            !s.bluez_address.is_empty() && s.bluez_address == saved.bluez_address
+        ):
+            router.reroute_mic(s.node_name.clone());
+            return
+
+    // Step 3: device.bus_path — stable per USB port
+    if !saved.bus_path.is_empty():
+        if let Some(s) = available_sources.iter().find(|s|
+            !s.bus_path.is_empty() && s.bus_path == saved.bus_path
+        ):
+            router.reroute_mic(s.node_name.clone());
+            return
+
+    // Step 4: device.product.name — weakest, collides on duplicates
+    if !saved.product_name.is_empty():
+        if let Some(s) = available_sources.iter().find(|s|
+            !s.product_name.is_empty() && s.product_name == saved.product_name
+        ):
+            router.reroute_mic(s.node_name.clone());
+            return
+
+    // No match — saved device not online; do nothing this tick
 ```
+
+The `available_sources` shape is the 5-field tuple from the parser extension below; `router.preferred_mic` is the cached struct loaded once at `AudioRouter::create` from the new 5-field `mixer_routing.txt` mic line.
 
 The preferred-mic cache lives on `AudioRouter` and is loaded once from `mixer_routing.txt` in `AudioRouter::create`. It's invalidated/updated on every `reroute_mic` call. The hotplug check reads the cache; **no per-tick disk read.**
 
@@ -501,11 +569,34 @@ Idempotent with the periodic capture; running both is harmless.
 
 #### Hypothesis for the "random values" symptom (testable)
 
-The spec replaces its earlier speculation with this empirical hypothesis: **after `VirtualSinks::create` builds the virtual mic source, calling `pactl set-source-volume SteelSeries_Mic 100%` and immediately reading back via `pactl get-source-volume SteelSeries_Mic` yields 100%.** If that's true, the user's symptom is fully explained by "we never persist the value, so every restart starts from the source's default — which differs run-to-run because PipeWire/WirePlumber's per-name state cache restores whatever value it last saw."
+Two hypotheses could explain the user's "random volume on relaunch" complaint:
 
-`project-tester` will verify this hypothesis empirically before declaring Issue 3 fixed: set 70% via system sound settings, quit, relaunch, read back via `pactl`. If the saved-and-restored value is honored, the fix works.
+- **H_A: WirePlumber state cache restoration.** PipeWire/WirePlumber's per-node state cache restores whatever value it last saw for `SteelSeries_Mic`. Since we never explicitly write a value at startup (volume helpers don't exist on the clipping branch), the recreated node lands on whatever WirePlumber remembered — which can drift run-to-run if multiple sessions have set different values.
+- **H_B: `pactl set-source-volume` is silently ignored on `Audio/Source/Virtual` nodes** on certain PipeWire builds. Setting succeeds but the actual value doesn't change. Reading back returns whatever the node defaulted to.
 
-If the hypothesis is *false* (volumes are silently ignored on `Audio/Source/Virtual` nodes on certain PipeWire builds), the fix expands to also re-apply the saved volume after the periodic tick observes it diverged from `last_saved_volumes` — which we already do in Step 2's logic. So the fix is robust to that uncertainty.
+**Pre-implementation discriminator (project-tester runs this BEFORE coding starts):**
+
+```bash
+# Discriminator: can we set the volume of SteelSeries_Mic at all?
+distrobox enter fedora-dev -- bash -c '
+  cd /var/home/admin/Documents/Code/SteelseriesFlatpak-clipping && cargo build && cd -
+'
+./target/debug/arctis-chatmix &  # let virtual sinks come up
+sleep 3
+pactl set-source-volume SteelSeries_Mic 50%
+sleep 0.2
+pactl get-source-volume SteelSeries_Mic
+# If this returns 50% → H_A is the candidate; save-and-restore design is correct.
+# If this returns something else (default, or unchanged) → H_B is true; the fix
+#   needs a different mechanism (e.g. pw-cli set-param on the adapter node directly,
+#   or persisting volume via node.target props at create-node time).
+```
+
+If the discriminator reveals **H_A**, the spec's fix (port from main + periodic capture + shutdown capture) is correct as-designed.
+
+If the discriminator reveals **H_B**, scope expansion required: the spec's "periodic re-apply" doesn't help because `pactl set-source-volume` is the broken layer in that universe. The fallback is to set the volume at node-creation time via `pw-cli`'s `Props` argument when creating the adapter node. This is a different code path from `pactl set-source-volume` and may bypass the silent-ignore bug. **If H_B is confirmed, Bundle A scope expands** to also extend `create_pw_node` in `src/audio/sinks.rs` to accept an optional initial volume and write it into the `Props` block at node creation. Project-tester flags this back to the team lead before Bundle A starts.
+
+`project-tester` runs the discriminator *first*. The choice between fix-A (save-restore via pactl, this spec's current design) and fix-B (initial volume via `pw-cli` Props at creation, scope expansion) is determined by that test before Implementer A begins.
 
 ### Issue 4 — Clips section relocation + expansion + terminology
 
@@ -592,7 +683,7 @@ Tests use a thin `SinkInputProvider` / `SourceListProvider` trait or fn-pointer 
 
 Files (read-write):
 
-- `src/audio/persistence.rs` — port volume helpers from main (`VOLUMES_FILE`, `volumes_path`, `load_volumes`, `save_volume_entry`); add `initial_tracked`, `update_saved_assignment`, rename `restore_new_streams` → `reconcile_stream_state` with new HashMap signature; extend mixer-routing reader/writer for the 3-field mic line (`save_mixer_routing_mic(node_name, stable_id)`).
+- `src/audio/persistence.rs` — port volume helpers from main (`VOLUMES_FILE`, `volumes_path`, `load_volumes`, `save_volume_entry`); add `initial_tracked`, `update_saved_assignment`, rename `restore_new_streams` → `reconcile_stream_state` with new HashMap signature; delete the now-unused `initial_seen_ids` helper; remove the `assignments.remove` on unmanaged-sink path inside `save_assignments` to align with the new monotonic rule; extend mixer-routing reader/writer for the 5-field mic line via a dedicated `load_mixer_routing_mic() -> Option<MicPreference>` / `save_mixer_routing_mic(&MicPreference)` pair (homogeneous channel→sink map stays 2-field).
 - `src/audio/router.rs` — add `current_mic_source: Option<String>` + `preferred_mic: Option<(String, String)>`; add `check_mic_hotplug` method; cache preferred-mic at construction.
 - `src/audio/sinks.rs` — extend `list_physical_sources` to also return the stable-id chain (`device.product.name` / `device.bus_path` / `api.bluez5.address`); extend `parse_device_list` to traverse the Properties block.
 - `src/audio/state_sync.rs` — **NEW**. Single public `pub fn tick(...)` that orchestrates the four jobs.
