@@ -291,6 +291,13 @@ impl ChatMixWindow {
     /// event poll in `app.rs` after each `BufferController::on_backend_event`
     /// + after the auto-resume block at startup so the badge reflects the
     /// initial buffer state without flicker.
+    ///
+    /// Also refreshes the row-1 Clips section's Pause button so its label /
+    /// sensitivity tracks state transitions (Idle / Armed → button enabled,
+    /// Saving / Error → disabled). `user_paused` is derived from the state
+    /// because `Paused` is the only state where the buffer's `user_paused`
+    /// flag is true, and this method's callers don't have the buffer ref
+    /// handy.
     pub fn set_clips_state(
         &self,
         state: crate::clips::BufferState,
@@ -298,6 +305,9 @@ impl ChatMixWindow {
     ) {
         let w = self.inner.borrow();
         w.clips_indicator.set_state(state, game);
+        if let Some(section) = &w.clips_section {
+            section.refresh_state(state, matches!(state, crate::clips::BufferState::Paused));
+        }
     }
 
     /// Refresh the dashboard's row-1 Clips section: pause-button label /
@@ -547,20 +557,7 @@ impl ClipsSectionWidgets {
         user_paused: bool,
         settings: &crate::clips::settings::ClipSettings,
     ) {
-        use crate::clips::buffer::BufferState as S;
-        let (base_label, sensitive) = match buffer_state {
-            S::Uninitialized => ("Pause Recording", false),
-            S::Idle | S::Arming | S::Armed => ("Pause Recording", true),
-            S::Saving => ("Pause Recording", false),
-            S::ErrorState => ("Pause Recording", false),
-            S::Paused => ("Resume Recording", true),
-        };
-        // `user_paused` takes precedence on the label: even if the state
-        // briefly says Idle (after a Pause → Resume race), the button copy
-        // tracks intent.
-        let label = if user_paused { "Resume Recording" } else { base_label };
-        self.pause_button.set_label(label);
-        self.pause_button.set_sensitive(sensitive);
+        self.refresh_state(buffer_state, user_paused);
 
         // Duration label — round to the nicest unit at the breakpoints.
         let secs = settings.buffer_length;
@@ -585,6 +582,33 @@ impl ClipsSectionWidgets {
             format!("Hotkey: {}", settings.save_hotkey_display)
         };
         self.hotkey_label.set_label(&hk);
+    }
+
+    /// Refresh just the pause button (label + sensitivity), without
+    /// touching duration / hotkey labels (those don't change on backend
+    /// state transitions and require a settings ref). Called from
+    /// `ChatMixWindow::set_clips_state` so the button tracks state changes
+    /// driven by the backend-event poll without needing a settings cell on
+    /// that path.
+    pub fn refresh_state(
+        &self,
+        buffer_state: crate::clips::buffer::BufferState,
+        user_paused: bool,
+    ) {
+        use crate::clips::buffer::BufferState as S;
+        let (base_label, sensitive) = match buffer_state {
+            S::Uninitialized => ("Pause Recording", false),
+            S::Idle | S::Arming | S::Armed => ("Pause Recording", true),
+            S::Saving => ("Pause Recording", false),
+            S::ErrorState => ("Pause Recording", false),
+            S::Paused => ("Resume Recording", true),
+        };
+        // `user_paused` takes precedence on the label: even if the state
+        // briefly says Idle (after a Pause → Resume race), the button copy
+        // tracks intent.
+        let label = if user_paused { "Resume Recording" } else { base_label };
+        self.pause_button.set_label(label);
+        self.pause_button.set_sensitive(sensitive);
     }
 }
 
