@@ -70,11 +70,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capture_no_change_writes_nothing() {
-        // No direct test for write-side without mocking pactl, but this
-        // asserts capture_virtual_volumes is callable with the cache and
-        // doesn't panic on missing pactl output. Real verification happens
-        // in the manual test recipe.
+    fn capture_virtual_volumes_does_not_panic_with_missing_pactl_output() {
+        // Smoke test — exercises the code path and confirms it doesn't panic
+        // when pactl returns nothing for a virtual source. Real behavior
+        // verification happens in the manual test recipe (Phase 5).
         let mut last = HashMap::new();
         last.insert(MIC_SOURCE_NAME.to_string(), 100);
         capture_virtual_volumes(&mut last);
