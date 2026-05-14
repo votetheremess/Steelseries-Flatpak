@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crate::eq::model::{Band, FilterType, EqTarget, SinkEq, SpatialState, NUM_BANDS};
 use crate::eq::spatial;
 
+use super::persistence::MicPreference;
 use super::sinks::ALL_SINKS;
 
 // ---------------------------------------------------------------------------
@@ -17,6 +18,73 @@ use super::sinks::ALL_SINKS;
 pub struct AudioRouter {
     eq_pipeline: EqPipeline,
     mic_linked: bool,
+    /// Node name of the source currently linked into SteelSeries_Mic (None if
+    /// the link attempt failed at startup or after a hotplug reroute). The
+    /// hotplug check uses this to suppress no-op reroutes.
+    current_mic_source: Option<String>,
+    /// Saved mic preference (the user's last explicit choice) — used by
+    /// `check_mic_hotplug` to decide whether a newly-appeared source is the
+    /// one they want back, even if its node name changed (USB-port move,
+    /// Bluetooth rename).
+    preferred_mic: Option<MicPreference>,
+}
+
+/// Pure function for unit testing — decides which node `check_mic_hotplug`
+/// should reroute to (if any). Returns `Some(node_name)` if a reroute should
+/// happen, `None` otherwise.
+///
+/// 4-tier match priority:
+///   1. exact node_name
+///   2. api.bluez5.address (handles Bluetooth node-name renames)
+///   3. device.bus_path (handles USB-port moves)
+///   4. device.product.name (last-resort fuzzy match by product)
+pub(crate) fn decide_hotplug_target(
+    preferred: Option<&MicPreference>,
+    current: Option<&str>,
+    available: &[(String, String, Option<String>, Option<String>, Option<String>)],
+) -> Option<String> {
+    let p = preferred?;
+    if current == Some(p.node_name.as_str()) {
+        return None;
+    }
+    // Step 1: exact node-name
+    if available.iter().any(|s| s.0 == p.node_name) {
+        return Some(p.node_name.clone());
+    }
+    // Step 2: bluez_address
+    if !p.bluez_address.is_empty() {
+        if let Some(s) = available.iter().find(|s| {
+            s.4.as_deref()
+                .filter(|v| !v.is_empty())
+                .map(|v| v == p.bluez_address)
+                .unwrap_or(false)
+        }) {
+            return Some(s.0.clone());
+        }
+    }
+    // Step 3: bus_path
+    if !p.bus_path.is_empty() {
+        if let Some(s) = available.iter().find(|s| {
+            s.3.as_deref()
+                .filter(|v| !v.is_empty())
+                .map(|v| v == p.bus_path)
+                .unwrap_or(false)
+        }) {
+            return Some(s.0.clone());
+        }
+    }
+    // Step 4: product_name
+    if !p.product_name.is_empty() {
+        if let Some(s) = available.iter().find(|s| {
+            s.2.as_deref()
+                .filter(|v| !v.is_empty())
+                .map(|v| v == p.product_name)
+                .unwrap_or(false)
+        }) {
+            return Some(s.0.clone());
+        }
+    }
+    None
 }
 
 impl AudioRouter {
@@ -44,25 +112,30 @@ impl AudioRouter {
         // Mic uses pw-link to connect the headset mic source to the virtual
         // Audio/Source/Virtual node. This makes it appear as a proper input
         // device in apps like Discord (unlike sink monitors which are hidden).
-        let mic_source = saved_routing
-            .get("mic")
-            .cloned()
+        //
+        // Mic preference now lives on its own 5-field record (so we can
+        // re-attach via stable IDs after a hotplug — handled by
+        // check_mic_hotplug). `saved_routing` no longer contains a "mic" key.
+        let preferred_mic = super::persistence::load_mixer_routing_mic();
+        let mic_source = preferred_mic
+            .as_ref()
+            .map(|p| p.node_name.clone())
             .or_else(|| find_headset_source().ok());
 
-        let mic_linked = match mic_source {
-            Some(source) => match link_mic_source(&source) {
+        let (mic_linked, current_mic_source) = match mic_source.as_deref() {
+            Some(source) => match link_mic_source(source) {
                 Ok(()) => {
                     log::info!("Linked mic ({source}) → SteelSeries_Mic");
-                    true
+                    (true, Some(source.to_string()))
                 }
                 Err(e) => {
                     log::warn!("Failed to link mic source: {e}");
-                    false
+                    (false, None)
                 }
             },
             None => {
                 log::warn!("Could not find mic source");
-                false
+                (false, None)
             }
         };
 
@@ -76,6 +149,8 @@ impl AudioRouter {
         Ok(AudioRouter {
             eq_pipeline,
             mic_linked,
+            current_mic_source,
+            preferred_mic,
         })
     }
 
@@ -109,13 +184,34 @@ impl AudioRouter {
         super::persistence::save_mixer_routing_entry(sink_name, new_target);
     }
 
-    /// Change which physical source the mic routes from.
+    /// Change which physical source the mic routes from. Persists the user's
+    /// intent as a full 5-field `MicPreference` (with stable IDs) so a later
+    /// hotplug can re-attach to the same physical device even if the node
+    /// name changes.
     pub fn reroute_mic(&mut self, new_source: &str) {
         log::info!("Rerouting mic → {new_source}");
-        // Persist the user's intent up-front. If the live link fails (missing
-        // device, port mismatch, etc.), we still remember the selection so the
+
+        // Build the full MicPreference by looking up the new source's properties.
+        let pref = super::sinks::list_physical_sources()
+            .into_iter()
+            .find(|(name, _, _, _, _)| name == new_source)
+            .map(|(node, _desc, product, bus, bluez)| MicPreference {
+                node_name: node,
+                product_name: product.unwrap_or_default(),
+                bus_path: bus.unwrap_or_default(),
+                bluez_address: bluez.unwrap_or_default(),
+            })
+            .unwrap_or_else(|| MicPreference {
+                node_name: new_source.to_string(),
+                product_name: String::new(),
+                bus_path: String::new(),
+                bluez_address: String::new(),
+            });
+
+        // Persist intent up-front. Even if the link fails (missing device,
+        // port mismatch, etc.) the user's preference is remembered so the
         // dropdown reflects it and the next launch tries again.
-        super::persistence::save_mixer_routing_entry("mic", new_source);
+        super::persistence::save_mixer_routing_mic(&pref);
 
         if self.mic_linked {
             unlink_mic_source();
@@ -123,11 +219,29 @@ impl AudioRouter {
         match link_mic_source(new_source) {
             Ok(()) => {
                 self.mic_linked = true;
+                self.current_mic_source = Some(new_source.to_string());
+                self.preferred_mic = Some(pref);
                 log::info!("Mic rerouted to {new_source}");
             }
             Err(e) => {
                 log::error!("Failed to reroute mic to {new_source}: {e}");
             }
+        }
+    }
+
+    /// Periodic check (called from the state-sync tick) that re-attaches to the
+    /// user's preferred mic if it has appeared (or reappeared) on the system.
+    /// No-op if no preference is saved, or if we're already linked to it.
+    pub fn check_mic_hotplug(&mut self) {
+        let available = super::sinks::list_physical_sources();
+        let target = decide_hotplug_target(
+            self.preferred_mic.as_ref(),
+            self.current_mic_source.as_deref(),
+            &available,
+        );
+        if let Some(node) = target {
+            log::info!("Mic hotplug: switching to {node}");
+            self.reroute_mic(&node);
         }
     }
 
@@ -1335,6 +1449,84 @@ fn unload_module(module_id: u32) {
 // ---------------------------------------------------------------------------
 // Orphaned loopback cleanup
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod hotplug_tests {
+    use super::*;
+    use crate::audio::persistence::MicPreference;
+    type Source = (String, String, Option<String>, Option<String>, Option<String>);
+
+    fn s(node: &str, prod: Option<&str>, bus: Option<&str>, bt: Option<&str>) -> Source {
+        (
+            node.to_string(),
+            format!("desc for {node}"),
+            prod.map(String::from),
+            bus.map(String::from),
+            bt.map(String::from),
+        )
+    }
+    fn pref(node: &str, prod: &str, bus: &str, bt: &str) -> MicPreference {
+        MicPreference::from_fields(node.into(), prod.into(), bus.into(), bt.into())
+    }
+
+    #[test]
+    fn noop_when_no_preference() {
+        let result = decide_hotplug_target(None, Some("alsa_a"), &[s("alsa_a", None, None, None)]);
+        assert_eq!(result, None);
+    }
+    #[test]
+    fn noop_when_already_on_saved() {
+        let p = pref("alsa_a", "FooMic", "", "");
+        let result = decide_hotplug_target(Some(&p), Some("alsa_a"), &[s("alsa_a", Some("FooMic"), None, None)]);
+        assert_eq!(result, None);
+    }
+    #[test]
+    fn exact_node_match_wins() {
+        let p = pref("alsa_a", "FooMic", "", "");
+        let result = decide_hotplug_target(Some(&p), Some("alsa_b"), &[s("alsa_a", Some("FooMic"), None, None)]);
+        assert_eq!(result, Some("alsa_a".into()));
+    }
+    #[test]
+    fn bluez_address_match_when_node_renamed() {
+        let p = pref("bluez_old_name", "WH-1000XM4", "", "AA:BB:CC:DD:EE:FF");
+        let result = decide_hotplug_target(
+            Some(&p),
+            Some("alsa_fallback"),
+            &[s("bluez_new_name", Some("WH-1000XM4"), None, Some("AA:BB:CC:DD:EE:FF"))],
+        );
+        assert_eq!(result, Some("bluez_new_name".into()));
+    }
+    #[test]
+    fn bus_path_match_when_bluez_unavailable() {
+        let p = pref("alsa_old", "FooMic", "usb-0000:00:14.0-3", "");
+        let result = decide_hotplug_target(
+            Some(&p),
+            Some("alsa_fallback"),
+            &[s("alsa_new", Some("FooMic"), Some("usb-0000:00:14.0-3"), None)],
+        );
+        assert_eq!(result, Some("alsa_new".into()));
+    }
+    #[test]
+    fn product_name_match_last_resort() {
+        let p = pref("alsa_old", "FooMic", "", "");
+        let result = decide_hotplug_target(
+            Some(&p),
+            Some("alsa_fallback"),
+            &[s("alsa_completely_new", Some("FooMic"), None, None)],
+        );
+        assert_eq!(result, Some("alsa_completely_new".into()));
+    }
+    #[test]
+    fn no_match_returns_none() {
+        let p = pref("alsa_old", "FooMic", "", "");
+        let result = decide_hotplug_target(
+            Some(&p),
+            Some("alsa_fallback"),
+            &[s("alsa_other", Some("BarMic"), None, None)],
+        );
+        assert_eq!(result, None);
+    }
+}
 
 fn cleanup_orphaned_loopbacks() {
     use super::sinks::LEGACY_SINK_MIGRATIONS;
