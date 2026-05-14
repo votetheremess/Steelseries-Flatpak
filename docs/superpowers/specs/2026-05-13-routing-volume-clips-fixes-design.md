@@ -463,7 +463,7 @@ The existing `parse_device_list` at `src/audio/sinks.rs:184-228` uses a similar 
 
 Implementer A may use a state machine or simpler line-prefix approach — the spec gives the shape, the implementer picks the cleanest expression.
 
-Consumers of `list_physical_sources` to update for the new tuple shape: `mixer.rs` (5 destructuring sites — find via `grep -n list_physical_sources src/`). Each site can ignore the new fields (`(name, desc, _, _, _)`) except the mic-source picker, which records the chain at save time.
+Consumers of `list_physical_sources` to update for the new tuple shape: 2 call sites in `src/mixer.rs` (verified by grep). Each can ignore the new fields with `(name, desc, _, _, _)` destructuring except the mic-source picker, which records all stable-id fields at save time.
 
 When the user picks a mic from the dropdown, `reroute_mic` is called with the node name; `persistence::save_mixer_routing_mic(node_name, stable_id)` writes both fields. `stable_id` is the first-non-empty value from the chain above.
 
@@ -605,7 +605,7 @@ See "Architecture → Issue 4" for the layout, contents, pause-design, hotkey-hi
 ## Data files / config impact
 
 - `assignments.txt` — file shape unchanged. Written more frequently (per-tick on change, plus at shutdown).
-- `mixer_routing.txt` — **`mic` line extended** to a 3-field tab-separated triple: `mic\t<node_name>\t<product_name>\n`. Lines with two fields parse as before with `<product_name>` empty (backward compatible).
+- `mixer_routing.txt` — **`mic` line extended** to a 5-field tab-separated record: `mic\t<node_name>\t<product_name>\t<bus_path>\t<bluez_address>\n`. Lines with two fields parse as before with the new fields empty (backward compatible). Old revision-1 3-field lines (`mic\t<node>\t<product>\n`) also parse with `<bus_path>` and `<bluez_address>` empty. The homogeneous `load_mixer_routing()` reader skips `mic` lines entirely (filter on `parts.next() == "mic"` before the `splitn(2)`); 5-field mic records are read/written via the dedicated `load_mixer_routing_mic() -> Option<MicPreference>` / `save_mixer_routing_mic(&MicPreference)` pair.
 - `volumes.txt` — **new on this branch** (ported from main). Format: `<pipewire_node_name>\t<volume_percent>\n` lines.
 - `clips_settings.txt` — **new field `save_hotkey_display=<chord_label>`**. Default "ALT+S". Persisted at portal bind time.
 - `eq_state.txt`, `eq_presets/*.txt`, autostart `.desktop` file — unchanged.
@@ -684,7 +684,7 @@ Tests use a thin `SinkInputProvider` / `SourceListProvider` trait or fn-pointer 
 Files (read-write):
 
 - `src/audio/persistence.rs` — port volume helpers from main (`VOLUMES_FILE`, `volumes_path`, `load_volumes`, `save_volume_entry`); add `initial_tracked`, `update_saved_assignment`, rename `restore_new_streams` → `reconcile_stream_state` with new HashMap signature; delete the now-unused `initial_seen_ids` helper; remove the `assignments.remove` on unmanaged-sink path inside `save_assignments` to align with the new monotonic rule; extend mixer-routing reader/writer for the 5-field mic line via a dedicated `load_mixer_routing_mic() -> Option<MicPreference>` / `save_mixer_routing_mic(&MicPreference)` pair (homogeneous channel→sink map stays 2-field).
-- `src/audio/router.rs` — add `current_mic_source: Option<String>` + `preferred_mic: Option<(String, String)>`; add `check_mic_hotplug` method; cache preferred-mic at construction.
+- `src/audio/router.rs` — add `current_mic_source: Option<String>` + `preferred_mic: Option<MicPreference>` where `MicPreference` is a public struct `{ node_name: String, product_name: String, bus_path: String, bluez_address: String }` (empty strings for unavailable fields); add `check_mic_hotplug` method; cache preferred-mic at construction by loading from `persistence::load_mixer_routing_mic()`. Note: `maybe_arm` gating in `BufferController` is Implementer B's concern; the explicit gate expression for `user_paused` is `let should_arm = !self.user_paused && (self.always_armed || (self.auto_arm && self.current_game.is_some()));`.
 - `src/audio/sinks.rs` — extend `list_physical_sources` to also return the stable-id chain (`device.product.name` / `device.bus_path` / `api.bluez5.address`); extend `parse_device_list` to traverse the Properties block.
 - `src/audio/state_sync.rs` — **NEW**. Single public `pub fn tick(...)` that orchestrates the four jobs.
 - `src/app.rs` — **three regions only**: (1) the state-sync timer block around the existing `restore_new_streams` watcher (where `glib::timeout_add_seconds_local(STREAM_WATCH_SECS, ...)` lives), (2) the `init_pipeline` function — add the ported apply-volumes loop after `VirtualSinks::create()` and before `AudioRouter::create()`, (3) the `connect_shutdown` handler — add the volume capture before `drop(res)`. No other `app.rs` edits.
