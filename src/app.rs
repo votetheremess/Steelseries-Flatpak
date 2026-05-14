@@ -1464,6 +1464,19 @@ pub fn run(start_hidden: bool) {
             // Save the current app assignments BEFORE destroying sinks,
             // otherwise PipeWire moves all streams to the fallback sink first.
             persistence::save_assignments();
+
+            // Capture virtual-source volumes one final time before destroying
+            // sinks. The periodic state-sync tick handles steady-state; this
+            // catches anything the user changed in the last <2 s window.
+            for name in [sinks::MUSIC_SINK_NAME, sinks::AUX_SINK_NAME] {
+                if let Ok(vol) = sinks::get_sink_volume(name) {
+                    persistence::save_volume_entry(name, vol);
+                }
+            }
+            if let Ok(vol) = sinks::get_source_volume(sinks::MIC_SOURCE_NAME) {
+                persistence::save_volume_entry(sinks::MIC_SOURCE_NAME, vol);
+            }
+
             if let Some(res) = resources.borrow_mut().take() {
                 res.shutdown.store(true, Ordering::Relaxed);
                 // Drop the router before sinks so filter-chains/loopbacks are
