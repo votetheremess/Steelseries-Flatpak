@@ -292,7 +292,7 @@ fn build_sink_dropdown(
     on_reroute: Option<Rc<dyn Fn(&str, &str)>>,
 ) -> gtk::DropDown {
     let devices = sinks::list_physical_sinks();
-    let display_names: Vec<&str> = devices.iter().map(|(_, desc)| desc.as_str()).collect();
+    let display_names: Vec<&str> = devices.iter().map(|(_, desc, _, _, _)| desc.as_str()).collect();
     let model = gtk::StringList::new(&display_names);
     let dropdown = gtk::DropDown::builder()
         .model(&model)
@@ -309,7 +309,7 @@ fn build_sink_dropdown(
         .cloned()
         .or_else(|| headset_sink.map(|s| s.to_string()));
     if let Some(ref target) = current {
-        for (i, (name, _)) in devices.iter().enumerate() {
+        for (i, (name, _, _, _, _)) in devices.iter().enumerate() {
             if name == target {
                 dropdown.set_selected(i as u32);
                 break;
@@ -326,7 +326,7 @@ fn build_sink_dropdown(
             if idx >= devices.len() {
                 return;
             }
-            let (ref device_name, _) = devices[idx];
+            let (ref device_name, _, _, _, _) = devices[idx];
             if let Some(ref cb) = on_reroute {
                 cb(&sink_name, device_name);
             }
@@ -343,10 +343,10 @@ fn build_source_dropdown(
     _headset_sink: Option<&str>,
     on_mic_reroute: Option<Rc<dyn Fn(&str)>>,
 ) -> gtk::DropDown {
-    let devices: Rc<RefCell<Vec<(String, String)>>> =
+    let devices: Rc<RefCell<Vec<sinks::PhysicalSourceRecord>>> =
         Rc::new(RefCell::new(sinks::list_physical_sources()));
     let model = gtk::StringList::new(&[]);
-    for (_, desc) in devices.borrow().iter() {
+    for (_, desc, _, _, _) in devices.borrow().iter() {
         model.append(desc);
     }
 
@@ -360,14 +360,13 @@ fn build_source_dropdown(
     dropdown.add_css_class("mixer-device-dropdown");
 
     // Pre-select the currently-linked mic. Mirror AudioRouter::create's logic:
-    // saved routing wins, otherwise fall back to the headset mic.
-    let current_mic = persistence::load_mixer_routing()
-        .get("mic")
-        .cloned()
+    // saved mic preference (5-field) wins, otherwise fall back to the headset mic.
+    let current_mic = persistence::load_mixer_routing_mic()
+        .map(|p| p.node_name)
         .or_else(|| router::find_headset_source().ok());
     if let Some(ref target) = current_mic {
         updating.set(true);
-        for (i, (name, _)) in devices.borrow().iter().enumerate() {
+        for (i, (name, _, _, _, _)) in devices.borrow().iter().enumerate() {
             if name == target {
                 dropdown.set_selected(i as u32);
                 break;
@@ -390,7 +389,7 @@ fn build_source_dropdown(
             // Save currently selected internal name so we can restore it after refresh
             let prev_name = {
                 let idx = dd.selected() as usize;
-                devices.borrow().get(idx).map(|(n, _)| n.clone())
+                devices.borrow().get(idx).map(|(n, _, _, _, _)| n.clone())
             };
 
             let new_devices = sinks::list_physical_sources();
@@ -399,11 +398,11 @@ fn build_source_dropdown(
             while model.n_items() > 0 {
                 model.remove(0);
             }
-            for (_, desc) in &new_devices {
+            for (_, desc, _, _, _) in &new_devices {
                 model.append(desc);
             }
             if let Some(prev) = prev_name {
-                for (i, (name, _)) in new_devices.iter().enumerate() {
+                for (i, (name, _, _, _, _)) in new_devices.iter().enumerate() {
                     if *name == prev {
                         dd.set_selected(i as u32);
                         break;
@@ -431,7 +430,7 @@ fn build_source_dropdown(
                 log::warn!("Mic dropdown index {idx} out of range ({})", devs.len());
                 return;
             }
-            let (ref source_name, ref desc) = devs[idx];
+            let (ref source_name, ref desc, _, _, _) = devs[idx];
             log::info!("Mic dropdown selected: {desc} ({source_name})");
             if let Some(ref cb) = on_mic_reroute {
                 cb(source_name);
