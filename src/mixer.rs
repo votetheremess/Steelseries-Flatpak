@@ -203,6 +203,19 @@ fn build_channel_strip(
                 } else {
                     sinks::set_sink_volume(name, pct).ok();
                 }
+
+                // Persist only for channels whose volume isn't owned elsewhere:
+                //   - Game/Chat → HID-dial-owned (saving would fight the dial).
+                //   - Master → WirePlumber owns the physical headset's volume.
+                // The 2-second state-sync tick also captures these, but
+                // writing here gives an immediate snapshot for the case where
+                // the app is killed before the next tick.
+                if name == sinks::MUSIC_SINK_NAME
+                    || name == sinks::AUX_SINK_NAME
+                    || name == sinks::MIC_SOURCE_NAME
+                {
+                    persistence::save_volume_entry(name, pct);
+                }
             }
         });
     }
