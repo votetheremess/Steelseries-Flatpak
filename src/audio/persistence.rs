@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use super::sinks::{is_managed, migrate_legacy_name};
 
@@ -16,11 +17,13 @@ fn config_path() -> Option<PathBuf> {
 }
 
 #[derive(Debug)]
-struct SinkInput {
-    id: u32,
-    sink_id: u32,
-    app_name: String,
+pub(crate) struct SinkInput {
+    pub(crate) id: u32,
+    pub(crate) sink_id: u32,
+    pub(crate) app_name: String,
 }
+
+pub(crate) const SUPPRESSION_WINDOW: Duration = Duration::from_millis(3000);
 
 /// Parse `pactl list sink-inputs` (verbose) into a structured list.
 fn list_sink_inputs() -> Vec<SinkInput> {
@@ -83,13 +86,17 @@ fn list_sinks_by_id() -> HashMap<u32, String> {
 /// Save the current set of apps assigned to ChatMix sinks to a config file,
 /// merging with any existing saved entries.
 ///
-/// Merge rules:
+/// Merge rules (monotonic):
 /// - Apps currently on a ChatMix sink → save/update their entry
-/// - Apps currently running but NOT on a ChatMix sink → remove from save (user moved them out)
+/// - Apps currently running but NOT on a managed sink → leave saved entry alone
 /// - Apps not currently running → keep their previous entry untouched
 ///
-/// This way, launching and closing the app without interacting doesn't wipe
-/// the save file, but intentionally moving an app off ChatMix is respected.
+/// Move-off-managed is no longer treated as a "forget me" signal here. The
+/// state-sync tick is the single source of truth for user-initiated moves;
+/// it writes through `update_saved_assignment` on every observed user move,
+/// and only ever ADDS / UPDATES entries (never deletes). This keeps the save
+/// file monotonic so a transient PulseAudio glitch reporting an unmanaged sink
+/// can't erase the user's preferences.
 pub fn save_assignments() {
     let Some(path) = config_path() else {
         log::warn!("Could not determine config path");
@@ -109,10 +116,8 @@ pub fn save_assignments() {
         if is_managed(sink_name) {
             // Currently on a managed sink → update the saved entry
             assignments.insert(input.app_name, sink_name.clone());
-        } else {
-            // Currently running but NOT on a managed sink → user moved it out, forget it
-            assignments.remove(&input.app_name);
         }
+        // else: monotonic — leave existing entry intact
     }
 
     if let Some(parent) = path.parent() {
@@ -265,6 +270,186 @@ pub fn restore_new_streams(seen_ids: &mut HashSet<u32>) {
             ),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stream-state reconciliation (Issue 1: persist user moves between Phase-1's
+// initial restore and shutdown's save_assignments)
+// ---------------------------------------------------------------------------
+//
+// Replaces the old new-stream watcher (`restore_new_streams` + `seen_ids`)
+// with a per-tick reconciler that:
+//   1. routes newly observed streams whose app has a saved target;
+//   2. observes user-driven moves and writes them through;
+//   3. suppresses our own moves for a window so the next pactl tick doesn't
+//      look like the user moving the stream back to where it was;
+//   4. garbage-collects state for streams that have died.
+//
+// The decision logic is split out into `reconcile_pure` /
+// `reconcile_pure_with_updates` so we can drive it from unit tests without
+// shelling out to pactl.
+
+/// Pure decision function: given inputs / state, append the moves to perform.
+/// No saved-assignment updates produced. No I/O.
+pub(crate) fn reconcile_pure(
+    inputs: &[SinkInput],
+    sinks_by_id: &HashMap<u32, String>,
+    saved: &HashMap<String, String>,
+    tracked: &mut HashMap<u32, String>,
+    pre: &mut HashMap<u32, (String, Instant)>,
+    moves: &mut Vec<(u32, String)>,
+    now: Instant,
+) {
+    let mut updates_buf = Vec::new();
+    reconcile_pure_with_updates(inputs, sinks_by_id, saved, tracked, pre, moves, &mut updates_buf, now);
+}
+
+/// Full decision function: also reports saved-assignment updates from observed
+/// user moves to managed sinks.
+pub(crate) fn reconcile_pure_with_updates(
+    inputs: &[SinkInput],
+    sinks_by_id: &HashMap<u32, String>,
+    saved: &HashMap<String, String>,
+    tracked: &mut HashMap<u32, String>,
+    pre: &mut HashMap<u32, (String, Instant)>,
+    moves: &mut Vec<(u32, String)>,
+    updates: &mut Vec<(String, String)>,
+    now: Instant,
+) {
+    let mut live_ids: HashSet<u32> = HashSet::new();
+    for input in inputs {
+        live_ids.insert(input.id);
+        let Some(current_sink) = sinks_by_id.get(&input.sink_id) else {
+            continue;
+        };
+
+        if !tracked.contains_key(&input.id) {
+            // Vacant — first time we're seeing this stream.
+            // Never touch our own EQ filter-chain streams (would create a
+            // feedback loop: sink → filter → sink → ...).
+            if input.app_name == "pw-cli" {
+                continue;
+            }
+            if let Some(target) = saved.get(&input.app_name) {
+                if current_sink != target {
+                    moves.push((input.id, target.clone()));
+                    tracked.insert(input.id, target.clone());
+                    pre.insert(input.id, (current_sink.clone(), now));
+                } else {
+                    tracked.insert(input.id, target.clone());
+                }
+            } else {
+                tracked.insert(input.id, current_sink.clone());
+            }
+        } else {
+            // Occupied — we've seen this stream before. Decide whether the
+            // sink change vs tracked is our own move (suppress) or the user's
+            // (persist).
+            let tracked_sink = tracked[&input.id].clone();
+            if &tracked_sink == current_sink {
+                continue;
+            }
+
+            let suppress = matches!(pre.get(&input.id), Some((pre_sink, t))
+                if pre_sink == current_sink && now.duration_since(*t) < SUPPRESSION_WINDOW);
+            if suppress {
+                continue;
+            }
+
+            if is_managed(current_sink) {
+                updates.push((input.app_name.clone(), current_sink.clone()));
+                tracked.insert(input.id, current_sink.clone());
+                pre.remove(&input.id);
+            }
+            // else: monotonic — silently ignore move-off-managed
+        }
+    }
+    pre.retain(|_, (_, t)| now.duration_since(*t) < SUPPRESSION_WINDOW);
+    tracked.retain(|id, _| live_ids.contains(id));
+    pre.retain(|id, _| live_ids.contains(id));
+}
+
+/// I/O wrapper around `reconcile_pure_with_updates`: queries pactl for the
+/// current state and applies any moves / saved-assignment updates the pure
+/// decision function emits.
+pub fn reconcile_stream_state(
+    tracked: &mut HashMap<u32, String>,
+    self_move_pre_sink: &mut HashMap<u32, (String, Instant)>,
+) {
+    let saved = read_saved_for_path();
+    let sinks_by_id = list_sinks_by_id();
+    let inputs = list_sink_inputs();
+
+    let mut moves = Vec::new();
+    let mut updates = Vec::new();
+    reconcile_pure_with_updates(
+        &inputs,
+        &sinks_by_id,
+        &saved,
+        tracked,
+        self_move_pre_sink,
+        &mut moves,
+        &mut updates,
+        Instant::now(),
+    );
+
+    for (id, target) in moves {
+        match move_sink_input(id, &target) {
+            Ok(()) => log::info!("Auto-routed stream {id} → {target}"),
+            Err(e) => {
+                log::warn!("Auto-route {id} → {target} failed: {e}");
+                // Roll back: use the pre-move sink from self_move_pre_sink
+                // (where the Vacant branch stashed it) so the next tick treats
+                // this as stable, not as a phantom user move.
+                let rollback = self_move_pre_sink
+                    .get(&id)
+                    .map(|(s, _)| s.clone())
+                    .unwrap_or_else(|| target.clone());
+                tracked.insert(id, rollback);
+                self_move_pre_sink.remove(&id);
+            }
+        }
+    }
+    for (app, sink) in updates {
+        update_saved_assignment(&app, &sink);
+    }
+}
+
+fn read_saved_for_path() -> HashMap<String, String> {
+    match config_path() {
+        Some(p) => read_saved(&p),
+        None => HashMap::new(),
+    }
+}
+
+/// Monotonic add/update of a single app→sink saved entry.
+pub fn update_saved_assignment(app: &str, sink: &str) {
+    let Some(path) = config_path() else {
+        return;
+    };
+    let mut saved = read_saved(&path);
+    saved.insert(app.into(), sink.into());
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let content: String = saved.iter().map(|(a, s)| format!("{a}\t{s}\n")).collect();
+    if let Err(e) = fs::write(&path, content) {
+        log::warn!("update_saved_assignment failed: {e}");
+    }
+}
+
+/// Snapshot of sink-input ID → sink_name at startup time. Used to seed the
+/// state-sync tick's `tracked` map so the first reconcile doesn't re-process
+/// streams that the startup `restore_assignments` already handled.
+pub fn initial_tracked() -> HashMap<u32, String> {
+    let sinks_by_id = list_sinks_by_id();
+    let mut out = HashMap::new();
+    for input in list_sink_inputs() {
+        if let Some(sink_name) = sinks_by_id.get(&input.sink_id) {
+            out.insert(input.id, sink_name.clone());
+        }
+    }
+    out
 }
 
 /// Delete the saved assignments file, if it exists.
@@ -500,6 +685,150 @@ pub fn save_volume_entry(channel: &str, volume_percent: u32) {
 
     if let Err(e) = fs::write(&path, content) {
         log::warn!("Failed to save volumes: {e}");
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn input(id: u32, sink_id: u32, app: &str) -> SinkInput {
+        SinkInput { id, sink_id, app_name: app.into() }
+    }
+
+    #[test]
+    fn vacant_with_saved_routes_and_seeds_suppression() {
+        let inputs = vec![input(10, 1, "Tidal")];
+        let mut sinks_by_id = HashMap::new();
+        sinks_by_id.insert(1u32, "SteelSeries_Game".to_string());
+        let mut saved = HashMap::new();
+        saved.insert("Tidal".into(), "SteelSeries_Music".into());
+
+        let mut tracked = HashMap::new();
+        let mut pre = HashMap::new();
+        let mut moves = Vec::new();
+
+        reconcile_pure(&inputs, &sinks_by_id, &saved, &mut tracked, &mut pre, &mut moves, Instant::now());
+
+        assert_eq!(moves, vec![(10u32, "SteelSeries_Music".to_string())]);
+        assert_eq!(tracked.get(&10), Some(&"SteelSeries_Music".into()));
+        assert_eq!(pre.get(&10).map(|(s, _)| s.as_str()), Some("SteelSeries_Game"));
+    }
+
+    #[test]
+    fn occupied_skips_within_suppression_window_when_pre_matches() {
+        let inputs = vec![input(10, 1, "Tidal")];
+        let mut sinks_by_id = HashMap::new();
+        sinks_by_id.insert(1u32, "SteelSeries_Game".to_string());  // pactl stale
+        let saved = HashMap::new();  // no longer in saved or different irrelevant
+
+        let mut tracked = HashMap::new();
+        tracked.insert(10u32, "SteelSeries_Music".to_string());
+        let mut pre = HashMap::new();
+        pre.insert(10u32, ("SteelSeries_Game".to_string(), Instant::now()));  // fresh suppression
+
+        let mut moves = Vec::new();
+        reconcile_pure(&inputs, &sinks_by_id, &saved, &mut tracked, &mut pre, &mut moves, Instant::now());
+
+        assert!(moves.is_empty(), "should not re-route during suppression");
+        assert_eq!(tracked.get(&10), Some(&"SteelSeries_Music".into()), "tracked unchanged during suppression");
+        assert!(pre.contains_key(&10), "suppression entry retained for multi-tick lag");
+    }
+
+    #[test]
+    fn occupied_user_move_to_managed_persists() {
+        let inputs = vec![input(10, 2, "Tidal")];
+        let mut sinks_by_id = HashMap::new();
+        sinks_by_id.insert(2u32, "SteelSeries_Music".to_string());
+        let saved = HashMap::new();
+
+        let mut tracked = HashMap::new();
+        tracked.insert(10u32, "SteelSeries_Game".to_string());
+        let mut pre = HashMap::new();
+
+        let mut moves = Vec::new();
+        let mut updates = Vec::new();
+
+        reconcile_pure_with_updates(
+            &inputs, &sinks_by_id, &saved,
+            &mut tracked, &mut pre, &mut moves, &mut updates,
+            Instant::now(),
+        );
+
+        assert!(moves.is_empty());
+        assert_eq!(updates, vec![("Tidal".to_string(), "SteelSeries_Music".to_string())]);
+        assert_eq!(tracked.get(&10), Some(&"SteelSeries_Music".into()));
+    }
+
+    #[test]
+    fn occupied_user_move_to_unmanaged_silently_ignored() {
+        let inputs = vec![input(10, 3, "Tidal")];
+        let mut sinks_by_id = HashMap::new();
+        sinks_by_id.insert(3u32, "alsa_output.laptop_speakers".to_string());
+        let saved = HashMap::new();
+
+        let mut tracked = HashMap::new();
+        tracked.insert(10u32, "SteelSeries_Music".to_string());
+        let mut pre = HashMap::new();
+
+        let mut moves = Vec::new();
+        let mut updates = Vec::new();
+
+        reconcile_pure_with_updates(
+            &inputs, &sinks_by_id, &saved,
+            &mut tracked, &mut pre, &mut moves, &mut updates,
+            Instant::now(),
+        );
+
+        assert!(moves.is_empty());
+        assert!(updates.is_empty(), "monotonic: move-off-managed does not destroy saved entry");
+    }
+
+    #[test]
+    fn suppression_expires_after_window() {
+        let inputs = vec![input(10, 1, "Tidal")];
+        let mut sinks_by_id = HashMap::new();
+        sinks_by_id.insert(1u32, "SteelSeries_Game".to_string());
+        let saved = HashMap::new();
+
+        let mut tracked = HashMap::new();
+        tracked.insert(10u32, "SteelSeries_Music".to_string());
+        let mut pre = HashMap::new();
+        // Backdate suppression entry
+        let stale_t = Instant::now() - Duration::from_millis(4000);
+        pre.insert(10u32, ("SteelSeries_Game".to_string(), stale_t));
+
+        let mut moves = Vec::new();
+        let mut updates = Vec::new();
+
+        reconcile_pure_with_updates(
+            &inputs, &sinks_by_id, &saved,
+            &mut tracked, &mut pre, &mut moves, &mut updates,
+            Instant::now(),
+        );
+
+        // Window expired (4s > 3s SUPPRESSION_WINDOW); processed as user move to managed.
+        assert_eq!(updates, vec![("Tidal".to_string(), "SteelSeries_Game".to_string())]);
+        assert!(!pre.contains_key(&10), "suppression entry removed after consumption");
+    }
+
+    #[test]
+    fn dead_ids_are_garbage_collected() {
+        let inputs: Vec<SinkInput> = vec![];  // stream 10 is gone
+        let sinks_by_id = HashMap::new();
+        let saved = HashMap::new();
+
+        let mut tracked = HashMap::new();
+        tracked.insert(10u32, "SteelSeries_Music".to_string());
+        let mut pre = HashMap::new();
+        pre.insert(10u32, ("SteelSeries_Game".to_string(), Instant::now()));
+
+        let mut moves = Vec::new();
+        reconcile_pure(&inputs, &sinks_by_id, &saved, &mut tracked, &mut pre, &mut moves, Instant::now());
+
+        assert!(tracked.is_empty(), "dead stream id removed from tracked");
+        assert!(pre.is_empty(), "dead stream id removed from suppression");
     }
 }
 
