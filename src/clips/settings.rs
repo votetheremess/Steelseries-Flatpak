@@ -234,7 +234,7 @@ pub fn build_clips_group(
     // ------------------------------------------------------------------
     let reset_row = adw::ActionRow::builder()
         .title("Capture source")
-        .subtitle("Pick the screen recorded by the clip buffer")
+        .subtitle("Pick the screen recorded by the clipper")
         .build();
     let row_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -251,13 +251,13 @@ pub fn build_clips_group(
     group.add(&reset_row);
 
     // ------------------------------------------------------------------
-    // Buffer length (SpinRow 30..=300 seconds).
+    // Recording length (SpinRow 30..=300 seconds).
     // ------------------------------------------------------------------
     let initial_buffer = clip_settings.borrow().buffer_length as f64;
     let buffer_adj = gtk::Adjustment::new(initial_buffer, 30.0, 300.0, 5.0, 30.0, 0.0);
     let buffer_row = adw::SpinRow::builder()
-        .title("Buffer length")
-        .subtitle("Seconds of gameplay kept in the replay buffer")
+        .title("Recording length")
+        .subtitle("Seconds of gameplay kept available for recording")
         .adjustment(&buffer_adj)
         .digits(0)
         .climb_rate(1.0)
@@ -385,14 +385,14 @@ pub fn build_clips_group(
     // ------------------------------------------------------------------
     let auto_arm_row = adw::SwitchRow::builder()
         .title("Auto-arm during games")
-        .subtitle("Start buffering when a known game launches")
+        .subtitle("Start recording when a known game launches")
         .active(clip_settings.borrow().auto_arm)
         .build();
     auto_arm_row.set_sensitive(!clip_settings.borrow().always_armed);
 
     let always_row = adw::SwitchRow::builder()
         .title("Always armed")
-        .subtitle("Buffer continuously, even outside games")
+        .subtitle("Record continuously, even outside games")
         .active(clip_settings.borrow().always_armed)
         .build();
 

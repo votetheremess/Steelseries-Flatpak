@@ -12,7 +12,7 @@
 //! |--------------------------|---------|-----------|------------------------|--------------|
 //! | Uninitialized            | yes     | dim white | "Set up Clips"         | no           |
 //! | Idle                     | no      | —         | —                      | no           |
-//! | Arming / Armed           | yes     | green     | "Buffering — <game>"   | no           |
+//! | Arming / Armed           | yes     | green     | "Recording — <game>"   | no           |
 //! | Saving                   | yes     | yellow    | "Saving…"              | no           |
 //! | ErrorState               | yes     | red       | "Capture stopped"      | yes          |
 //!
@@ -64,7 +64,7 @@ impl StatusIndicator {
             BufferState::Arming | BufferState::Armed => {
                 self.dot.add_css_class("dot-armed");
                 let g = game.unwrap_or("game");
-                self.label.set_label(&format!("Buffering: {g}"));
+                self.label.set_label(&format!("Recording: {g}"));
             }
             BufferState::Saving => {
                 self.dot.add_css_class("dot-saving");
