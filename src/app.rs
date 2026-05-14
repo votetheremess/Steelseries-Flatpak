@@ -1513,6 +1513,22 @@ fn init_pipeline() -> Result<AppResources, String> {
     log::info!("Creating virtual ChatMix sinks...");
     let sinks = VirtualSinks::create()?;
 
+    // Restore user-set volumes for Music / Aux / Mic. The virtual sinks above
+    // are recreated every launch so their volumes reset; load_volumes()
+    // returns whatever the periodic capture or shutdown handler last saved.
+    for (name, pct) in persistence::load_volumes() {
+        let result = if name == sinks::MIC_SOURCE_NAME {
+            sinks::set_source_volume(&name, pct)
+        } else {
+            sinks::set_sink_volume(&name, pct)
+        };
+        if let Err(e) = result {
+            log::warn!("Failed to restore volume for {name}: {e}");
+        } else {
+            log::info!("Restored volume: {name} = {pct}%");
+        }
+    }
+
     log::info!("Setting up audio routing...");
     let router = AudioRouter::create(&headset_sink)?;
 
