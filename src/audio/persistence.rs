@@ -293,11 +293,17 @@ fn mixer_routing_path() -> Option<PathBuf> {
 }
 
 /// Load saved mixer routing: channel_name → device_name.
+/// Skips the "mic" line — it's a 5-field record loaded separately via
+/// `load_mixer_routing_mic`.
 pub fn load_mixer_routing() -> HashMap<String, String> {
     let Some(path) = mixer_routing_path() else {
         return HashMap::new();
     };
-    let Ok(content) = fs::read_to_string(&path) else {
+    parse_mixer_routing_from(&path)
+}
+
+pub(crate) fn parse_mixer_routing_from(path: &std::path::Path) -> HashMap<String, String> {
+    let Ok(content) = fs::read_to_string(path) else {
         return HashMap::new();
     };
     content
@@ -305,13 +311,101 @@ pub fn load_mixer_routing() -> HashMap<String, String> {
         .filter_map(|line| {
             let mut parts = line.splitn(2, '\t');
             let channel = parts.next()?.to_string();
+            if channel == "mic" {
+                return None; // 5-field record, read separately
+            }
             let device = parts.next()?.to_string();
             Some((channel, device))
         })
         .collect()
 }
 
-/// Save a single mixer routing entry (merge with existing file).
+// ---------------------------------------------------------------------------
+// Mic preference (5-field mic line in mixer_routing.txt)
+// ---------------------------------------------------------------------------
+//
+// The mic line in mixer_routing.txt carries extra stable-id columns so we can
+// re-attach to the same physical microphone after a USB-port change, Bluetooth
+// reconnect, or PipeWire node-name renaming. Sink lines stay 2-field; only the
+// mic record uses 5 fields:
+//
+//   mic <TAB> node_name <TAB> product_name <TAB> bus_path <TAB> bluez_address
+//
+// All four mic columns are optional; legacy 2- or 3-field forms parse cleanly.
+// Empty bus_path / bluez_address are normal for ALSA / non-Bluetooth devices.
+
+#[derive(Debug, Clone, Default)]
+pub struct MicPreference {
+    pub node_name: String,
+    pub product_name: String,
+    pub bus_path: String,
+    pub bluez_address: String,
+}
+
+impl MicPreference {
+    pub fn from_fields(node: String, product: String, bus_path: String, bluez: String) -> Self {
+        Self {
+            node_name: node,
+            product_name: product,
+            bus_path,
+            bluez_address: bluez,
+        }
+    }
+}
+
+pub(crate) fn parse_mic_preference_from(path: &std::path::Path) -> Option<MicPreference> {
+    let content = fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let mut parts = line.split('\t');
+        if parts.next()? != "mic" {
+            continue;
+        }
+        let node_name = parts.next()?.to_string();
+        let product_name = parts.next().unwrap_or("").to_string();
+        let bus_path = parts.next().unwrap_or("").to_string();
+        let bluez_address = parts.next().unwrap_or("").to_string();
+        return Some(MicPreference {
+            node_name,
+            product_name,
+            bus_path,
+            bluez_address,
+        });
+    }
+    None
+}
+
+pub fn load_mixer_routing_mic() -> Option<MicPreference> {
+    parse_mic_preference_from(&mixer_routing_path()?)
+}
+
+pub fn save_mixer_routing_mic(pref: &MicPreference) {
+    let Some(path) = mixer_routing_path() else {
+        log::warn!("Could not determine mixer routing path");
+        return;
+    };
+    // load_mixer_routing() skips the mic line by design, so reading + writing
+    // sink entries here is safe (won't clobber the 5-field record we're about
+    // to write).
+    let routing = load_mixer_routing();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut content = String::new();
+    for (ch, dev) in &routing {
+        content.push_str(&format!("{ch}\t{dev}\n"));
+    }
+    content.push_str(&format!(
+        "mic\t{}\t{}\t{}\t{}\n",
+        pref.node_name, pref.product_name, pref.bus_path, pref.bluez_address
+    ));
+    if let Err(e) = fs::write(&path, content) {
+        log::warn!("Failed to save mixer routing (mic): {e}");
+    }
+}
+
+/// Save a single mixer routing entry (merge with existing file). Preserves
+/// any 5-field mic record so a sink reroute doesn't clobber the user's mic
+/// preference.
 pub fn save_mixer_routing_entry(channel: &str, device: &str) {
     let Some(path) = mixer_routing_path() else {
         log::warn!("Could not determine mixer routing path");
@@ -325,10 +419,17 @@ pub fn save_mixer_routing_entry(channel: &str, device: &str) {
         let _ = fs::create_dir_all(parent);
     }
 
-    let content: String = routing
-        .iter()
-        .map(|(ch, dev)| format!("{ch}\t{dev}\n"))
-        .collect();
+    let mut content = String::new();
+    for (ch, dev) in &routing {
+        content.push_str(&format!("{ch}\t{dev}\n"));
+    }
+    // Preserve the 5-field mic line if present.
+    if let Some(pref) = parse_mic_preference_from(&path) {
+        content.push_str(&format!(
+            "mic\t{}\t{}\t{}\t{}\n",
+            pref.node_name, pref.product_name, pref.bus_path, pref.bluez_address
+        ));
+    }
 
     if let Err(e) = fs::write(&path, content) {
         log::warn!("Failed to save mixer routing: {e}");
@@ -399,5 +500,68 @@ pub fn save_volume_entry(channel: &str, volume_percent: u32) {
 
     if let Err(e) = fs::write(&path, content) {
         log::warn!("Failed to save volumes: {e}");
+    }
+}
+
+#[cfg(test)]
+mod mic_preference_tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    fn write_mixer_file(dir: &TempDir, content: &str) -> PathBuf {
+        let path = dir.path().join(MIXER_ROUTING_FILE);
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_mic_preference_5_field() {
+        let dir = TempDir::new().unwrap();
+        let path = write_mixer_file(
+            &dir,
+            "SteelSeries_Game\talsa_output.foo\nmic\tnode_x\tProductX\tusb-0000:00:14.0-3\t00:11:22:33:44:55\n",
+        );
+        let pref = parse_mic_preference_from(&path).unwrap();
+        assert_eq!(pref.node_name, "node_x");
+        assert_eq!(pref.product_name, "ProductX");
+        assert_eq!(pref.bus_path, "usb-0000:00:14.0-3");
+        assert_eq!(pref.bluez_address, "00:11:22:33:44:55");
+    }
+
+    #[test]
+    fn load_mic_preference_legacy_2_field() {
+        let dir = TempDir::new().unwrap();
+        let path = write_mixer_file(&dir, "mic\tnode_legacy\n");
+        let pref = parse_mic_preference_from(&path).unwrap();
+        assert_eq!(pref.node_name, "node_legacy");
+        assert_eq!(pref.product_name, "");
+        assert_eq!(pref.bus_path, "");
+        assert_eq!(pref.bluez_address, "");
+    }
+
+    #[test]
+    fn load_mic_preference_legacy_3_field() {
+        let dir = TempDir::new().unwrap();
+        let path = write_mixer_file(&dir, "mic\tnode_x\tProductX\n");
+        let pref = parse_mic_preference_from(&path).unwrap();
+        assert_eq!(pref.node_name, "node_x");
+        assert_eq!(pref.product_name, "ProductX");
+        assert_eq!(pref.bus_path, "");
+        assert_eq!(pref.bluez_address, "");
+    }
+
+    #[test]
+    fn load_mixer_routing_skips_mic_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = write_mixer_file(
+            &dir,
+            "SteelSeries_Game\talsa_a\nmic\tnode_x\tP\tB\tM\nSteelSeries_Aux\talsa_b\n",
+        );
+        let routing = parse_mixer_routing_from(&path);
+        assert_eq!(routing.get("SteelSeries_Game").map(|s| s.as_str()), Some("alsa_a"));
+        assert_eq!(routing.get("SteelSeries_Aux").map(|s| s.as_str()), Some("alsa_b"));
+        assert!(routing.get("mic").is_none(), "mic must not be in homogeneous routing map");
     }
 }
