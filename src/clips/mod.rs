@@ -37,6 +37,16 @@ pub enum ClipCommand {
     SaveClipLong,   // 120 s
     /// Tear down current capture and reload with new config.
     Reconfigure { config: CaptureConfig },
+    /// User pressed Pause: stop the active GSR replay session and clear the
+    /// backend's auto-restart limiter. The buffer is lost (GSR SIGINT
+    /// discards the in-memory ring). Distinct from StopReplay because Pause
+    /// reflects user intent, not a state-machine transition.
+    PauseRecording,
+    /// User pressed Resume: clear the supervisor's restart-attempts limiter
+    /// so a long-paused stretch doesn't count against the rolling window
+    /// when the next StartReplay (already queued by BufferController::resume)
+    /// arms a fresh session.
+    ResumeRecording,
     /// Final shutdown (drives the thread to exit).
     Shutdown,
 }

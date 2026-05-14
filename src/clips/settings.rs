@@ -55,6 +55,12 @@ pub struct ClipSettings {
     /// wizard (i.e., picked a screen). Page 3 is optional and does not flip
     /// this flag.
     pub onboarding_complete: bool,
+    /// Last-known display string for the save-clip hotkey, as reported by the
+    /// portal's `list_shortcuts` after a successful `bind_shortcuts`. Defaults
+    /// to "ALT+S" (matching `suggested_bindings`) until the first bind
+    /// completes. Used by the dashboard Clips section to label the hotkey
+    /// hint without forcing a portal round-trip on every refresh.
+    pub save_hotkey_display: String,
 }
 
 impl Default for ClipSettings {
@@ -70,6 +76,7 @@ impl Default for ClipSettings {
                 .join("Videos/Clips"),
             disk_cap_gb: None,
             onboarding_complete: false,
+            save_hotkey_display: "ALT+S".to_string(),
         }
     }
 }
@@ -104,6 +111,7 @@ pub fn load() -> ClipSettings {
             "storage_path" => s.storage_path = PathBuf::from(v),
             "disk_cap_gb" => s.disk_cap_gb = v.parse().ok(),
             "onboarding_complete" => s.onboarding_complete = v == "1",
+            "save_hotkey_display" => s.save_hotkey_display = v.to_string(),
             _ => {}
         }
     }
@@ -137,6 +145,7 @@ pub fn save(s: &ClipSettings) -> std::io::Result<()> {
         "onboarding_complete={}\n",
         if s.onboarding_complete { 1 } else { 0 }
     ));
+    body.push_str(&format!("save_hotkey_display={}\n", s.save_hotkey_display));
     std::fs::write(path, body)
 }
 
@@ -225,7 +234,7 @@ pub fn build_clips_group(
     // ------------------------------------------------------------------
     let reset_row = adw::ActionRow::builder()
         .title("Capture source")
-        .subtitle("Pick the screen recorded by the clip buffer")
+        .subtitle("Pick the screen recorded by the clipper")
         .build();
     let row_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -242,13 +251,13 @@ pub fn build_clips_group(
     group.add(&reset_row);
 
     // ------------------------------------------------------------------
-    // Buffer length (SpinRow 30..=300 seconds).
+    // Recording length (SpinRow 30..=300 seconds).
     // ------------------------------------------------------------------
     let initial_buffer = clip_settings.borrow().buffer_length as f64;
     let buffer_adj = gtk::Adjustment::new(initial_buffer, 30.0, 300.0, 5.0, 30.0, 0.0);
     let buffer_row = adw::SpinRow::builder()
-        .title("Buffer length")
-        .subtitle("Seconds of gameplay kept in the replay buffer")
+        .title("Recording length")
+        .subtitle("Seconds of gameplay kept available for recording")
         .adjustment(&buffer_adj)
         .digits(0)
         .climb_rate(1.0)
@@ -317,12 +326,13 @@ pub fn build_clips_group(
     // ------------------------------------------------------------------
     // Hotkey row (current binding + Rebind button).
     //
-    // The actual binding is owned by KDE's GlobalShortcuts portal; we don't
-    // know the user's current chord at runtime (ashpd 0.10 has no
-    // `list_shortcuts` API). We display the suggested default — which is
-    // also what KDE persists if the user just clicks "Save" in the bind
-    // dialog without changes — and let the Rebind button re-open the
-    // portal picker if they want to switch chords.
+    // The actual binding is owned by KDE's GlobalShortcuts portal. ashpd
+    // 0.11.1 exposes `list_shortcuts`, which we call after `bind_shortcuts`
+    // to persist the portal's display string into `save_hotkey_display`
+    // (used by the dashboard Clips section's hotkey hint).
+    // `ConfigureShortcuts` is still a portal-level API not available, so
+    // the Rebind button re-opens the picker by firing a fresh bind
+    // request.
     // ------------------------------------------------------------------
     let hotkey_row = adw::ActionRow::builder()
         .title("Hotkey")
@@ -375,14 +385,14 @@ pub fn build_clips_group(
     // ------------------------------------------------------------------
     let auto_arm_row = adw::SwitchRow::builder()
         .title("Auto-arm during games")
-        .subtitle("Start buffering when a known game launches")
+        .subtitle("Start recording when a known game launches")
         .active(clip_settings.borrow().auto_arm)
         .build();
     auto_arm_row.set_sensitive(!clip_settings.borrow().always_armed);
 
     let always_row = adw::SwitchRow::builder()
         .title("Always armed")
-        .subtitle("Buffer continuously, even outside games")
+        .subtitle("Record continuously, even outside games")
         .active(clip_settings.borrow().always_armed)
         .build();
 

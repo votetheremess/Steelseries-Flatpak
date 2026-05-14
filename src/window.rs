@@ -52,7 +52,14 @@ struct Widgets {
     spare_battery_label: gtk::Label,
     spare_battery_icon: gtk::Image,
     balance_scale: gtk::Scale,
+    /// Cloned reference to the indicator inside `clips_section`. Kept here
+    /// so `set_clips_state` can keep its existing signature; the underlying
+    /// GObject is shared, so mutations from either path are reflected in
+    /// the visible widget.
     clips_indicator: crate::clips::StatusIndicator,
+    /// Owned by the dashboard row-1 section. `None` only in tests / partial
+    /// builds; in normal operation always `Some` after `build_dashboard_page`.
+    clips_section: Option<ClipsSectionWidgets>,
     mixer: Option<MixerWidgets>,
     clips: Option<Rc<crate::clips::ClipsPage>>,
     /// Sidebar Clips toggle button. Held so `show_clips_tab()` can flip it
@@ -200,6 +207,7 @@ impl ChatMixWindow {
              .clip-indicator .dot-saving { color: rgb(242,205,64); } \
              .clip-indicator .dot-error  { color: rgb(230,77,77); } \
              .clip-indicator .dot-setup  { color: alpha(currentColor, 0.5); } \
+             .clip-indicator .dot-paused { color: rgb(160,160,160); } \
              .clips-row-card { padding: 14px 18px; }"
         );
         gtk::style_context_add_provider_for_display(
@@ -283,6 +291,13 @@ impl ChatMixWindow {
     /// event poll in `app.rs` after each `BufferController::on_backend_event`
     /// + after the auto-resume block at startup so the badge reflects the
     /// initial buffer state without flicker.
+    ///
+    /// Also refreshes the row-1 Clips section's Pause button so its label /
+    /// sensitivity tracks state transitions (Idle / Armed → button enabled,
+    /// Saving / Error → disabled). `user_paused` is derived from the state
+    /// because `Paused` is the only state where the buffer's `user_paused`
+    /// flag is true, and this method's callers don't have the buffer ref
+    /// handy.
     pub fn set_clips_state(
         &self,
         state: crate::clips::BufferState,
@@ -290,6 +305,26 @@ impl ChatMixWindow {
     ) {
         let w = self.inner.borrow();
         w.clips_indicator.set_state(state, game);
+        if let Some(section) = &w.clips_section {
+            section.refresh_state(state, matches!(state, crate::clips::BufferState::Paused));
+        }
+    }
+
+    /// Refresh the dashboard's row-1 Clips section: pause-button label /
+    /// sensitivity, duration label, hotkey hint. Indicator state is updated
+    /// separately via `set_clips_state` (no game name needed here).
+    /// Called by the `app.pause-recording-toggle` GAction handler and any
+    /// other site that wants the section's controls to reflect a new
+    /// buffer state / settings snapshot.
+    pub fn refresh_clips_section(
+        &self,
+        state: crate::clips::BufferState,
+        paused: bool,
+        settings: &crate::clips::settings::ClipSettings,
+    ) {
+        if let Some(section) = &self.inner.borrow().clips_section {
+            section.refresh(state, paused, settings);
+        }
     }
 
     pub fn set_battery(&self, headset: u8, spare: u8) {
@@ -434,14 +469,11 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
     let (device_card, dev_widgets) = build_device_card();
 
     // SizeGroup forces all rows to match the tallest (Device card's ActionRows).
-    // The clips_row participates so the indicator's padding doesn't create a
-    // shorter trailing row that breaks the card's vertical rhythm.
     let row_height = gtk::SizeGroup::new(gtk::SizeGroupMode::Vertical);
     row_height.add_widget(&dev_widgets.0);
     row_height.add_widget(&dev_widgets.1);
     row_height.add_widget(&status_result.battery_row);
     row_height.add_widget(&status_result.chatmix_row);
-    row_height.add_widget(&status_result.clips_row);
 
     // Also match the cards themselves for any sub-pixel rounding
     let card_height = gtk::SizeGroup::new(gtk::SizeGroupMode::Vertical);
@@ -450,6 +482,12 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
 
     grid.attach(&status_card, 0, 0, 1, 1);
     grid.attach(&device_card, 1, 0, 1, 1);
+
+    // Row 1: full-width Clips section. Holds the indicator (cloned from the
+    // section widgets so `set_clips_state` continues to update one shared
+    // dot/label) plus the Save/Pause buttons + duration/hotkey hints.
+    let (clips_section, clips_section_widgets) = build_clips_section();
+    grid.attach(&clips_section, 0, 1, 2, 1);
 
     let footer = gtk::Label::builder()
         .label("Assign apps to SteelSeries sinks in your system sound settings. Assignments are remembered between sessions.")
@@ -471,6 +509,9 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
     clamp.set_child(Some(&content));
     scroll.set_child(Some(&clamp));
 
+    // `StatusIndicator` is Clone (all fields are GObject refs) so the
+    // dashboard's set_clips_state path and the section's own indicator
+    // refer to the same widget tree under the hood.
     let widgets = Widgets {
         device_row: dev_widgets.0,
         noise_row: dev_widgets.1,
@@ -479,7 +520,8 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
         spare_battery_label: status_result.spare_battery_label,
         spare_battery_icon: status_result.spare_battery_icon,
         balance_scale: status_result.balance_scale,
-        clips_indicator: status_result.clips_indicator,
+        clips_indicator: clips_section_widgets.indicator.clone(),
+        clips_section: Some(clips_section_widgets),
         mixer: None,
         clips: None,
         clips_sidebar_btn: None,
@@ -488,7 +530,160 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
     (scroll.upcast(), widgets)
 }
 
-// -- Status card (battery + chatmix + clip indicator) --
+// -- Clips section (row 1, full-width) --
+//
+// Sits on its own row beneath the Status / Device cards. Shows the live
+// indicator at the top and a compact action row underneath: Save / Pause
+// buttons on the left, recording-duration + hotkey-hint labels on the right.
+// Owned by `Widgets.clips_section` so the action handler in app.rs and the
+// backend-event poll can both refresh it in lockstep with state changes.
+
+pub struct ClipsSectionWidgets {
+    pub indicator: crate::clips::StatusIndicator,
+    pub save_button: gtk::Button,
+    pub pause_button: gtk::Button,
+    pub duration_label: gtk::Label,
+    pub hotkey_label: gtk::Label,
+}
+
+impl ClipsSectionWidgets {
+    /// Refresh the pause button (label + sensitivity), the duration hint,
+    /// and the hotkey hint. The indicator itself updates via the separate
+    /// `set_clips_state` path so the action handler doesn't need a game
+    /// name to call refresh.
+    pub fn refresh(
+        &self,
+        buffer_state: crate::clips::buffer::BufferState,
+        user_paused: bool,
+        settings: &crate::clips::settings::ClipSettings,
+    ) {
+        self.refresh_state(buffer_state, user_paused);
+
+        // Duration label — round to the nicest unit at the breakpoints.
+        let secs = settings.buffer_length;
+        let text = if secs < 60 {
+            format!("Recording last {secs} seconds")
+        } else if secs < 3600 {
+            format!("Recording last {} minutes", (secs as f64 / 60.0).round() as u32)
+        } else {
+            format!(
+                "Recording last {} hour{}",
+                secs / 3600,
+                if secs >= 7200 { "s" } else { "" }
+            )
+        };
+        self.duration_label.set_label(&text);
+
+        // Hotkey label — falls back to the suggested default if the portal
+        // hasn't filled in the display string yet.
+        let hk = if settings.save_hotkey_display.is_empty() {
+            "Hotkey: ALT+S".to_string()
+        } else {
+            format!("Hotkey: {}", settings.save_hotkey_display)
+        };
+        self.hotkey_label.set_label(&hk);
+    }
+
+    /// Refresh just the pause button (label + sensitivity), without
+    /// touching duration / hotkey labels (those don't change on backend
+    /// state transitions and require a settings ref). Called from
+    /// `ChatMixWindow::set_clips_state` so the button tracks state changes
+    /// driven by the backend-event poll without needing a settings cell on
+    /// that path.
+    pub fn refresh_state(
+        &self,
+        buffer_state: crate::clips::buffer::BufferState,
+        user_paused: bool,
+    ) {
+        use crate::clips::buffer::BufferState as S;
+        let (base_label, sensitive) = match buffer_state {
+            S::Uninitialized => ("Pause Recording", false),
+            S::Idle | S::Arming | S::Armed => ("Pause Recording", true),
+            S::Saving => ("Pause Recording", false),
+            S::ErrorState => ("Pause Recording", false),
+            S::Paused => ("Resume Recording", true),
+        };
+        // `user_paused` takes precedence on the label: even if the state
+        // briefly says Idle (after a Pause → Resume race), the button copy
+        // tracks intent.
+        let label = if user_paused { "Resume Recording" } else { base_label };
+        self.pause_button.set_label(label);
+        self.pause_button.set_sensitive(sensitive);
+    }
+}
+
+fn build_clips_section() -> (adw::PreferencesGroup, ClipsSectionWidgets) {
+    let group = adw::PreferencesGroup::builder().title("Clips").build();
+
+    // Row 1: status indicator (re-used widget — clones share the underlying
+    // GObject so `set_state` from elsewhere updates the same dot/label).
+    let indicator = crate::clips::build_status_indicator();
+    let indicator_holder = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .halign(gtk::Align::Center)
+        .margin_top(8)
+        .margin_bottom(4)
+        .build();
+    indicator_holder.append(&indicator.root);
+    let row_indicator = gtk::ListBoxRow::builder()
+        .child(&indicator_holder)
+        .activatable(false)
+        .selectable(false)
+        .build();
+    group.add(&row_indicator);
+
+    // Row 2: action row — Save / Pause buttons on the left, duration +
+    // hotkey hints on the right.
+    let action_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_start(15)
+        .margin_end(15)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+
+    let save_button = gtk::Button::builder().label("Save Clip Now").build();
+    save_button.add_css_class("suggested-action");
+    save_button.set_action_name(Some("app.save-clip"));
+    action_box.append(&save_button);
+
+    let pause_button = gtk::Button::builder().label("Pause Recording").build();
+    pause_button.set_action_name(Some("app.pause-recording-toggle"));
+    pause_button.set_tooltip_text(Some(
+        "Pause recording. The last N seconds of recording will be lost.",
+    ));
+    action_box.append(&pause_button);
+
+    let spacer = gtk::Box::builder().hexpand(true).build();
+    action_box.append(&spacer);
+
+    let duration_label = gtk::Label::builder().label("Recording last 60 seconds").build();
+    duration_label.add_css_class("dim-label");
+    action_box.append(&duration_label);
+
+    let hotkey_label = gtk::Label::builder().label("Hotkey: ALT+S").build();
+    hotkey_label.add_css_class("dim-label");
+    action_box.append(&hotkey_label);
+
+    let row_action = gtk::ListBoxRow::builder()
+        .child(&action_box)
+        .activatable(false)
+        .selectable(false)
+        .build();
+    group.add(&row_action);
+
+    let widgets = ClipsSectionWidgets {
+        indicator,
+        save_button,
+        pause_button,
+        duration_label,
+        hotkey_label,
+    };
+    (group, widgets)
+}
+
+// -- Status card (battery + chatmix) --
 
 struct StatusResult {
     headset_battery_label: gtk::Label,
@@ -496,10 +691,8 @@ struct StatusResult {
     spare_battery_label: gtk::Label,
     spare_battery_icon: gtk::Image,
     balance_scale: gtk::Scale,
-    clips_indicator: crate::clips::StatusIndicator,
     battery_row: adw::ActionRow,
     chatmix_row: gtk::ListBoxRow,
-    clips_row: gtk::ListBoxRow,
 }
 
 fn build_status_card() -> (adw::PreferencesGroup, StatusResult) {
@@ -569,34 +762,14 @@ fn build_status_card() -> (adw::PreferencesGroup, StatusResult) {
         .build();
     group.add(&chatmix_row);
 
-    // Clip status badge — sits below the ChatMix slider. Wrapped in a
-    // non-activatable ListBoxRow so it picks up the same row padding /
-    // separator styling as the rows above without being clickable.
-    let clips_indicator = crate::clips::build_status_indicator();
-    let clips_holder = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .halign(gtk::Align::Center)
-        .margin_top(4)
-        .margin_bottom(4)
-        .build();
-    clips_holder.append(&clips_indicator.root);
-    let clips_row = gtk::ListBoxRow::builder()
-        .child(&clips_holder)
-        .activatable(false)
-        .selectable(false)
-        .build();
-    group.add(&clips_row);
-
     let result = StatusResult {
         headset_battery_label,
         headset_battery_icon,
         spare_battery_label,
         spare_battery_icon,
         balance_scale,
-        clips_indicator,
         battery_row,
         chatmix_row,
-        clips_row,
     };
     (group, result)
 }

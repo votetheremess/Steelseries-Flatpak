@@ -532,6 +532,21 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
                     let _ = evt_tx.send(BackendEvent::Armed);
                 }
             }
+            Ok(ClipCommand::PauseRecording) => {
+                log::info!("backend: handling PauseRecording");
+                restart_attempts.clear();
+                if active.is_some() {
+                    disarm(&mut active);
+                }
+            }
+            Ok(ClipCommand::ResumeRecording) => {
+                log::info!("backend: handling ResumeRecording");
+                restart_attempts.clear();
+                // BufferController::resume() already called maybe_arm synchronously on
+                // the GTK side, so a StartReplay (if applicable) is in the channel queue
+                // either before or after this ResumeRecording (order depends on
+                // mpsc fairness). ResumeRecording is solely a limiter-clear here.
+            }
             Ok(ClipCommand::Shutdown) => {
                 disarm(&mut active);
                 return;
