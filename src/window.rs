@@ -52,7 +52,14 @@ struct Widgets {
     spare_battery_label: gtk::Label,
     spare_battery_icon: gtk::Image,
     balance_scale: gtk::Scale,
+    /// Cloned reference to the indicator inside `clips_section`. Kept here
+    /// so `set_clips_state` can keep its existing signature; the underlying
+    /// GObject is shared, so mutations from either path are reflected in
+    /// the visible widget.
     clips_indicator: crate::clips::StatusIndicator,
+    /// Owned by the dashboard row-1 section. `None` only in tests / partial
+    /// builds; in normal operation always `Some` after `build_dashboard_page`.
+    clips_section: Option<ClipsSectionWidgets>,
     mixer: Option<MixerWidgets>,
     clips: Option<Rc<crate::clips::ClipsPage>>,
     /// Sidebar Clips toggle button. Held so `show_clips_tab()` can flip it
@@ -293,6 +300,23 @@ impl ChatMixWindow {
         w.clips_indicator.set_state(state, game);
     }
 
+    /// Refresh the dashboard's row-1 Clips section: pause-button label /
+    /// sensitivity, duration label, hotkey hint. Indicator state is updated
+    /// separately via `set_clips_state` (no game name needed here).
+    /// Called by the `app.pause-recording-toggle` GAction handler and any
+    /// other site that wants the section's controls to reflect a new
+    /// buffer state / settings snapshot.
+    pub fn refresh_clips_section(
+        &self,
+        state: crate::clips::BufferState,
+        paused: bool,
+        settings: &crate::clips::settings::ClipSettings,
+    ) {
+        if let Some(section) = &self.inner.borrow().clips_section {
+            section.refresh(state, paused, settings);
+        }
+    }
+
     pub fn set_battery(&self, headset: u8, spare: u8) {
         let w = self.inner.borrow();
 
@@ -435,14 +459,11 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
     let (device_card, dev_widgets) = build_device_card();
 
     // SizeGroup forces all rows to match the tallest (Device card's ActionRows).
-    // The clips_row participates so the indicator's padding doesn't create a
-    // shorter trailing row that breaks the card's vertical rhythm.
     let row_height = gtk::SizeGroup::new(gtk::SizeGroupMode::Vertical);
     row_height.add_widget(&dev_widgets.0);
     row_height.add_widget(&dev_widgets.1);
     row_height.add_widget(&status_result.battery_row);
     row_height.add_widget(&status_result.chatmix_row);
-    row_height.add_widget(&status_result.clips_row);
 
     // Also match the cards themselves for any sub-pixel rounding
     let card_height = gtk::SizeGroup::new(gtk::SizeGroupMode::Vertical);
@@ -451,6 +472,12 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
 
     grid.attach(&status_card, 0, 0, 1, 1);
     grid.attach(&device_card, 1, 0, 1, 1);
+
+    // Row 1: full-width Clips section. Holds the indicator (cloned from the
+    // section widgets so `set_clips_state` continues to update one shared
+    // dot/label) plus the Save/Pause buttons + duration/hotkey hints.
+    let (clips_section, clips_section_widgets) = build_clips_section();
+    grid.attach(&clips_section, 0, 1, 2, 1);
 
     let footer = gtk::Label::builder()
         .label("Assign apps to SteelSeries sinks in your system sound settings. Assignments are remembered between sessions.")
@@ -472,6 +499,9 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
     clamp.set_child(Some(&content));
     scroll.set_child(Some(&clamp));
 
+    // `StatusIndicator` is Clone (all fields are GObject refs) so the
+    // dashboard's set_clips_state path and the section's own indicator
+    // refer to the same widget tree under the hood.
     let widgets = Widgets {
         device_row: dev_widgets.0,
         noise_row: dev_widgets.1,
@@ -480,7 +510,8 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
         spare_battery_label: status_result.spare_battery_label,
         spare_battery_icon: status_result.spare_battery_icon,
         balance_scale: status_result.balance_scale,
-        clips_indicator: status_result.clips_indicator,
+        clips_indicator: clips_section_widgets.indicator.clone(),
+        clips_section: Some(clips_section_widgets),
         mixer: None,
         clips: None,
         clips_sidebar_btn: None,
@@ -628,7 +659,7 @@ fn build_clips_section() -> (adw::PreferencesGroup, ClipsSectionWidgets) {
     (group, widgets)
 }
 
-// -- Status card (battery + chatmix + clip indicator) --
+// -- Status card (battery + chatmix) --
 
 struct StatusResult {
     headset_battery_label: gtk::Label,
@@ -636,10 +667,8 @@ struct StatusResult {
     spare_battery_label: gtk::Label,
     spare_battery_icon: gtk::Image,
     balance_scale: gtk::Scale,
-    clips_indicator: crate::clips::StatusIndicator,
     battery_row: adw::ActionRow,
     chatmix_row: gtk::ListBoxRow,
-    clips_row: gtk::ListBoxRow,
 }
 
 fn build_status_card() -> (adw::PreferencesGroup, StatusResult) {
@@ -709,34 +738,14 @@ fn build_status_card() -> (adw::PreferencesGroup, StatusResult) {
         .build();
     group.add(&chatmix_row);
 
-    // Clip status badge — sits below the ChatMix slider. Wrapped in a
-    // non-activatable ListBoxRow so it picks up the same row padding /
-    // separator styling as the rows above without being clickable.
-    let clips_indicator = crate::clips::build_status_indicator();
-    let clips_holder = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .halign(gtk::Align::Center)
-        .margin_top(4)
-        .margin_bottom(4)
-        .build();
-    clips_holder.append(&clips_indicator.root);
-    let clips_row = gtk::ListBoxRow::builder()
-        .child(&clips_holder)
-        .activatable(false)
-        .selectable(false)
-        .build();
-    group.add(&clips_row);
-
     let result = StatusResult {
         headset_battery_label,
         headset_battery_icon,
         spare_battery_label,
         spare_battery_icon,
         balance_scale,
-        clips_indicator,
         battery_row,
         chatmix_row,
-        clips_row,
     };
     (group, result)
 }
