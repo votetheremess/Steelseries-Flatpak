@@ -788,6 +788,53 @@ pub fn run(start_hidden: bool) {
                 app.add_action_entries([save_action]);
             }
 
+            // app.pause-recording-toggle — bound to the Pause / Resume
+            // button in the dashboard's row-1 Clips section. Toggles the
+            // BufferController's user_paused flag: on pause, send
+            // PauseRecording so the backend disarms its active GSR session
+            // and clears the auto-restart limiter; on resume, send
+            // ResumeRecording (in addition to the StartReplay that
+            // BufferController::resume queues via maybe_arm) so the
+            // restart-attempt budget starts fresh. Refreshes the section
+            // UI immediately rather than waiting for the next BackendEvent.
+            {
+                let buffer_for_toggle = buffer.clone();
+                let resources_for_toggle = resources.clone();
+                let settings_for_toggle = clip_settings.clone();
+                let window_for_toggle = window.clone();
+                let toggle_action = gtk::gio::ActionEntry::builder("pause-recording-toggle")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        let cmd_tx = resources_for_toggle
+                            .borrow()
+                            .as_ref()
+                            .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
+                        let Some(tx) = cmd_tx else {
+                            log::warn!("no clip backend available for pause-recording-toggle");
+                            return;
+                        };
+                        let next_paused = !buffer_for_toggle.borrow().user_paused();
+                        if next_paused {
+                            buffer_for_toggle.borrow_mut().pause();
+                            let _ = tx.send(crate::clips::ClipCommand::PauseRecording);
+                        } else {
+                            buffer_for_toggle.borrow_mut().resume(&tx);
+                            // resume() may have already sent StartReplay via maybe_arm;
+                            // also send ResumeRecording so the supervisor's
+                            // restart-attempts limiter starts fresh.
+                            let _ = tx.send(crate::clips::ClipCommand::ResumeRecording);
+                        }
+                        // Refresh the clips section UI via the public
+                        // accessor on ChatMixWindow so the button label /
+                        // sensitivity reflects the new state immediately.
+                        let state = buffer_for_toggle.borrow().state();
+                        let paused = buffer_for_toggle.borrow().user_paused();
+                        let settings = settings_for_toggle.borrow();
+                        window_for_toggle.refresh_clips_section(state, paused, &settings);
+                    })
+                    .build();
+                app.add_action_entries([toggle_action]);
+            }
+
             // app.retry-clip-capture — bound to the Retry button shown
             // alongside the dashboard's clip-status badge when
             // BufferState::ErrorState is active. Calls
