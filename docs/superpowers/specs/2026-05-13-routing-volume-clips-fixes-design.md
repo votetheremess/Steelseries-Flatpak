@@ -2,9 +2,9 @@
 
 **Date:** 2026-05-13
 **Topic:** Four bug + UX fixes — app→sink persistence, mic hotplug, virtual-source volume persistence, Clips home-page section relocation/expansion
-**Status:** Draft, awaiting QA + critic review
+**Status:** Revised draft (revision 2 — addresses QA & critic feedback)
 **Target branch:** `clipping-system` (worktree `/var/home/admin/Documents/Code/SteelseriesFlatpak-clipping/`)
-**Authoritative bug list:** `knownbugs.txt` (issues 1–3) + new request (issue 4)
+**Authoritative bug list:** `knownbugs.txt` (issues 1–3) + user request (issue 4)
 
 ## Context
 
@@ -15,31 +15,47 @@ Four issues surfaced during live testing on the `clipping-system` branch. Three 
 1. **Tidal's sink assignment doesn't persist.** Open Tidal → it lands on `SteelSeries_Chat`. Move it to `SteelSeries_Music` via system sound settings. Close Tidal, reopen Tidal → it goes back to `SteelSeries_Chat`. Repeats forever.
 2. **Mic source doesn't auto-switch on hotplug.** App starts while preferred mic (e.g. Alias Pro) is powered off → app falls back to whatever is available. Turn the preferred mic on later → app does not detect or switch. User has to manually re-select from the dropdown every time.
 3. **`SteelSeries_Mic` (and likely `_Music` / `_Aux`) volume doesn't persist correctly.** User sets `SteelSeries_Mic` to 100% via system sound settings. Closes the app. Reopens. Volume comes up as something other than 100% — and the value is inconsistent across launches (47%, 83%, etc.).
-4. **Clip status indicator placement is wrong + needs more controls.** Today the indicator sits as a third row inside the Status card, crowding it. User wants it relocated to its own full-width section below Status + Device, and expanded to include: "Save Clip Now" button, recording duration display, current hotkey hint, and a pause / resume toggle. Plus a terminology pass — user-visible strings should say "recording" rather than "buffering".
+4. **Clip status indicator placement is wrong + needs more controls.** Today the indicator sits as a third row inside the Status card, crowding it. User wants it relocated to its own full-width section below Status + Device, expanded with: "Save Clip Now" button, recording-duration display, current hotkey hint, and a pause / resume toggle. Plus a terminology pass — user-visible strings should say "recording" rather than "buffering".
 
 ### Why these have proven hard
 
-Issues 1 and 3 share a structural root cause: **we only capture user-state at app shutdown.** `persistence::save_assignments` runs in `app.connect_shutdown`. The volume save in `mixer.rs` runs on slider change but never observes external (system-sound-settings) changes. When the user changes state externally and then doesn't trigger our shutdown — or when a watched object (a sink-input) disappears before our shutdown — the saved state is stale.
+Issues 1 and 3 share a structural root cause: **we only capture user-state at app shutdown.** `persistence::save_assignments` runs in `app.connect_shutdown`. Volume changes are never persisted at all on `clipping-system` today (see "Branch state vs. main" below). When the user changes state externally and then doesn't trigger our shutdown — or when a watched object (a sink-input) disappears before our shutdown — the saved state is stale or absent.
 
 Issue 2 is similar in spirit: the mic source is chosen once during `AudioRouter::create` and never reconsidered. PipeWire's source list is dynamic; our model is static.
 
-Issue 4 is a layout + content change, plus a domain-terminology change, plus one new ClipCommand variant (pause/resume). Mechanically independent of 1–3 except for one possible touchpoint in `app.rs` to wire a new command.
+Issue 4 is a layout + content change, plus a domain-terminology change, plus a pause/resume mechanism that GSR replay mode does **not** natively support (see "Pause/resume design — what 'pause' means" below).
+
+### Branch state vs. main (important)
+
+The clipping-system branch **does not yet contain** the volume-persistence helpers that exist on `main` (`load_volumes`, `save_volume_entry`, `volumes_path`, the `VOLUMES_FILE` constant, the `init_pipeline` apply-volumes loop, and the `mixer.rs` slider save-on-change handler). The CLAUDE.md description of `volumes.txt` is forward-looking and reflects `main`. Implementer A must therefore **port these helpers from main** before extending them. The spec assumes this porting step is part of Implementer A's scope; see "Implementer A scope" below for the file list.
 
 ## Goals
 
 - **Saved app→sink assignments always reflect the user's current routing,** whether the user moved a stream via system sound settings, via this app's future UI, or any other means.
-- **The preferred mic source auto-attaches as soon as it appears,** without any manual user action, as long as the user has expressed a preference via the mixer dropdown previously.
+- **The preferred mic source auto-attaches as soon as it appears,** without any manual user action, as long as the user has expressed a preference via the mixer dropdown previously — and tolerates USB re-enumeration and Bluetooth profile switches that change the node name but not the underlying device.
 - **Virtual sink/source volumes survive app restarts**, including when the user changed them externally (system sound settings, `pactl`, etc.).
-- **Clips section on the home page is its own card,** full-width across the dashboard, with an expanded set of controls; user-visible language is "recording" rather than "buffering" throughout the clip UI.
+- **Clips section on the home page is its own card,** full-width across the dashboard, with an expanded set of controls; user-visible language is "recording" rather than "buffering" throughout the clip UI; pause behavior is honest about what it costs the user.
 
 ## Non-goals
 
-- Reusing existing virtual sinks across launches instead of destroy/recreate. The current architecture deliberately destroys and recreates for clean state on startup. Issue 3 is solved by saving the right values, not by avoiding the recreate.
-- Game and Chat volume persistence. These remain HID-dial-owned by design and are out of scope for the volume save logic.
+- Reusing existing virtual sinks across launches instead of destroy/recreate. Current architecture deliberately destroys and recreates for clean state on startup. Issue 3 is solved by saving the right values, not by avoiding the recreate.
+- Game and Chat volume persistence. These remain HID-dial-owned and out of scope for the volume save logic.
 - Master (physical headset) volume persistence. WirePlumber owns this natively; we do not duplicate.
 - Per-app routing through some new GUI surface. Routing remains exclusively system-sound-settings driven; we just track it more reliably.
-- Renaming internal types (`BufferController`, `buffer.rs`, etc.). Only user-visible strings change for the "recording" terminology pass.
+- Renaming internal type names (`BufferController`, `buffer.rs`, etc.). Only user-visible strings change for the "recording" terminology pass.
 - Auto-detect / auto-switch any non-preferred mic. Only the user's explicit saved preference triggers a switch on hotplug.
+- "Resumable" pause that preserves an in-progress replay buffer across pause/resume. GSR's replay mode has no pause primitive (SIGUSR2 pause only applies to direct-record mode, per the GSR docs). Our pause stops the recorder, drops the buffer, and resumes from zero. UI copy must communicate this honestly.
+
+## Score-gate rubric (calibration)
+
+To make the user's "fix and re-review until ≥ 90%" workflow well-defined, the QA + critic reviewers score each phase against four dimensions, each weighted 25:
+
+- **Correctness** — does the design / plan / implementation actually solve the user-reported bugs? Logic gaps, edge cases, race conditions count against.
+- **Idiomatic fit** — does it follow the existing patterns in CLAUDE.md and the codebase (mpsc + glib::timeout_add_seconds_local, single-entry merge writes, persistent pw-cli session, etc.)?
+- **Completeness** — error handling, edge cases, testing recipes, file impact, threading, terminology consistency.
+- **Implementation guidance** — would two parallel implementers given this spec produce mergeable code without re-deriving design decisions?
+
+A 90/100 means each dimension is at least ~22/25. Mixed scores (e.g. QA 91 / critic 88) trigger another revision pass focused on whichever dimension(s) the lower-scoring reviewer flagged. The next pass re-scores from scratch — there is no carry-over.
 
 ## Architecture
 
@@ -47,164 +63,320 @@ Issue 4 is a layout + content change, plus a domain-terminology change, plus one
 
 Three of the four issues are different facets of the same structural gap: we don't observe-and-persist state continuously, only at startup and shutdown. The fix is to **extend the existing 2-second sink-input watcher in `app.rs`** (today it only calls `persistence::restore_new_streams`) into a broader "state sync tick" that does four things per cycle:
 
-1. **Auto-route new streams** — existing behavior, unchanged: any new sink-input gets routed to its saved sink.
-2. **Detect user-initiated stream moves** (Issue 1) — track `HashMap<u32, String>` mapping sink-input-id → last-known sink-name. If a stream's sink changes between polls and the new sink is one of ours, update the saved assignment. If it moves *off* a managed sink, drop the saved entry.
-3. **Mic hotplug check** (Issue 2) — read the saved preferred mic from `mixer_routing.txt`. If it's set, differs from the currently linked mic, and appears in `list_physical_sources()`, call `router.reroute_mic(saved)`.
-4. **Virtual sink/source volume capture** (Issue 3) — query `get_sink_volume` / `get_source_volume` for `SteelSeries_Music`, `SteelSeries_Aux`, `SteelSeries_Mic`. If the value differs from what's recorded in memory since the last write, call `persistence::save_volume_entry`.
+1. **Auto-route new streams** — existing behavior, retained: any new sink-input gets routed to its saved sink.
+2. **Detect user-initiated stream moves** (Issue 1) — track `HashMap<u32, String>` mapping sink-input-id → last-known sink-name. If a stream's sink changes between polls and the new sink is one of ours, update the saved assignment. **Do not** drop the saved entry on a move *off* a managed sink (see "Decision: only persist moves *onto* managed sinks" below).
+3. **Mic hotplug check** (Issue 2) — see "Issue 2 detailed design" for the stable-identifier match logic. Cached in the `AudioRouter`; no per-tick disk read.
+4. **Virtual sink/source volume capture** (Issue 3) — query `get_sink_volume` / `get_source_volume` for `SteelSeries_Music`, `SteelSeries_Aux`, `SteelSeries_Mic`. If the value differs from what's in the in-memory `last_saved_volumes` cache, write through `persistence::save_volume_entry` and update the cache.
 
-All four pieces share one `glib::timeout_add_local` at 2 seconds. No new threads, no new MPSC channels, no new IPC. The state-tracking maps live as `Rc<RefCell<...>>` captured by the closure.
+All four pieces share one `glib::timeout_add_seconds_local(2, ...)` callback (matching the existing `STREAM_WATCH_SECS = 2` constant in `app.rs`). No new threads, no new MPSC channels, no new IPC. The state-tracking maps live as `Rc<RefCell<...>>` captured by the closure.
+
+#### Factoring: extract the tick body into a small module
+
+To minimize `app.rs` co-editing between the two parallel implementers, the tick body lives in a new module — `src/audio/state_sync.rs` — exporting a single function:
+
+```rust
+pub fn tick(
+    tracked: &mut HashMap<u32, String>,
+    last_saved_volumes: &mut HashMap<String, u32>,
+    router: &mut AudioRouter,
+);
+```
+
+`app.rs`'s `connect_activate` closure registers the timer with a one-liner closure that calls `state_sync::tick(...)`. Implementer A owns `state_sync.rs` in full; Implementer B does not touch it. Implementer B's only `app.rs` change is registering one new GAction (`pause-recording-toggle`), discussed below.
 
 #### Shutdown capture (Issue 3, finale)
 
-In `app.connect_shutdown`, just before dropping `AppResources` (which destroys the sinks via `VirtualSinks::drop`), iterate `[MUSIC_SINK_NAME, AUX_SINK_NAME, MIC_SOURCE_NAME]`, query each volume, and write to `volumes.txt`. This catches the user's final state at quit time — important because the periodic poll only fires every 2 seconds, and a fast change-then-quit could miss the periodic window.
+In `app.connect_shutdown`, immediately before dropping `AppResources` (which destroys the sinks via `VirtualSinks::drop`), iterate the three virtual targets, query each volume, and write through `persistence::save_volume_entry`. This catches the user's final state at quit time — important because the periodic poll only fires every 2 seconds, and a fast change-then-quit could miss the periodic window.
+
+The existing `persistence::save_assignments()` call at shutdown **stays**, with a doc-comment justifying why: it captures any sink-input that the periodic tick missed (a stream that briefly existed within a single 2-second window — typically a notification chime). Removing it is a separate, safer change for a future cleanup pass.
 
 ### Issue 4: Clips section relocation + expansion + terminology
+
+#### Pause/resume design — what "pause" means
+
+GSR's replay mode has no native pause primitive (verified against the GSR docs at `git.dec05eba.com/gpu-screen-recorder/about/` — SIGUSR2 pause is "only applicable and useful when recording (not streaming nor replay)"). The spec therefore defines pause as **stop the recorder entirely**:
+
+- Pause: send the GSR child SIGINT via the existing `disarm()` path, mark a new `user_paused: bool` on `BufferController`, and stop participating in auto-arm. The replay buffer is **lost**.
+- Resume: clear `user_paused`, re-enter the normal auto-arm flow (which arms when a game is detected, or immediately if `always_armed` is on).
+
+UI copy must communicate the cost: the Pause button's tooltip reads "Pause recording. The current 60-second buffer will be lost." (substitute the actual buffer length).
+
+A new `BufferState` variant `Paused` is added, sitting between `Idle` and `Arming` in the conceptual lifecycle. Transitions:
+
+| From state | Pause | Resume |
+|---|---|---|
+| Uninitialized | (button hidden) | (button hidden) |
+| Idle | → Paused | (button shows Pause) |
+| Arming | (interpret as Pause: cancel arm, → Paused) | n/a |
+| Armed | → Paused (disarm, buffer lost) | n/a |
+| Saving | button disabled until Saved | n/a |
+| ErrorState | (button hidden — retry button shown instead) | n/a |
+| Paused | n/a | → Idle (auto-arm picks up from here) |
+
+`auto_arm` and `always_armed` are honored *after* Resume, not during Paused. Pausing does not flip those flags; it just adds a gate that prevents them from acting. This means the user does not need to remember to re-enable always-armed after pausing.
+
+The `restart_attempts` rolling-window counter (currently `MAX_RESTARTS_PER_WINDOW = 3` per 30 s) is **cleared** when entering Paused, matching the existing convention from `StartReplay` / `Stop`: user intent overrides the limiter.
+
+#### New `ClipCommand` variants
+
+Add to `src/clips/mod.rs`'s `ClipCommand` enum:
+
+```rust
+ClipCommand::PauseRecording,   // backend: enter user-paused, disarm
+ClipCommand::ResumeRecording,  // backend: clear user-paused, drive normal arm path
+```
+
+Two variants instead of one `SetRecordingEnabled(bool)` keep the supervisor's match arms small and self-documenting. Both clear `restart_attempts` per above.
+
+The supervisor's `run_backend` command loop gains two new arms:
+
+```rust
+Ok(ClipCommand::PauseRecording) => {
+    restart_attempts.clear();
+    if active.is_some() {
+        disarm(&mut active);  // SIGINT via existing path
+    }
+    // BufferController transitions: caller side is responsible (see below)
+}
+Ok(ClipCommand::ResumeRecording) => {
+    restart_attempts.clear();
+    // Resume just re-enables auto-arm; the next tick of BufferController will
+    // re-call StartReplay if conditions are met.
+}
+```
+
+`BufferController` flips `user_paused` on the GTK main thread (the BufferController already lives there), and re-applies arm logic from its existing tick.
 
 #### Layout change in `src/window.rs`
 
 - Remove the clip indicator from `build_status_card()`. Drop `clips_row` and `clips_indicator` fields from `StatusResult`. Drop the `clips_row` line from the row-height `SizeGroup`.
-- Add a new `build_clips_section() -> (adw::PreferencesGroup, ClipsSectionWidgets)` returning a styled card titled **"Clips"** (per user choice).
+- Add `build_clips_section(...) -> (adw::PreferencesGroup, ClipsSectionWidgets)` returning a styled card titled **"Clips"** (per user choice).
 - Attach the new section to the dashboard grid as row 1 spanning both columns: `grid.attach(&clips_section, 0, 1, 2, 1)`.
 - `Widgets.clips_indicator` continues to live on the top-level `Widgets` struct but now sources from the new section.
+- The dashboard `card_height` `SizeGroup` continues to group `status_card` and `device_card` — the new clips section is *outside* that group, so its width is just the grid's column-span result and its height is intrinsic.
 
 #### Contents of the Clips section
 
-The card contains, in order:
+Vertical `gtk::Box`, in order:
 
-1. **Status indicator badge** — the existing `crate::clips::StatusIndicator` widget, unchanged in appearance (colored dot + game name).
-2. **"Save Clip Now" button** — primary button (`add_css_class("suggested-action")`) that sends the existing `ClipCommand::SaveClip` over the channel. Identical effect to the hotkey path.
-3. **Recording-duration label** — text reading e.g. "Recording last 5 minutes". Pulled from `ClipSettings.buffer_duration_seconds` (or whatever the equivalent field is named in the existing settings) and rendered via a humanize helper. Re-renders when settings change.
-4. **Hotkey hint label** — text e.g. "Hotkey: ALT+S". Pulled from `ClipSettings.save_clip_binding` (or equivalent). Re-renders when settings change.
-5. **Pause / Resume toggle** — a `gtk::Button` that flips between "Pause Recording" and "Resume Recording" depending on the buffer state. Sends a new `ClipCommand` variant (named below).
+1. **Status indicator badge** — the existing `crate::clips::StatusIndicator` widget, unchanged in appearance (colored dot + game name + state label).
+2. **Action row** — horizontal `gtk::Box` containing:
+   - **"Save Clip Now" button** (primary, `add_css_class("suggested-action")`) — uses `set_action_name(Some("app.save-clip"))` to reuse the existing GAction. No new wiring.
+   - **Pause / Resume toggle button** — `gtk::Button` whose label flips between "Pause Recording" and "Resume Recording" depending on `BufferController.user_paused`. Action name `app.pause-recording-toggle`. Tooltip text per the cost-disclosure rule above.
+   - **Recording-duration label** — text reading e.g. "Recording last 60 seconds" (or "Recording last 5 minutes" for 300 s). Pulled from `ClipSettings.buffer_length` (u32, seconds). Format rule: `< 60 → "Recording last N seconds"`, `60 ≤ N < 3600 → "Recording last M minutes"` (where `M = N / 60` rounded), `≥ 3600 → "Recording last H hour(s)"`. Re-renders when `ClipSettings` changes.
+   - **Hotkey hint label** — text e.g. "Hotkey: ALT+S". Pulled from a new `ClipSettings.save_hotkey_display` field (see below). Re-renders when the binding changes.
 
-Layout: vertical `gtk::Box`; the indicator sits at the top, the action button + duration + hotkey + pause toggle form a horizontal row underneath, with the action button left-aligned and the secondary info right-aligned.
+The action row uses `homogeneous = false` and `spacing = 12`. Suggested order left→right: Save | Pause/Resume | (flexible spacer) | Duration | Hotkey.
 
-#### New `ClipCommand` variant
+#### New persisted field: `save_hotkey_display`
 
-Add a single new variant to the enum in `src/clips/mod.rs`:
+`ClipSettings` gains:
 
 ```rust
-ClipCommand::SetRecordingEnabled(bool),  // true = resume, false = pause
+pub save_hotkey_display: String,  // human-readable; e.g. "ALT+S". Default "ALT+S".
 ```
 
-Single setter (not two separate Pause / Resume variants) keeps the toggle simple and lets the implementer use one match arm in the backend supervisor. The supervisor (`backend.rs`) interprets `false` by sending SIGSTOP-equivalent (or the appropriate GSR-level mechanism — pause may map to `flatpak kill` + restart with the same args under the existing supervisor; the implementer chooses the cleanest path). On `true`, the supervisor re-arms the buffer.
+Persisted as `save_hotkey_display=...` in the existing `clips_settings.txt`. Set:
+- **At onboarding-page-3 (hotkey binding step):** when the user picks a chord via `org.freedesktop.portal.GlobalShortcuts`, the chord's human-readable label is written to this field.
+- **At "Reset Hotkey":** if the user clears/re-binds via Settings → Clips, same write.
 
-The pause/resume implementation must reuse the existing supervisor's restart-loop infrastructure (rolling-window deque, etc.) rather than ad-hoc process management.
+If the field is empty at read time, fall back to the literal string "ALT+S" (the documented default). The portal's binding-introspection API is unreliable across portals/versions, so we maintain our own persisted label rather than query at display time.
 
 #### Terminology pass
 
-Anywhere in user-visible strings the word "buffer" or "buffering" appears in the clip UI, replace with "recording". Survey points:
+Anywhere user-visible strings in the clip UI use the words "buffer" or "buffering" describing the user-facing state, replace with "recording". The pass is **enumerated** rather than greppy:
 
-- `src/clips/indicator.rs` — state labels ("Buffering" → "Recording")
-- `src/clips/settings.rs` — preference labels, descriptions, tooltips
-- `src/clips/mod.rs` — any user-facing string constants
-- `src/clips/notifications.rs` — toast text
-- `src/window.rs` — labels added in this work
+| File | String to change |
+|---|---|
+| `src/clips/indicator.rs` | "Buffering" state label → "Recording"; tooltip "Buffer armed" → "Recording armed"; etc. (audit by reading the file) |
+| `src/clips/settings.rs` | UI label "Buffer length" → "Recording length"; description "How many seconds to buffer..." → "How many seconds of gameplay to keep ready..." |
+| `src/clips/notifications.rs` | Toast text "buffer..." → "recording..." (audit by reading the file) |
+| `src/window.rs` | Any string added in this PR uses "recording" |
 
-Internal type names (`BufferController`, `buffer.rs`, etc.) and code comments stay as-is. The renaming is a UX/copy change, not a refactor.
+Implementer B reads each listed file end-to-end and rewrites only the user-visible literal strings. Internal type names (`BufferController`, `BufferState`, `buffer.rs`, `buffer_length`), variable names, log lines, doc comments, and code comments stay. The "buffer" word in those internal contexts is fine — it describes the in-memory replay buffer accurately.
+
+Verification: `grep -nE "[Bb]uffer(ing)?" src/clips/indicator.rs src/clips/settings.rs src/clips/notifications.rs src/window.rs` should return only:
+- Identifier references (`buffer_length`, `BufferController`, etc.)
+- Log-line / doc-comment references
+- Zero user-visible string literals that read "buffering" / "buffer" in a UI sense
+
+The "recording" word does not conflict with the user-facing meaning of save. The pause-button tooltip explicitly disambiguates: "Pause recording. The current N-second buffer will be lost." — the word "buffer" appears here in the tooltip *because* we're describing what gets lost, not the action itself.
 
 ## Detailed designs
 
 ### Issue 1 — User-move detection
 
-Today, `persistence::restore_new_streams(seen_ids: &mut HashSet<u32>)` only acts on streams whose IDs it hasn't seen. The "seen" semantics are wrong for the new requirement — we want to keep observing streams forever, not just on first appearance.
+#### Decision: only persist moves *onto* managed sinks
 
-**Approach:** change the signature from `seen_ids: &mut HashSet<u32>` to `tracked: &mut HashMap<u32, String>` where the value is the last-known sink name. Each poll:
+Today's `save_assignments` removes an entry when a stream's current sink is unmanaged. The proposed user-move detection extends that. **The new design drops the "remove on move-off-managed" rule** for two reasons:
+
+- *A brief preview to a different physical speaker via system sound settings is a legitimate user action that should not destroy the saved assignment for the app.* The user expects Tidal → Music to persist across app restarts, even if they briefly auditioned Tidal on the laptop speakers.
+- *App_name as a persistence key is brittle* (some apps don't set `application.name`; browsers report the same name across tabs; Discord changes name between voice and notification streams) — this is an existing issue, not caused by this spec, but the brittle key means we shouldn't aggressively *destroy* entries on transient observations.
+
+The new rule is **monotonic**: a move *onto* a managed sink updates / creates the saved entry; a move *off* a managed sink is ignored (the entry stays). The user can still purge entries via the existing "Clear Config" button.
+
+#### Race against pactl eventual consistency
+
+`pactl move-sink-input` is generally synchronous, but the next call to `pactl list sink-inputs` can observe pre-move state for a brief window after a self-initiated move. The spec mitigates this with a **post-move tracking rule**: when the tick's Vacant branch initiates a `move_sink_input(id, target)`:
+
+- If the move succeeded (`Ok(())`), insert `tracked[id] = target` (the *intended* target, not the observed sink). The next tick will see `tracked[id] == target`; if pactl now reports the actual target, no change. If pactl still reports the pre-move sink, the Occupied branch only acts on a transition *onto* a managed sink — and the pre-move sink is the headset / unmanaged, so we *don't* trigger a spurious user-move event.
+- If the move failed (`Err(...)`), insert `tracked[id] = current_sink` (the observed pre-move sink). Next tick treats it as Occupied-stable; no spurious update.
+
+This is sufficient because the new "only persist moves onto managed sinks" rule means a transient blip from managed→unmanaged is silently ignored — exactly the right behavior.
+
+Sink-input ID reuse: PipeWire sink-input IDs can be reused after a long session. The garbage-collection pass at end-of-tick (drop entries from `tracked` whose IDs no longer appear in `list_sink_inputs`) ensures that a reused ID always enters the tick as Vacant from the tick's perspective, which routes correctly via the saved entry for the new `app_name`.
+
+#### First-tick seeding
+
+Add `persistence::initial_tracked() -> HashMap<u32, String>` returning `(id → current_sink_name)` for every live sink-input at startup. `app.rs` calls it before installing the tick closure and seeds the closure's `tracked` map. First tick sees all existing streams as Occupied with identical sink → no-ops. Streams that appear after startup hit the Vacant branch correctly.
+
+`init_pipeline::restore_assignments()` stays as-is — it runs once at startup, moves saved streams to their target sinks immediately, and the seeding then captures the *final* sink each stream landed on. The tick is additive, not replacing.
+
+#### Helper signatures
+
+```rust
+// In src/audio/persistence.rs:
+
+// New
+pub fn initial_tracked() -> HashMap<u32, String>;  // id -> sink_name for live sink-inputs
+
+// New — single-entry write, same shape as save_mixer_routing_entry
+pub fn update_saved_assignment(app: &str, sink: &str);
+
+// state_sync calls these in a tick — they internally call list_sink_inputs / list_sinks_by_id
+pub fn reconcile_stream_state(tracked: &mut HashMap<u32, String>);
+
+// Existing — UNCHANGED
+pub fn save_assignments();
+pub fn restore_assignments();
+pub fn clear_saved() -> Result<(), String>;
+```
+
+`restore_new_streams` is renamed to `reconcile_stream_state` and gets the new signature. Existing callers in `app.rs` are updated by Implementer A.
+
+#### Tick pseudocode (Issue 1 portion)
 
 ```text
-for input in list_sink_inputs():
-    let current_sink = sinks_by_id[input.sink_id];
+fn reconcile_stream_state(tracked):
+    sinks_by_id = list_sinks_by_id()
+    inputs = list_sink_inputs()
+    saved = read_saved()
+    live_ids = set()
 
-    match tracked.entry(input.id):
-        Vacant => {
-            // New stream — preserve the existing auto-route behavior
-            if input.app_name == "pw-cli": skip
-            if let Some(target) = saved.get(&input.app_name):
-                if current_sink != target: move_sink_input(input.id, target)
-                final_sink = target.clone()
-            else:
-                final_sink = current_sink.to_string()
-            tracked.insert(input.id, final_sink)
-        }
-        Occupied(entry) => {
-            // Existing stream — detect a user move
-            if entry.get() != current_sink:
-                if is_managed(current_sink):
-                    update_saved_assignment(input.app_name, current_sink)
+    for input in inputs:
+        live_ids.add(input.id)
+        current_sink = sinks_by_id[input.sink_id]
+
+        match tracked.entry(input.id):
+            Vacant:
+                if input.app_name == "pw-cli": continue
+                if let Some(target) = saved.get(&input.app_name):
+                    if current_sink != target:
+                        result = move_sink_input(input.id, target)
+                        if result.is_ok():
+                            tracked[input.id] = target.clone()
+                        else:
+                            tracked[input.id] = current_sink.to_string()
+                    else:
+                        tracked[input.id] = target.clone()
                 else:
-                    remove_saved_assignment(input.app_name)
-                *entry.get_mut() = current_sink.to_string()
-        }
+                    tracked[input.id] = current_sink.to_string()
+
+            Occupied(entry):
+                if entry.get() != current_sink:
+                    // User-initiated move (with possible eventual-consistency stagger).
+                    if is_managed(current_sink):
+                        update_saved_assignment(input.app_name, current_sink)
+                        *entry.get_mut() = current_sink.to_string()
+                    // else: ignore (don't destroy saved entry on transient unmanaged move)
+
+    // Garbage collect dead IDs
+    tracked.retain(|id, _| live_ids.contains(id))
 ```
 
-Garbage collection: at the end of each poll, drop entries from `tracked` whose IDs no longer appear in `list_sink_inputs()`. Necessary so the map doesn't grow unbounded across long sessions.
+### Issue 2 — Mic hotplug detection with stable identifier matching
 
-Update helpers `update_saved_assignment(app, sink)` and `remove_saved_assignment(app)` work on the existing `assignments.txt` file via the same read-modify-write pattern as `save_mixer_routing_entry`. They write single entries, not the whole file each time.
+#### Save both node-name and stable-id at user-pick time
 
-**Why not poll-all and write-all every tick:** writes are cheap but produce noisy filesystem activity. Single-entry updates are clearer and avoid clobbering concurrent writes from `save_assignments` at shutdown. (We keep `save_assignments` for the case where the user changes state and quits before the next 2-second tick.)
+`mixer_routing.txt` today stores entries as `channel\tdevice_name\n`. The new design extends the `"mic"` entry to a tab-separated triple: `mic\t<node_name>\t<stable_id>\n` where `<stable_id>` is `device.product.name` (or, if unavailable, an empty string). Backward-compatible: lines with only two fields are treated as `<stable_id>` = empty.
 
-### Issue 2 — Mic hotplug detection
+`device.product.name` is a stable PipeWire property exposed for most USB and Bluetooth audio devices via `pactl list sources` verbose output, e.g.:
 
-Add to `AudioRouter`:
-
-```rust
-pub struct AudioRouter {
-    eq_pipeline: EqPipeline,
-    mic_linked: bool,
-    current_mic_source: Option<String>,  // NEW
-}
+```
+Properties:
+    ...
+    device.product.name = "Arctis Nova Elite"
+    ...
 ```
 
-`current_mic_source` is set after every successful `link_mic_source` call (both in `create` and in `reroute_mic`). Public accessor `pub fn current_mic_source(&self) -> Option<&str>`.
+It survives USB re-enumeration and Bluetooth profile switches (A2DP ↔ HSP/HFP) where the node name changes but the underlying device doesn't.
 
-New method on `AudioRouter`:
+`sinks::list_physical_sources()` is extended to also return the product name. New tuple shape: `Vec<(String /*node_name*/, String /*description*/, Option<String> /*product_name*/)>`. Existing callers in `mixer.rs` are updated by Implementer A (it's an audio-module change).
 
-```rust
-pub fn check_mic_hotplug(&mut self) {
-    let saved = persistence::load_mixer_routing().get("mic").cloned();
-    let Some(saved_source) = saved else { return };  // No preference recorded
-    if self.current_mic_source.as_deref() == Some(saved_source.as_str()) {
-        return;  // Already on it
-    }
-    let available = sinks::list_physical_sources();
-    if !available.iter().any(|(name, _)| name == &saved_source) {
-        return;  // Saved device isn't online
-    }
-    log::info!("Mic hotplug: switching to saved preference {saved_source}");
-    self.reroute_mic(&saved_source);
-}
-```
+When the user picks a mic from the dropdown, `reroute_mic` is called with the node name; `persistence::save_mixer_routing_mic(node_name, product_name)` writes both fields.
 
-Called from the state-sync tick.
-
-**Why only on explicit preference:** if the user has never used the dropdown, there's no `"mic"` entry in `mixer_routing.txt`. We do not auto-save the startup-fallback choice, so this method early-returns. New users see no surprising behavior.
-
-**Edge cases:**
-
-- *User unplugs the preferred mic mid-session.* The link to the preferred device breaks at the PipeWire layer; we continue running with a broken link until the next poll observes the preferred device is gone — but our hotplug check doesn't currently auto-fall-back. In v1, the user manually picks a fallback via the dropdown; their pick updates the saved preference, so when the preferred device comes back, we'll obediently switch back to it (per user's explicit choice). Document this in code-comments.
-- *User picks fallback mic Y while preferred mic X is offline; later X comes online.* Saved preference is now Y, not X. No switch. Correct.
-- *Two preferred-mic-class devices online at once with the same name.* Out of scope; PipeWire's node-name uniqueness handles it at a lower layer.
-
-### Issue 3 — Volume persistence
-
-#### Periodic capture (in the state-sync tick)
-
-Maintain `Rc<RefCell<HashMap<String, u32>>>` `last_saved_volumes`, initially populated from `persistence::load_volumes()`. Each tick:
+#### Match logic in hotplug check
 
 ```text
-for name in [MUSIC_SINK_NAME, AUX_SINK_NAME]:
-    if let Ok(vol) = sinks::get_sink_volume(name):
-        if last_saved_volumes[name] != vol:
-            persistence::save_volume_entry(name, vol)
-            last_saved_volumes[name] = vol
+fn check_mic_hotplug(router, available_sources):
+    let Some((saved_node, saved_product)) = router.preferred_mic else: return  // no preference
 
-if let Ok(vol) = sinks::get_source_volume(MIC_SOURCE_NAME):
-    if last_saved_volumes[MIC_SOURCE_NAME] != vol:
-        persistence::save_volume_entry(MIC_SOURCE_NAME, vol)
-        last_saved_volumes[MIC_SOURCE_NAME] = vol
+    if router.current_mic_source == saved_node: return  // already on the exact node
+
+    // Try exact node name first
+    if available_sources.iter().any(|(n, _, _)| n == saved_node):
+        router.reroute_mic(saved_node);
+        return
+
+    // Fallback: match by product name (handles USB re-enum, BT profile switch)
+    if !saved_product.is_empty():
+        if let Some((alt_node, _, _)) = available_sources.iter().find(|(_, _, p)| p.as_deref() == Some(&saved_product)):
+            router.reroute_mic(alt_node);
+            return
+    // else: saved device not online; do nothing this tick
 ```
 
-#### Shutdown capture
+The preferred-mic cache lives on `AudioRouter` and is loaded once from `mixer_routing.txt` in `AudioRouter::create`. It's invalidated/updated on every `reroute_mic` call. The hotplug check reads the cache; **no per-tick disk read.**
+
+#### Edge cases
+
+- *User unplugs preferred mid-session.* The link to the preferred device breaks at the PipeWire layer. Our hotplug check doesn't currently auto-fall-back to a different device. In v1, the user manually picks a fallback via the dropdown; their pick updates the saved preference, so when the preferred device comes back, we'll switch back to *whatever the user last picked* — which may now be the fallback, not the original preferred. This is a known behavior of "last user pick wins"; documented as a limitation.
+- *User has the dropdown open when hotplug fires.* The dropdown rebuilds its model on open via the existing `GestureClick` Capture-phase handler in `mixer.rs`. A reroute mid-display can cause a model swap; the user sees the dropdown's selection update to the new pick. Acceptable — same behavior as today when the user picks via dropdown.
+- *Two devices with the same product name.* The first match wins. Out of scope to disambiguate further (PipeWire's node-name uniqueness already handles this at a lower layer).
+
+### Issue 3 — Volume persistence (NEW on clipping-system)
+
+#### Step 1: Port volume helpers from main
+
+Implementer A copies / adapts from `/var/home/admin/Documents/Code/SteelseriesFlatpak/src/audio/persistence.rs` (the main branch's version of the file):
+
+- The `VOLUMES_FILE` constant
+- The `volumes_path()` helper
+- `pub fn load_volumes() -> HashMap<String, u32>`
+- `pub fn save_volume_entry(channel: &str, volume_percent: u32)`
+
+And from main's `src/app.rs::init_pipeline`:
+
+- The `for (name, pct) in persistence::load_volumes() { … }` apply-volumes loop, placed after `VirtualSinks::create()` and before `AudioRouter::create()`
+
+And from main's `src/mixer.rs`:
+
+- The `if name == sinks::MUSIC_SINK_NAME || name == sinks::AUX_SINK_NAME || name == sinks::MIC_SOURCE_NAME { persistence::save_volume_entry(name, pct); }` block inside the slider `connect_value_changed` handler
+
+These are mechanical ports — same code, no behavior changes.
+
+#### Step 2: Periodic capture in the state-sync tick
+
+Maintain `last_saved_volumes: HashMap<String, u32>`, seeded from `persistence::load_volumes()` at startup. Each tick, for `[MUSIC_SINK_NAME, AUX_SINK_NAME]` call `get_sink_volume`; for `MIC_SOURCE_NAME` call `get_source_volume`. On change vs. the cache:
+
+```rust
+if last_saved_volumes.get(name).copied() != Some(vol) {
+    persistence::save_volume_entry(name, vol);
+    last_saved_volumes.insert(name.to_string(), vol);
+}
+```
+
+#### Step 3: Shutdown capture
 
 In `app.connect_shutdown`, before `drop(res)`:
 
@@ -219,112 +391,169 @@ if let Ok(vol) = sinks::get_source_volume(MIC_SOURCE_NAME) {
 }
 ```
 
-This runs unconditionally, even if the periodic capture already saw a recent change. Saving the same value twice is harmless.
+Idempotent with the periodic capture; running both is harmless.
 
-#### Mixer-slider save retained
+#### Hypothesis for the "random values" symptom (testable)
 
-The existing `mixer.rs` slider-change handler that calls `save_volume_entry` stays. It's still the lowest-latency path when the user moves the slider in our UI; the periodic capture catches everything else.
+The spec replaces its earlier speculation with this empirical hypothesis: **after `VirtualSinks::create` builds the virtual mic source, calling `pactl set-source-volume SteelSeries_Mic 100%` and immediately reading back via `pactl get-source-volume SteelSeries_Mic` yields 100%.** If that's true, the user's symptom is fully explained by "we never persist the value, so every restart starts from the source's default — which differs run-to-run because PipeWire/WirePlumber's per-name state cache restores whatever value it last saw."
 
-#### Apply-on-startup ordering
+`project-tester` will verify this hypothesis empirically before declaring Issue 3 fixed: set 70% via system sound settings, quit, relaunch, read back via `pactl`. If the saved-and-restored value is honored, the fix works.
 
-`load_volumes()` runs in `init_pipeline` after `VirtualSinks::create()`. This already works. The only addition is that the saved file will now actually contain useful values that reflect external changes.
-
-#### Why the user observes "random" values today
-
-Most likely: WirePlumber's per-node state cache restores some value when our recreated `SteelSeries_Mic` appears with the same node name as the destroyed one. The restored value isn't truly random — it's whatever WirePlumber last cached. With the new capture-and-restore round-tripping the user's actual intended value, our explicit `set_source_volume` after `load_volumes` wins, and the "randomness" goes away.
-
-If WirePlumber's restored value still wins for any reason, the periodic poll picks up the discrepancy within 2 seconds and immediately re-applies the saved value — but in practice, our `set_source_volume` call in `init_pipeline` is the last write and PipeWire honors it.
+If the hypothesis is *false* (volumes are silently ignored on `Audio/Source/Virtual` nodes on certain PipeWire builds), the fix expands to also re-apply the saved volume after the periodic tick observes it diverged from `last_saved_volumes` — which we already do in Step 2's logic. So the fix is robust to that uncertainty.
 
 ### Issue 4 — Clips section relocation + expansion + terminology
 
-Already covered in **Architecture → Issue 4** above. No additional detailed-design notes needed beyond:
-
-- Resize the dashboard `gtk::Grid` if needed to fit row 1 cleanly. The existing grid has `column_homogeneous(true)` so the section's `attach(..., col=0, row=1, w=2, h=1)` naturally spans both columns.
-- The new section must participate in the dashboard's `adw::Clamp` so its width respects the dashboard max (1125 px today).
-- Update `Widgets` struct in `window.rs` to carry the new section's widgets (button refs, label refs, pause-state ref) so external code can refresh them on `ClipSettings` change and on buffer state change.
+See "Architecture → Issue 4" for the layout, contents, pause-design, hotkey-hint persistence, and terminology pass.
 
 ## Data files / config impact
 
-- `assignments.txt` — file shape unchanged. Will be written more frequently (per-tick, per-change, plus at shutdown). Atomic single-entry helpers wrap a `read_saved → modify → write` cycle, same pattern as `save_mixer_routing_entry`.
-- `mixer_routing.txt` — unchanged.
-- `volumes.txt` — unchanged file shape. Will reliably contain the right values.
+- `assignments.txt` — file shape unchanged. Written more frequently (per-tick on change, plus at shutdown).
+- `mixer_routing.txt` — **`mic` line extended** to a 3-field tab-separated triple: `mic\t<node_name>\t<product_name>\n`. Lines with two fields parse as before with `<product_name>` empty (backward compatible).
+- `volumes.txt` — **new on this branch** (ported from main). Format: `<pipewire_node_name>\t<volume_percent>\n` lines.
+- `clips_settings.txt` — **new field `save_hotkey_display=<chord_label>`**. Default "ALT+S". Persisted at portal bind time.
 - `eq_state.txt`, `eq_presets/*.txt`, autostart `.desktop` file — unchanged.
 
 ## Threading
 
-No new threads. No new mpsc channels. All four issues live inside the existing GTK-main-thread polling tick. The `AudioRouter::check_mic_hotplug` method is called on the main thread; it shells out to `pactl` and `pw-link` synchronously like the rest of the audio code does today.
+No new threads. No new mpsc channels. All four issues live inside the existing GTK-main-thread polling tick. `AudioRouter::check_mic_hotplug` runs on the main thread and shells out to `pactl` / `pw-link` synchronously, matching the existing audio-module style.
+
+`Rc<RefCell<...>>` borrow safety: the tick's `borrow_mut` on `router` is safe because all UI callbacks (dropdown handlers, mixer slider, etc.) complete-then-release before the next main-loop iteration. `glib::timeout_add_seconds_local` schedules the callback as a separate iteration; no risk of nested borrow under current architecture.
+
+Tick latency: the unified tick makes ~5 synchronous `pactl` calls (`list sink-inputs`, `list sinks short`, `list sources` for the hotplug stable-id, plus 3 `get-volume` calls). Each is ~10–50 ms on this hardware. Worst-case ~250 ms blocking every 2 s. Acceptable for a desktop app at 2 Hz; if profiling shows jank, the `list sources` call for hotplug can be cached (changes only on PipeWire object events, which we could subscribe to via `pw-cli -m` in a future pass — explicitly out of scope here).
 
 ## Error handling
 
-- `pactl get-*-volume` failures: log at `warn` level, skip this tick's capture for the failing channel, retry next tick. Don't pollute `volumes.txt` with a fallback.
-- Hotplug check failures (e.g. `pw-link` errors during reroute): the existing `reroute_mic` already logs and persists user intent regardless of link success. Same applies in the hotplug path.
-- User-move detection on a stream that was created and destroyed within 2 seconds: invisible to us. Acceptable — short-lived streams (notification sounds, e.g.) are not what the user wants persisted anyway.
+- `pactl get-*-volume` failures: log at `warn` level, skip this tick's capture for the failing channel, retry next tick.
+- Hotplug check failures (e.g. `pw-link` errors during reroute): `reroute_mic` already logs and persists user intent regardless of link success. Same applies in the hotplug path.
+- User-move detection on a stream created and destroyed within 2 seconds: invisible to us. Acceptable — short-lived streams (notification sounds) are not what the user wants persisted.
 - Filesystem write failures on `save_*_entry`: log at `warn` level, do not retry. The next change triggers another write attempt.
+- Pause command issued while supervisor is mid-restart: `restart_attempts.clear()` runs first; the next tick of the supervisor sees a clean slate.
 
 ## Testing
 
 ### Existing tests stay green
 
-- All 40 existing unit tests must continue passing.
-- The 9 HID protocol tests and 10 biquad tests are unaffected by these changes; sanity check after merge.
+- All existing unit tests (HID protocol, biquad, Sonar import, spatial state, mixer dead-code) continue passing.
+- After Implementer A's changes: `cargo test` inside the distrobox passes. Implementer B's changes are mostly UI and don't break tests.
 
 ### New unit tests
 
 - `persistence.rs`:
-  - `tracked_map_user_move_updates_saved` — simulate a stream's sink changing from managed-A to managed-B; the saved file gains/updates the entry to B.
-  - `tracked_map_user_move_to_unmanaged_removes_saved` — stream moves to an unmanaged sink; saved entry is dropped.
-  - `tracked_map_garbage_collects_dead_ids` — after a poll where a tracked stream no longer appears in `list_sink_inputs`, its entry is removed from the map.
+  - `tracked_map_user_move_to_managed_updates_saved` — simulate stream's sink changing from managed-A to managed-B; saved file gains/updates entry to B.
+  - `tracked_map_user_move_to_unmanaged_keeps_saved` — stream moves to an unmanaged sink; saved entry is *retained* (per the new monotonic rule).
+  - `tracked_map_garbage_collects_dead_ids` — after a poll where a tracked stream no longer appears in `list_sink_inputs`, its entry is removed.
   - `update_saved_assignment_preserves_other_entries` — single-entry write doesn't clobber unrelated entries.
+  - `initial_tracked_seeds_existing_streams` — given fixture sink-input output, returns the right id→sink map.
 - `router.rs`:
   - `check_mic_hotplug_noop_when_no_saved_preference` — empty `mixer_routing.txt` → no reroute call.
   - `check_mic_hotplug_noop_when_already_on_saved` — `current_mic_source == saved` → no reroute call.
-  - `check_mic_hotplug_switches_when_saved_becomes_available` — saved == X, current == Y, X appears in `list_physical_sources` → reroute called with X.
+  - `check_mic_hotplug_exact_node_match` — saved node X, current Y, X appears → reroute called with X.
+  - `check_mic_hotplug_product_name_fallback` — saved node X with product P; current Y. X is gone but a new node Z with product P appears → reroute called with Z.
+  - `check_mic_hotplug_no_match_without_product_id` — old 2-field mic line in saved (no product), node renamed, no exact match → no reroute (acceptable behavior on upgrade).
+- `state_sync.rs`:
+  - `tick_no_volume_changes_no_writes` — if all virtual volumes match cache, no `save_volume_entry` call.
+  - `tick_volume_change_triggers_write_and_cache_update` — single change → single write, cache updated.
+- `buffer.rs`:
+  - `pause_from_armed_transitions_to_paused` — `BufferController` in Armed state, `pause()` → `Paused`, `disarm` called.
+  - `resume_from_paused_to_idle` — `BufferController` in Paused, `resume()` → Idle, ready for auto-arm.
+  - `pause_clears_restart_attempts` — pre-condition non-empty `restart_attempts`; pause clears it.
 
-These mock `list_sink_inputs` / `list_physical_sources` via a thin trait or test seam — implementer chooses.
+Tests use a thin `SinkInputProvider` / `SourceListProvider` trait or fn-pointer seam so `list_sink_inputs` / `list_physical_sources` can be mocked. Implementer A chooses the cleanest seam.
 
-### Manual verification
+### Manual verification (project-tester runs after both implementers report)
 
-After implementer reports, project-tester runs the build + targeted verifications:
-
-- Issue 1: launch Tidal (or `paplay --device=SteelSeries_Music /usr/share/sounds/...`-style stand-in), observe initial routing, move via system sound settings, kill the stream, relaunch, confirm new routing persists. Repeat with the move going *off* a managed sink to confirm forgetting.
-- Issue 2: turn off Alias Pro, launch app, observe fallback. Turn on Alias Pro. Within ~3 seconds (one 2-second tick + slack), mixer dropdown selection and active link reflect Alias Pro.
-- Issue 3: set `SteelSeries_Mic` to 70% via system sound settings. Quit app. Relaunch. Volume is 70%. Set `SteelSeries_Music` to 35% via our mixer slider — restart — confirm 35%. Set `SteelSeries_Aux` to 90% via `pactl set-sink-volume SteelSeries_Aux 90%` — wait 3 seconds — quit — relaunch — confirm 90%.
-- Issue 4: open Home tab — confirm Clips card is below Status + Device, full-width, contains indicator + Save button + duration + hotkey + pause toggle. Click Save Clip Now during a game session — clip saved. Click Pause — indicator reflects paused state. Click Resume. All UI strings say "recording".
+- **Issue 1:** Launch a known sink-input source (e.g. `paplay --device=SteelSeries_Chat /usr/share/sounds/freedesktop/stereo/bell.oga` or open a music app). Move it to `SteelSeries_Music` via system sound settings. Within ~3 seconds, `cat ~/.config/arctis-chatmix/assignments.txt | grep <app>` shows `→ SteelSeries_Music`. Kill the stream, relaunch the app (or paplay), confirm it routes to Music. Move it briefly to the laptop speakers (unmanaged sink), wait 3 seconds, confirm `assignments.txt` still has the Music entry (monotonic rule).
+- **Issue 2:** Save preferred mic = Alias Pro. Turn off Alias Pro. Quit and relaunch our app — Mixer dropdown shows the fallback. Turn Alias Pro on. Within ~3 seconds, dropdown selection and live link both reflect Alias Pro. Bonus: re-plug Alias Pro into a different USB port (which renames the node). Within ~3 seconds, the product-name fallback re-attaches.
+- **Issue 3:** Set `SteelSeries_Mic` to 70% via system sound settings. Quit app. Relaunch. `pactl get-source-volume SteelSeries_Mic` returns 70%. Repeat with `SteelSeries_Music` set to 35% via our mixer slider — restart — confirm 35%. Then `pactl set-sink-volume SteelSeries_Aux 90%` — wait 3 seconds — quit — relaunch — confirm 90%.
+- **Issue 4:** Open Home tab — confirm Clips card is row 1 (below Status + Device), full-width, contains indicator + Save button + Pause button + duration + hotkey labels. Click "Save Clip Now" during a game session — clip saved (toast appears). Click "Pause Recording" — indicator updates, GSR child is killed, buffer is gone (`ls ~/Videos/Clips/.arctis/`). Click "Resume Recording" — GSR restarts and re-arms. All UI strings say "recording" rather than "buffering" (verify via the enumerated file list).
+- **Hotkey display:** Change the hotkey via portal → confirm Clips section's hotkey label updates after settings save.
 
 ## Risks
 
-- **Risk: write storm.** If a sink-input rapidly bounces between sinks (some apps do this on startup), the per-tick `save_volume_entry` could write the assignments file dozens of times per minute. **Mitigation:** the poll runs at 2 Hz and only writes on actual change; modern filesystems coalesce trivially. Not a real risk on the actual hardware.
-- **Risk: race between mixer slider and periodic poll.** User drags slider → mixer.rs writes save → periodic poll reads slightly stale volume → re-writes the slightly stale value. **Mitigation:** the `last_saved_volumes` cache is the source of truth for "did we already save this value?" — both the slider write and the periodic-poll write update it. Slider handler updates the cache after `save_volume_entry`.
-- **Risk: WirePlumber restores volume before our `set_source_volume`.** As noted in Issue 3 detailed design. **Mitigation:** explicit `set_source_volume` call after `VirtualSinks::create` already wins in practice. If it doesn't, the periodic poll catches up within 2 seconds.
-- **Risk: Pause/Resume implementation interacts badly with the existing supervisor's rolling-window restart limiter.** The supervisor counts restarts to detect crash-loops; deliberately pausing/resuming the recorder shouldn't trip that. **Mitigation:** implementer must add a `paused` state to the supervisor that suppresses restart counting; this is a small state-machine extension, not a rewrite. Detailed in plan.
-- **Risk: Terminology change misses one of the user-visible string sites.** A leftover "buffering" label looks unprofessional. **Mitigation:** include an explicit grep checklist in the implementation plan and verify post-implementation via `grep -rni 'buffer' src/clips/ src/window.rs | grep -vi 'buffercontroller\|buffer.rs'` to confirm only internal references remain.
+- **Write storm.** A rapidly-bouncing sink-input could trigger many small file writes. *Mitigation:* poll is 2 Hz; only writes on actual change vs. cache; modern filesystems coalesce. Not a real risk on this hardware.
+- **Slider/poll race.** User drags slider → mixer.rs writes save_volume_entry → poll reads slightly stale volume → re-writes. *Mitigation:* `last_saved_volumes` cache is the source of truth for "did we already save?" — both paths update the cache.
+- **WirePlumber restores volume before our `set_source_volume`.** *Mitigation:* explicit `set_source_volume` after `VirtualSinks::create` wins in practice (it's the last write). If not, periodic poll catches up within 2 seconds.
+- **Pause/Resume race with supervisor restart.** *Mitigation:* `restart_attempts.clear()` is the first action in both Pause and Resume command arms.
+- **Terminology change miss.** *Mitigation:* enumerated file list + line-by-line audit; verified via word-bounded grep listed in "Terminology pass."
+- **`save_hotkey_display` drifts from actual binding.** If the user re-binds via the portal outside our wizard (e.g. via a settings.json edit), the display stays stale. *Mitigation:* every time the wizard or settings flow re-binds, we update the field. Out of scope to detect external edits.
+- **Product-name match collisions** (two devices with the same product name simultaneously online). First match wins; users with two physical mics of the same model will have to disambiguate manually. *Mitigation:* documented limitation; out of scope to dedupe via serial.
+- **Brittle app_name persistence key** (existing issue, not introduced here). Some apps don't set `application.name`; browsers report the same name across tabs; Discord changes its name between voice and notification streams. *Mitigation:* none beyond what already ships; the new monotonic rule reduces the blast radius (we don't aggressively destroy entries on transient observations).
+
+## Implementer A scope (Audio/Persistence Bundle — Issues 1+2+3)
+
+Files (read-write):
+
+- `src/audio/persistence.rs` — port volume helpers from main; add `initial_tracked`, `update_saved_assignment`, rename `restore_new_streams` → `reconcile_stream_state` with new HashMap signature; extend mixer-routing reader/writer for the 3-field mic line.
+- `src/audio/router.rs` — add `current_mic_source: Option<String>` + `preferred_mic: Option<(String, String)>`; add `check_mic_hotplug` method; cache preferred-mic at construction.
+- `src/audio/sinks.rs` — extend `list_physical_sources` to also return product name; update `ALL_SOURCES` consumers as needed.
+- `src/audio/state_sync.rs` — **NEW**. Single public `pub fn tick(...)` that orchestrates the four jobs.
+- `src/app.rs` — only the state-sync timer block (lines around the existing `restore_new_streams` watcher) and the shutdown handler's volume capture. **No other `app.rs` edits.**
+- `src/mixer.rs` — port volume save-on-change block from main; update dropdown to consume the 3-tuple from `list_physical_sources`.
+
+Files (read-only, for context): `src/audio/sinks.rs`'s `ALL_SINKS`/`ALL_SOURCES`, the existing `restore_assignments` flow, the main branch's persistence.rs for reference.
+
+## Implementer B scope (Clips UI Bundle — Issue 4)
+
+Files (read-write):
+
+- `src/window.rs` — remove `clips_row` from `build_status_card` + `StatusResult`; add `build_clips_section`; attach as grid row 1 spanning 2 columns; update `Widgets` + the dashboard SizeGroup wiring; rebuild the on-state-change refresh path so `set_state` updates the new section's widgets.
+- `src/clips/mod.rs` — add `ClipCommand::PauseRecording`, `ClipCommand::ResumeRecording`.
+- `src/clips/buffer.rs` — add `user_paused: bool` field; add `BufferState::Paused`; add `pause()` / `resume()` methods; update arm-gating logic to honor `user_paused`.
+- `src/clips/backend.rs` — add match arms for the two new commands; clear `restart_attempts` and call `disarm` on Pause; trigger normal arm path on Resume.
+- `src/clips/indicator.rs` — terminology pass on user-visible strings; possibly add a "Paused" state visual.
+- `src/clips/settings.rs` — add `save_hotkey_display` field with load/save support; terminology pass on user-visible strings.
+- `src/clips/notifications.rs` — terminology pass on user-visible strings.
+- `src/app.rs` — register one new GAction: `app.pause-recording-toggle`. Place adjacent to the existing `app.save-clip` / `app.retry-clip-capture` actions (around the `app.add_action_entries(save_action)` block). **No other `app.rs` edits.** Implementer A's state-sync block is in a separate region of the file.
+- `src/clips/hotkey.rs` — write `save_hotkey_display` after a successful bind (single line, find via grep for where the chord-string is constructed for the user).
+- `src/clips/browser.rs` — terminology pass on any user-visible strings (audit by reading).
+
+Files (read-only, for context): GSR docs, `state_sync.rs` (do not edit), `audio/persistence.rs` (do not edit beyond what Implementer A merges).
+
+## Coordination point: `src/app.rs`
+
+The single shared file between Implementers A and B is `src/app.rs`. To avoid merge conflicts:
+
+- Implementer A's edit region: the existing `restore_new_streams` watcher block and the `connect_shutdown` handler.
+- Implementer B's edit region: the action-registration cluster (search for `add_action_entries([save_action]`).
+
+These regions are ~500+ lines apart in the current file. A merge of two diffs touching non-adjacent lines is mechanical. If the team-lead orchestrating the merge sees a conflict marker, the resolution is: take both edits in their respective regions verbatim.
 
 ## Open questions
 
-None at spec write time. All user-preference questions have been resolved during brainstorming. Implementer-time decisions (e.g. exact GTK widget layout in the new Clips card, exact ClipCommand integration with the existing supervisor for pause) are technical choices left to the implementer.
+None at revision-2 spec time. All previously-open questions resolved:
+
+- **Pause backend mechanism:** decided — disarm + user_paused flag, buffer lost on pause.
+- **Hotkey hint data source:** decided — new `save_hotkey_display` persisted field, written at bind time.
+- **Mic hotplug stable identifier:** decided — `device.product.name` with fallback to exact node-name.
+- **Move-off-managed rule:** decided — monotonic (don't destroy entries on transient moves).
+- **First-tick seeding:** decided — `persistence::initial_tracked` populates from live sink-inputs.
+- **`restore_new_streams` rename:** decided — `reconcile_stream_state`.
+- **`save_assignments` at shutdown:** decided — keep with documented rationale.
+- **`app.rs` ownership:** decided — line-region carve-up; `state_sync.rs` extraction reduces the shared surface.
+- **`backend.rs` in Bundle B:** decided — explicitly included.
+- **Pause button state machine:** tabulated above.
+- **Score rubric:** defined in "Score-gate rubric" section.
 
 ## Teammate involvement
 
-Per the user's directive on this work item, the workflow is:
+Per the user's directive on this work item:
 
 1. **Spec phase (this document).** After commit:
-   - `qa-code-auditor` reviews for technical soundness, completeness, idiomatic style; returns numeric score 0–100 plus narrative.
-   - `devils-advocate-critic` reviews adversarially; returns numeric score 0–100 plus narrative.
-   - Run in **parallel**.
-   - If either score < 90, fix the spec and re-review.
+   - `qa-code-auditor` reviews for technical soundness, completeness, idiomatic style, implementation guidance; returns numeric score 0–100 plus narrative against the rubric.
+   - `devils-advocate-critic` reviews adversarially; returns numeric score 0–100 plus narrative against the rubric.
+   - Run **in parallel**.
+   - If either score < 90, fix and re-review (this loop).
    - Once both ≥ 90, the spec is auto-approved.
 2. **Plan phase.** After auto-approval:
    - Main session writes the implementation plan using `superpowers:writing-plans`.
-   - Plan determines the parallel-implementer split (per architecture, 2 implementers in 2 worktrees — see below).
+   - Plan inherits this spec's parallel-implementer split (2 implementers, Audio + Clips UI).
    - Plan is reviewed by `qa-code-auditor` + `devils-advocate-critic` in parallel; same 90% gate.
 3. **Implementation phase.** After plan auto-approval:
-   - Two `plan-implementer` instances dispatched **in parallel** in **isolated git worktrees** off `clipping-system`:
-     - Implementer A — Audio/Persistence Bundle (Issues 1+2+3). Files: `src/audio/persistence.rs`, `src/audio/router.rs`, `src/audio/sinks.rs`, `src/app.rs`.
-     - Implementer B — Clips UI Bundle (Issue 4). Files: `src/window.rs`, `src/clips/mod.rs`, `src/clips/indicator.rs`, `src/clips/settings.rs`, `src/clips/buffer.rs`, `src/clips/notifications.rs`, plus the `app.rs` line that registers any new `ClipCommand` variant (single touchpoint to coordinate at merge time).
-   - Each implementer returns its report to **`qa-code-auditor`** (not back to the team lead).
+   - Two `plan-implementer` instances dispatched **in parallel** in **isolated git worktrees** off `clipping-system`.
+   - Each implementer returns its report to **`qa-code-auditor`** (the team-lead is the conduit but does not act on the reports until the QA synthesis is done).
    - `qa-code-auditor` synthesizes both reports into one comprehensive QA report; same 90% gate.
    - `devils-advocate-critic` writes the final adversarial report on the synthesized output; same 90% gate.
-   - Final report comes back to the team lead.
+   - Final report returns to the team-lead.
 4. **Verification phase.** `project-tester` runs the build + manual verifications outlined in the Testing section.
 5. **`security-audit-sentinel`** — skipped. No auth, secrets, or public-endpoint surface in this work; only local PipeWire calls and `pactl`. Trivial change in attack surface relative to what already ships.
-6. **`research-bot`** — only on-demand. If the implementer hits an unknown around GSR pause semantics, ashpd, or PipeWire-volume-restore behavior, escalate via research-bot using context7 as the primary source.
+6. **`research-bot`** — only on-demand. Use context7 as the primary source for any doc lookup; only escalate to research-bot if context7 lacks the doc set needed.
