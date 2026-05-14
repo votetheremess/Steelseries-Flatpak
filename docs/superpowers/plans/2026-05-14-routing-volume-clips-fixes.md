@@ -1767,11 +1767,14 @@ fn pause_from_armed_transitions_to_paused() {
 
 #[test]
 fn resume_from_paused_to_idle() {
+    use std::sync::mpsc::channel;
+    let (tx, _rx) = channel();
     let mut bc = BufferController::new(CaptureConfig::default());
     bc.has_portal_pick = true;
+    bc.set_state_for_test(BufferState::Idle);  // Move out of Uninitialized
     bc.pause();
     assert_eq!(bc.state(), BufferState::Paused);
-    bc.resume();
+    bc.resume(&tx);
     assert_eq!(bc.state(), BufferState::Idle);
     assert!(!bc.user_paused());
 }
@@ -1804,6 +1807,7 @@ fn resume_when_always_armed_re_arms_immediately() {
     let mut bc = BufferController::new(CaptureConfig::default());
     bc.has_portal_pick = true;
     bc.always_armed = true;
+    bc.set_state_for_test(BufferState::Idle);  // Move out of Uninitialized
     bc.pause();
     assert_eq!(bc.state(), BufferState::Paused);
     bc.resume(&tx);
@@ -1901,7 +1905,13 @@ Update the existing `maybe_arm` (or equivalent) to call `should_arm()`. If `mayb
 grep -n "maybe_arm\|always_armed\|auto_arm" src/clips/buffer.rs
 ```
 
-Also add a `Paused` arm wherever `BufferState` is matched (`indicator.rs`, possibly `mod.rs`). For `indicator.rs`, the new state's user-visible label is **"Paused"** with `.dot-error` CSS class (or a new `.dot-paused` if the implementer prefers — visually similar to ErrorState but with non-error semantics; reuse `.dot-error` for now and add a comment).
+Also add a `Paused` arm wherever `BufferState` is matched (`indicator.rs`, possibly `mod.rs`). For `indicator.rs`, the new state's user-visible label is **"Paused"** with **a new CSS class `.dot-paused`**. Add the CSS rule alongside the existing dot classes in `src/window.rs:198-202`:
+
+```css
+.clip-indicator .dot-paused { color: rgb(160,160,160); }
+```
+
+(Muted gray — distinct from the green/yellow/red/dim of the existing states. Visually communicates "deliberately stopped, not an error.")
 
 - [ ] **Step 4: Run tests + build**
 
@@ -1961,9 +1971,10 @@ Ok(ClipCommand::PauseRecording) => {
 Ok(ClipCommand::ResumeRecording) => {
     log::info!("backend: handling ResumeRecording");
     restart_attempts.clear();
-    // Resume only clears the limiter; BufferController on the GTK side
-    // re-enters Idle and the next BufferController tick triggers StartReplay
-    // if conditions are met (auto_arm + game, or always_armed).
+    // BufferController::resume() already called maybe_arm synchronously on
+    // the GTK side, so a StartReplay (if applicable) is in the channel queue
+    // either before or after this ResumeRecording (order depends on
+    // mpsc fairness). ResumeRecording is solely a limiter-clear here.
 }
 ```
 
@@ -2052,8 +2063,7 @@ After the `bind_result?;` line at `src/clips/hotkey.rs:137` (where the existing 
 
 ```rust
 // Read back the portal's display string for the bound chord and persist.
-use ashpd::desktop::global_shortcuts::ListShortcutsOptions;
-match proxy.list_shortcuts(&session, ListShortcutsOptions::default()).await {
+match proxy.list_shortcuts(&session).await {
     Ok(req) => match req.response() {
         Ok(resp) => {
             if let Some(s) = resp.shortcuts().iter().find(|s| s.id() == "save-clip") {
@@ -2070,7 +2080,7 @@ match proxy.list_shortcuts(&session, ListShortcutsOptions::default()).await {
 }
 ```
 
-`list_shortcuts` in ashpd 0.11.1 requires both `session: &Session<Self>` and `options: ListShortcutsOptions` arguments. The default `ListShortcutsOptions` has no required fields. Variable naming in the existing code uses `bindings` for the `Vec<NewShortcut>` argument passed to `bind_shortcuts`; that's separate from the per-`Shortcut` items returned by `list_shortcuts`.
+`list_shortcuts` in ashpd **0.11.x** takes a single `session: &Session<Self>` argument (verified against the 0.11.0 docs.rs / source). The 2-arg form with `ListShortcutsOptions` is a 0.13.x addition; do not import it. Variable naming in the existing code uses `bindings` for the `Vec<NewShortcut>` argument passed to `bind_shortcuts`; that's a separate type from the per-`Shortcut` items returned by `list_shortcuts`.
 
 The `settings_cell: Option<Rc<RefCell<ClipSettings>>>` must be threaded into `run_global_shortcuts` (around `src/clips/hotkey.rs:114`) and `rebind_shortcuts` (likewise). Update their callers in `src/app.rs:1017` and `src/app.rs:1107` — both are within Implementer B's **second declared `app.rs` region** (see "Coordination point" below). Pass `Some(settings_cell.clone())` where `settings_cell` is the same `Rc<RefCell<ClipSettings>>` the existing `clips_settings_ctx_partial` already carries.
 
