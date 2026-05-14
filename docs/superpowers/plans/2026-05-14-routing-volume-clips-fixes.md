@@ -14,14 +14,16 @@
 
 | Phase | Agent | Worktree | Files |
 |---|---|---|---|
-| 0. Discriminator | `project-tester` | clipping-system worktree | Runs shell test, reports H_A vs H_B |
+| 0. Discriminator | `project-tester` | clipping-system worktree | Runs shell test + verifies GSR SIGINT semantics; reports H_A vs H_B |
 | 1A. Audio Bundle | `plan-implementer` A | new worktree `SteelseriesFlatpak-routing-volume` | `src/audio/{persistence,router,sinks,state_sync}.rs`, `src/mixer.rs`, `src/app.rs` (3 disjoint regions) |
-| 1B. Clips UI Bundle | `plan-implementer` B | new worktree `SteelseriesFlatpak-clips-ui` | `src/window.rs`, `src/clips/*.rs`, `src/app.rs` (1 disjoint region) |
+| 1B. Clips UI Bundle | `plan-implementer` B | new worktree `SteelseriesFlatpak-clips-ui` | `src/window.rs`, `src/clips/*.rs`, `src/app.rs` (2 disjoint regions: action cluster + `run_global_shortcuts` call site) |
 | 2. QA synthesis | `qa-code-auditor` | reads both worktrees | Reports |
 | 3. Adversarial review | `devils-advocate-critic` | reads QA report + both worktrees | Final report |
 | 4. Verification | `project-tester` | merged worktree | Manual recipes |
 
-Phases 1A and 1B run in **parallel**. Their work is mergeable because `app.rs` is the only shared file and the four edit regions are mutually disjoint (verified by reviewers at spec time).
+Phases 1A and 1B run in **parallel**. Their work is mergeable because the five edit regions across `app.rs` (3 from A, 2 from B) are mutually disjoint — see "Coordination point: `src/app.rs`" at the bottom of this plan.
+
+**Every commit MUST `cargo build` cleanly.** If a commit would leave the worktree non-compiling because of a downstream caller, either (a) merge that commit with its caller-fix commit, or (b) keep a temporary deprecated stub in the producer that's deleted in a subsequent commit. The implementer is responsible for choosing per-task; the plan defaults to (b) for clean bisects.
 
 ---
 
@@ -64,7 +66,24 @@ pactl get-source-volume SteelSeries_Mic
 
 If the percentage on the second line of `get-source-volume` output is **50%** (or very close, like `front-left: 32768 / 50% / -6.02 dB`): **H_A is the candidate.** Bundle A proceeds as designed (port save/restore + periodic capture). Report this in the test summary.
 
-If the percentage is anything else (default ~100%, or stuck on a previous value): **H_B is true.** Bundle A's scope expands to also implement `pw-cli` Props at create-time volume initialization. Flag this back to the team lead **before** Implementer A starts.
+If the percentage is anything else (default ~100%, or stuck on a previous value): **H_B is true.** Bundle A's scope expands to also include Task A11 (the `pw-cli` Props at create-time path). Flag this back to the team lead **before** Implementer A starts.
+
+- [ ] **Step 4b: Verify GSR SIGINT semantics (separate, parallel check)**
+
+This is a separate verification that informs the Pause-tooltip copy. With GSR in replay mode, send SIGINT and see whether a clip file is produced. Run:
+
+```bash
+mkdir -p /tmp/gsr-test && cd /tmp/gsr-test
+flatpak run --command=gpu-screen-recorder com.dec05eba.gpu_screen_recorder \
+  -w portal -r 20 -c mp4 -o /tmp/gsr-test/replay &
+GSR_PID=$!
+sleep 10
+kill -INT "$GSR_PID"; wait "$GSR_PID" 2>/dev/null
+ls -la /tmp/gsr-test/
+```
+
+- If `/tmp/gsr-test/` contains a `.mp4` file (or a `replay_*` file): SIGINT does flush the buffer to disk. The spec's "buffer is lost on pause" claim is wrong on this user's hardware. Flag back to the team lead — the Pause-button tooltip needs updating to "Pause recording. The current N-second clip will be saved on pause."
+- If `/tmp/gsr-test/` is empty: SIGINT discards the buffer cleanly, matching the spec. Pause copy stays as designed.
 
 - [ ] **Step 5: Stop the app (do not leave it running)**
 
@@ -305,7 +324,7 @@ pub fn save_mixer_routing_mic(pref: &MicPreference) {
         log::warn!("Could not determine mixer routing path");
         return;
     };
-    let mut routing = load_mixer_routing();  // non-mic channels (skip-mic semantics)
+    let routing = load_mixer_routing();  // non-mic channels only (skip-mic semantics)
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -317,10 +336,46 @@ pub fn save_mixer_routing_mic(pref: &MicPreference) {
         "mic\t{}\t{}\t{}\t{}\n",
         pref.node_name, pref.product_name, pref.bus_path, pref.bluez_address
     ));
-    let _ = routing.insert("mic".into(), String::new());  // not really needed; clarity only
-    drop(routing);
     if let Err(e) = fs::write(&path, content) {
         log::warn!("Failed to save mixer routing (mic): {e}");
+    }
+}
+
+// REPLACE the existing `save_mixer_routing_entry` (currently at
+// `src/audio/persistence.rs:322-344`) with this updated version that
+// preserves the 5-field mic line.
+//
+// The old version load_mixer_routing()'d the file, inserted the new entry,
+// and wrote the whole map back. Once load_mixer_routing skips "mic" lines
+// (per the new behavior), the old write would erase the 5-field mic record
+// on every sink reroute. The replacement reads the mic preference separately
+// and re-emits the 5-field line at the end.
+pub fn save_mixer_routing_entry(channel: &str, device: &str) {
+    let Some(path) = mixer_routing_path() else {
+        log::warn!("Could not determine mixer routing path");
+        return;
+    };
+    let mut routing = load_mixer_routing();
+    routing.insert(channel.to_string(), device.to_string());
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let mut content = String::new();
+    for (ch, dev) in &routing {
+        content.push_str(&format!("{ch}\t{dev}\n"));
+    }
+    // Preserve the 5-field mic line if present.
+    if let Some(pref) = parse_mic_preference_from(&path) {
+        content.push_str(&format!(
+            "mic\t{}\t{}\t{}\t{}\n",
+            pref.node_name, pref.product_name, pref.bus_path, pref.bluez_address
+        ));
+    }
+
+    if let Err(e) = fs::write(&path, content) {
+        log::warn!("Failed to save mixer routing: {e}");
     }
 }
 
@@ -569,15 +624,21 @@ pub fn list_physical_sources() -> Vec<PhysicalSourceRecord> {
 }
 ```
 
-- [ ] **Step 4: Update the 2 destructuring sites in `src/mixer.rs`**
+- [ ] **Step 4: Update ALL call sites and tuple-destructure points in `src/mixer.rs`**
 
 Find via:
 
 ```bash
-grep -n "list_physical_sources\|list_physical_sinks" src/mixer.rs
+grep -n "list_physical_sources\|list_physical_sinks\|Vec<(String, String)>" src/mixer.rs
 ```
 
-Each site that does `for (name, desc) in list_physical_sources()` becomes `for (name, desc, _product, _bus_path, _bluez_address) in list_physical_sources()`. Likewise for `list_physical_sinks()` calls. Do **not** strip the `_` prefix from the unused fields — Implementer A's later tasks will consume them through the new MicPreference path, not at these sites.
+There are 3 invocations (lines ~294, ~347, ~396) and multiple downstream destructure points (lines ~312, ~329, ~349, ~370, ~402, ~406, ~434). For each:
+
+- **For-loop destructures**: `for (name, desc) in list_physical_sources()` → `for (name, desc, _product, _bus_path, _bluez_address) in list_physical_sources()`.
+- **Typed `Vec` declarations**: a line like `let devices: Rc<RefCell<Vec<(String, String)>>> = Rc::new(...)` becomes `let devices: Rc<RefCell<Vec<(String, String, Option<String>, Option<String>, Option<String>)>>> = Rc::new(...)`.
+- **Tuple field access**: `pair.0` and `pair.1` continue to work; positions 2-4 are unused at non-mic sites.
+
+Do **not** strip the `_` prefix from the unused fields at non-mic sites — Implementer A's later mic-source picker (already-implemented in Task A4's `reroute_mic`) is the only consumer.
 
 - [ ] **Step 5: Run tests + full build**
 
@@ -594,7 +655,7 @@ git add src/audio/sinks.rs src/mixer.rs
 git commit -m "audio: extend list_physical_sources to return stable-id chain"
 ```
 
-### Task A4: Add `current_mic_source` + `preferred_mic` to `AudioRouter` and `check_mic_hotplug`
+### Task A4: Add `current_mic_source` + `preferred_mic` to `AudioRouter`, `check_mic_hotplug`, and updated `reroute_mic`
 
 **Files:**
 - Modify: `src/audio/router.rs`
@@ -752,9 +813,101 @@ pub struct AudioRouter {
 }
 ```
 
-In `AudioRouter::create`, set `preferred_mic = super::persistence::load_mixer_routing_mic()` and `current_mic_source` to whichever source was actually linked (after the existing `link_mic_source` block — set to `Some(source.clone())` on Ok, `None` on Err). In `reroute_mic`, set `current_mic_source = Some(new_source.to_string())` on Ok.
+**Update `AudioRouter::create` (`router.rs:23-80`)**. The existing block:
 
-Add the public method:
+```rust
+let mic_source = saved_routing
+    .get("mic")
+    .cloned()
+    .or_else(|| find_headset_source().ok());
+```
+
+is now broken because `saved_routing` no longer contains the `mic` key (Task A2 skipped it). Replace it with:
+
+```rust
+let preferred_mic = super::persistence::load_mixer_routing_mic();
+let mic_source = preferred_mic
+    .as_ref()
+    .map(|p| p.node_name.clone())
+    .or_else(|| find_headset_source().ok());
+```
+
+And in the `link_mic_source` Ok branch, also set `current_mic_source = Some(source.clone())`. The full updated tail of `AudioRouter::create`:
+
+```rust
+let (mic_linked, current_mic_source) = match mic_source.as_deref() {
+    Some(source) => match link_mic_source(source) {
+        Ok(()) => {
+            log::info!("Linked mic ({source}) → SteelSeries_Mic");
+            (true, Some(source.to_string()))
+        }
+        Err(e) => {
+            log::warn!("Failed to link mic source: {e}");
+            (false, None)
+        }
+    },
+    None => {
+        log::warn!("Could not find mic source");
+        (false, None)
+    }
+};
+
+set_default_sink(super::sinks::GAME_SINK_NAME);
+set_default_source(super::sinks::MIC_SOURCE_NAME);
+
+Ok(AudioRouter {
+    eq_pipeline,
+    mic_linked,
+    current_mic_source,
+    preferred_mic,
+})
+```
+
+**Update `reroute_mic` (`router.rs:113-132`)**. It currently calls `save_mixer_routing_entry("mic", new_source)` which writes a 2-field mic line and would clobber the 5-field mic record. Replace its body:
+
+```rust
+pub fn reroute_mic(&mut self, new_source: &str) {
+    log::info!("Rerouting mic → {new_source}");
+
+    // Build the full MicPreference by looking up the new source's properties.
+    let pref = super::sinks::list_physical_sources()
+        .into_iter()
+        .find(|(name, _, _, _, _)| name == new_source)
+        .map(|(node, _desc, product, bus, bluez)| super::persistence::MicPreference {
+            node_name: node,
+            product_name: product.unwrap_or_default(),
+            bus_path: bus.unwrap_or_default(),
+            bluez_address: bluez.unwrap_or_default(),
+        })
+        .unwrap_or_else(|| super::persistence::MicPreference {
+            node_name: new_source.to_string(),
+            product_name: String::new(),
+            bus_path: String::new(),
+            bluez_address: String::new(),
+        });
+
+    // Persist intent up-front. Even if the link fails, the user's preference
+    // is remembered so next launch tries again.
+    super::persistence::save_mixer_routing_mic(&pref);
+
+    if self.mic_linked {
+        unlink_mic_source();
+    }
+    match link_mic_source(new_source) {
+        Ok(()) => {
+            self.mic_linked = true;
+            self.current_mic_source = Some(new_source.to_string());
+            self.preferred_mic = Some(pref);
+            log::info!("Mic rerouted to {new_source}");
+        }
+        Err(e) => {
+            log::error!("Failed to reroute mic to {new_source}: {e}");
+        }
+    }
+}
+```
+
+Add the public method `check_mic_hotplug`:
 
 ```rust
 pub fn check_mic_hotplug(&mut self) {
@@ -1032,10 +1185,9 @@ pub(crate) fn reconcile_pure_with_updates(
     pre.retain(|id, _| live_ids.contains(id));
 }
 
-fn is_managed(name: &str) -> bool {
-    super::sinks::is_managed(name)
-}
 ```
+
+(The existing `is_managed` function from `super::sinks` is already in scope via the file's existing `use super::sinks::{is_managed, migrate_legacy_name};`. Do not add a local wrapper.)
 
 Add `use std::time::{Duration, Instant};` at the top of the file.
 
@@ -1063,8 +1215,14 @@ pub fn reconcile_stream_state(
             Ok(()) => log::info!("Auto-routed stream {id} → {target}"),
             Err(e) => {
                 log::warn!("Auto-route {id} → {target} failed: {e}");
-                // Roll back tracker so next tick retries
-                tracked.insert(id, sinks_by_id.get(&id).cloned().unwrap_or_default());
+                // Roll back: use the pre-move sink from self_move_pre_sink (where
+                // the Vacant branch stashed it) so the next tick treats this as
+                // stable, not as a phantom user move.
+                let rollback = self_move_pre_sink
+                    .get(&id)
+                    .map(|(s, _)| s.clone())
+                    .unwrap_or_else(|| target.clone());
+                tracked.insert(id, rollback);
                 self_move_pre_sink.remove(&id);
             }
         }
@@ -1106,7 +1264,7 @@ pub fn initial_tracked() -> HashMap<u32, String> {
 }
 ```
 
-Also rename the existing `pub fn restore_new_streams(seen_ids: &mut HashSet<u32>)` body to delete it (it's superseded by `reconcile_stream_state`); update all callers (search via `grep -n restore_new_streams src/`). The old `pub fn initial_seen_ids() -> HashSet<u32>` is now dead code — delete it.
+**Build-clean policy at A5:** the existing `pub fn restore_new_streams(seen_ids: &mut HashSet<u32>)` has one caller (`src/app.rs:1393`) and `pub fn initial_seen_ids()` has one caller (`src/app.rs:1391`). Do **not** delete them in Task A5 — leave them in place; Task A7 will rewrite the caller block and delete both helpers in the same commit. This keeps every intermediate commit building.
 
 Also amend `save_assignments` at the bottom of the function — find the `else { assignments.remove(&input.app_name); }` block (around line 113) and remove it. The new monotonic save behavior is "only add/update entries, never destroy on observation."
 
@@ -1116,7 +1274,7 @@ Also amend `save_assignments` at the bottom of the function — find the `else {
 distrobox enter fedora-dev -- bash -c 'cd /var/home/admin/Documents/Code/SteelseriesFlatpak-routing-volume && cargo test reconcile 2>&1 | tail -10 && cargo build 2>&1 | tail -10'
 ```
 
-Expected: 6 reconcile tests pass; build clean. Any leftover `restore_new_streams` references in app.rs will cause build errors — that's fine, Task A6/A7 fixes those callers.
+Expected: 6 reconcile tests pass; build clean. `restore_new_streams` and `initial_seen_ids` are still in `persistence.rs` per the build-clean policy above — they'll be deleted in Task A7.
 
 - [ ] **Step 6: Commit**
 
@@ -1217,7 +1375,7 @@ Add `pub mod state_sync;` to `src/audio/mod.rs` after the existing module declar
 distrobox enter fedora-dev -- bash -c 'cd /var/home/admin/Documents/Code/SteelseriesFlatpak-routing-volume && cargo build 2>&1 | tail -10'
 ```
 
-Expected: clean build (any app.rs reference to old `restore_new_streams` is still an error — Task A7 fixes those).
+Expected: clean build. The existing `restore_new_streams` callers in app.rs are still intact (per A5's build-clean policy); they'll be replaced in Task A7.
 
 - [ ] **Step 4: Commit**
 
@@ -1226,10 +1384,11 @@ git add src/audio/state_sync.rs src/audio/mod.rs
 git commit -m "audio: add state_sync module orchestrating Issues 1+2+3"
 ```
 
-### Task A7: Wire state-sync tick + first-tick seeding in `app.rs`
+### Task A7: Wire state-sync tick + first-tick seeding in `app.rs` and delete stub helpers
 
 **Files:**
 - Modify: `src/app.rs` (region 1: state-sync timer block around the existing `restore_new_streams` watcher)
+- Modify: `src/audio/persistence.rs` (delete now-unused `restore_new_streams` + `initial_seen_ids`)
 
 - [ ] **Step 1: Locate the existing watcher block**
 
@@ -1249,16 +1408,20 @@ glib::timeout_add_seconds_local(STREAM_WATCH_SECS, move || {
 
 - [ ] **Step 2: Replace it with the state-sync tick**
 
-Use Edit to replace the block. The new shape:
+The actual variable in `app.rs` is `resources: Rc<RefCell<Option<AppResources>>>` (verify with `grep -n 'let resources' src/app.rs`). The `AppResources` struct contains `router: Rc<RefCell<Option<AudioRouter>>>` already, so the tick closure needs to traverse through the outer `Option<AppResources>` to reach the inner router.
+
+Replace the existing `restore_new_streams` watcher block with:
 
 ```rust
 let sync_state = Rc::new(RefCell::new(state_sync::StateSyncState::new_seeded()));
 let sync_state_for_tick = sync_state.clone();
-let router_for_tick = resources_holder.router.clone();
+let resources_for_tick = resources.clone();
 glib::timeout_add_seconds_local(STREAM_WATCH_SECS, move || {
     let mut state = sync_state_for_tick.borrow_mut();
-    if let Some(router) = router_for_tick.borrow_mut().as_mut() {
-        state_sync::tick(&mut state, router);
+    if let Some(res) = resources_for_tick.borrow().as_ref() {
+        if let Some(router) = res.router.borrow_mut().as_mut() {
+            state_sync::tick(&mut state, router);
+        }
     }
     glib::ControlFlow::Continue
 });
@@ -1266,7 +1429,7 @@ glib::timeout_add_seconds_local(STREAM_WATCH_SECS, move || {
 
 Add `use crate::audio::state_sync;` near the existing `use crate::audio::...` imports at the top of `src/app.rs`.
 
-Note: `resources_holder.router` is `Rc<RefCell<Option<AudioRouter>>>`. The existing block already has this in scope from `AppResources`. Verify by reading around line 1390 before editing.
+After the new watcher block is in place, delete `pub fn restore_new_streams(...)` and `pub fn initial_seen_ids() -> HashSet<u32>` from `src/audio/persistence.rs` — they have no callers after this commit.
 
 - [ ] **Step 3: Build and confirm the old watcher is fully replaced**
 
@@ -1279,8 +1442,8 @@ Expected: clean build. Any lingering reference to `restore_new_streams` or `init
 - [ ] **Step 4: Commit**
 
 ```bash
-git add src/app.rs
-git commit -m "app: wire state_sync tick replacing restore_new_streams watcher"
+git add src/app.rs src/audio/persistence.rs
+git commit -m "app: wire state_sync tick + delete restore_new_streams stub"
 ```
 
 ### Task A8: Add shutdown volume capture
@@ -1425,25 +1588,102 @@ git commit -m "mixer: persist slider changes for Music/Aux/Mic"
 ### Task A11 (CONDITIONAL — only if Phase 0 revealed H_B)
 
 **Files:**
-- Modify: `src/audio/sinks.rs` (`create_pw_node` signature + caller)
+- Modify: `src/audio/sinks.rs` (`create_pw_node` body, caller in `VirtualSinks::create`)
+- Modify: `src/app.rs` (region 3, where the apply-volumes loop lives in Task A9 — relocate the volume application to Task A11's init path)
 
 **Skip this task if Phase 0 said H_A is the candidate.**
 
-- [ ] **Step 1: Extend `create_pw_node` to accept an optional initial volume**
+In the H_B world, `pactl set-source-volume` silently fails on `Audio/Source/Virtual` nodes. The fix is to write the initial volume into the `Props` block at node-creation time via `pw-cli`, bypassing the broken layer.
 
-This is the H_B fallback path the spec described. The implementer modifies `create_pw_node` to write a `Props` block with `channelVolumes` at create-time, sidestepping the broken `pactl set-source-volume` layer. Coordinate with the team lead for the exact `pw-cli` invocation — typically:
+- [ ] **Step 1: Look up saved volumes before `cleanup_orphaned` runs**
 
-```bash
-pw-cli create-node adapter '{ ... existing props ... node.target.object=null, props={channelVolumes=[0.5,0.5]} }'
+In `src/audio/sinks.rs`, modify `VirtualSinks::create()`:
+
+```rust
+pub fn create() -> Result<Self, String> {
+    cleanup_orphaned();
+
+    let saved = crate::audio::persistence::load_volumes();
+    let initial_vol = |name: &str| -> Option<u32> { saved.get(name).copied() };
+
+    for (name, description, position) in ALL_SINKS {
+        create_pw_node_with_volume(name, description, "Audio/Sink", position, initial_vol(name))?;
+        log::info!("Created sink {name}");
+    }
+    for (name, description, position) in ALL_SOURCES {
+        create_pw_node_with_volume(name, description, "Audio/Source/Virtual", position, initial_vol(name))?;
+        log::info!("Created source {name}");
+    }
+
+    Ok(VirtualSinks { _created: true })
+}
 ```
 
-Where `0.5` is volume in linear (0.0–1.0). Convert from the saved percent: `linear = (pct / 100.0).powf(3.0)` (cubic-to-linear is PulseAudio's convention).
+- [ ] **Step 2: Add `create_pw_node_with_volume` next to the existing `create_pw_node`**
 
-Detailed implementation depends on H_B's symptoms — the team lead provides the exact code shape after Phase 0 reports.
+The existing `create_pw_node` builds a `pw-cli create-node adapter '{ ... }'` invocation. The new wrapper appends a `Props { channelVolumes }` entry when `initial_volume_pct` is `Some(pct)`. Convert percent to PipeWire's expected linear via cube — PipeWire treats `channelVolumes` as cubic-scaled volumes per the `Audio EQ Cookbook` convention used by PulseAudio:
 
-- [ ] **Step 2: Build + test + commit**
+```rust
+fn create_pw_node_with_volume(
+    name: &str,
+    description: &str,
+    media_class: &str,
+    position: &str,
+    initial_volume_pct: Option<u32>,
+) -> Result<(), String> {
+    let channel_volumes_section = match initial_volume_pct {
+        Some(pct) => {
+            let linear: f64 = (pct as f64 / 100.0).powf(3.0);
+            // Comma-separate one value per channel based on `position`.
+            let n_channels = position.split(',').count();
+            let values: Vec<String> = (0..n_channels).map(|_| format!("{linear:.6}")).collect();
+            format!(" channelVolumes = [{}]", values.join(","))
+        }
+        None => String::new(),
+    };
 
-Standard: build, run unit tests, commit per the existing pattern.
+    // Existing props string composition continues, with channel_volumes_section
+    // appended inside the `props = { ... }` block.
+    let props = format!(
+        "node.name={name} node.description=\"{description}\" \
+         media.class={media_class} audio.position=[{position}] \
+         monitor.channel-volumes=true monitor.passthrough=true{channel_volumes_section}",
+    );
+
+    let output = Command::new("pw-cli")
+        .args(["create-node", "adapter", &format!("{{ factory.name=support.null-audio-sink {props} }}")])
+        .output()
+        .map_err(|e| format!("Failed to run pw-cli: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "pw-cli create-node failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+```
+
+(Reuse the rest of the existing `create_pw_node`'s argument-builder logic — the snippet above is a sketch; merge with the existing function rather than duplicating it. The new `channel_volumes_section` is the only added field.)
+
+- [ ] **Step 3: Remove the duplicate apply-volumes loop from `init_pipeline` (Task A9)**
+
+In `src/app.rs` region 3, the apply-volumes loop added in Task A9 is now redundant because the initial volume is set at create-time. **Keep** the loop only as a defensive belt-and-braces: it's harmless if `pactl set-source-volume` is silently ignored, and it remains useful if Phase 0's H_A turned out to be partially true (mixed behavior). No change needed.
+
+- [ ] **Step 4: Run tests + build + manual verify**
+
+```bash
+distrobox enter fedora-dev -- bash -c 'cd /var/home/admin/Documents/Code/SteelseriesFlatpak-routing-volume && cargo build 2>&1 | tail -5 && cargo test 2>&1 | tail -10'
+```
+
+Expected: clean. Then run `pactl set-source-volume SteelSeries_Mic 70%` in the live app, quit, relaunch, and confirm `pactl get-source-volume SteelSeries_Mic` returns 70%. If still wrong, this code path is itself buggy — escalate to team lead.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/audio/sinks.rs
+git commit -m "audio: write initial volumes via pw-cli Props at create-time (H_B fallback)"
+```
 
 ### Task A12: Implementer A self-review checklist
 
@@ -1495,6 +1735,8 @@ Hand this report to **`qa-code-auditor`** as the next agent (not back to the tea
 
 - [ ] **Step 1: Write failing tests for pause/resume transitions**
 
+Note: `BufferController` does not currently expose a way to force-transition to `Armed` from tests — existing tests drive into `Armed` via `on_portal_pick_complete → on_game_started → on_backend_event(BackendEvent::Armed, ...)`. To keep these tests simple, Implementer B adds a small `#[cfg(test)]` testing seam in Step 3. The seam is `pub fn set_state_for_test(&mut self, s: BufferState)`.
+
 Add to `src/clips/buffer.rs`'s `#[cfg(test)]` module:
 
 ```rust
@@ -1502,7 +1744,7 @@ Add to `src/clips/buffer.rs`'s `#[cfg(test)]` module:
 fn pause_from_armed_transitions_to_paused() {
     let mut bc = BufferController::new(CaptureConfig::default());
     bc.has_portal_pick = true;
-    bc.set_armed();
+    bc.set_state_for_test(BufferState::Armed);
     assert_eq!(bc.state(), BufferState::Armed);
     bc.pause();
     assert_eq!(bc.state(), BufferState::Paused);
@@ -1524,7 +1766,7 @@ fn resume_from_paused_to_idle() {
 fn pause_clears_pending_reconfigure() {
     let mut bc = BufferController::new(CaptureConfig::default());
     bc.has_portal_pick = true;
-    bc.set_armed();
+    bc.set_state_for_test(BufferState::Armed);
     bc.pending_reconfigure = true;
     bc.pause();
     assert!(!bc.pending_reconfigure);
@@ -1598,6 +1840,11 @@ pub fn should_arm(&self) -> bool {
     if self.user_paused { return false; }
     self.always_armed || (self.auto_arm && self.current_game.is_some())
 }
+
+#[cfg(test)]
+pub fn set_state_for_test(&mut self, s: BufferState) {
+    self.state = s;
+}
 ```
 
 Update the existing `maybe_arm` (or equivalent) to call `should_arm()`. If `maybe_arm` already has inline arming logic, replace its condition with `if !self.should_arm() { return; }`. Verify by grep:
@@ -1623,10 +1870,13 @@ git add src/clips/buffer.rs src/clips/indicator.rs
 git commit -m "clips: add BufferState::Paused + user_paused field"
 ```
 
-### Task B2: Add `ClipCommand::PauseRecording` + `ResumeRecording`
+### Task B2: Add `ClipCommand::PauseRecording` + `ResumeRecording` AND supervisor match arms
+
+> Merged from prior B2+B3 because adding the variants without arms breaks `backend.rs`'s exhaustive match. Single commit keeps every intermediate worktree state building.
 
 **Files:**
 - Modify: `src/clips/mod.rs`
+- Modify: `src/clips/backend.rs` (around the command loop at line 1057)
 
 - [ ] **Step 1: Add the variants**
 
@@ -1640,27 +1890,7 @@ pub enum ClipCommand {
 }
 ```
 
-- [ ] **Step 2: Build**
-
-```bash
-distrobox enter fedora-dev -- bash -c 'cd /var/home/admin/Documents/Code/SteelseriesFlatpak-clips-ui && cargo build 2>&1 | tail -15'
-```
-
-Expected: compile error in `backend.rs` for non-exhaustive `match` on `ClipCommand`. Task B3 fixes this.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add src/clips/mod.rs
-git commit -m "clips: add Pause/Resume command variants"
-```
-
-### Task B3: Add supervisor match arms for Pause/Resume
-
-**Files:**
-- Modify: `src/clips/backend.rs` (around the command loop at line 1057)
-
-- [ ] **Step 1: Locate the command loop**
+- [ ] **Step 2: Locate the command loop**
 
 ```bash
 grep -n "fn run_backend\|Ok(ClipCommand::" src/clips/backend.rs
@@ -1668,7 +1898,7 @@ grep -n "fn run_backend\|Ok(ClipCommand::" src/clips/backend.rs
 
 Around `backend.rs:1057-1100`.
 
-- [ ] **Step 2: Add the new arms**
+- [ ] **Step 3: Add the new arms**
 
 Insert these arms in the `match` block (alongside the existing `StartReplay`, `SaveClip`, etc.):
 
@@ -1689,7 +1919,7 @@ Ok(ClipCommand::ResumeRecording) => {
 }
 ```
 
-- [ ] **Step 3: Build**
+- [ ] **Step 4: Build**
 
 ```bash
 distrobox enter fedora-dev -- bash -c 'cd /var/home/admin/Documents/Code/SteelseriesFlatpak-clips-ui && cargo build 2>&1 | tail -5'
@@ -1697,12 +1927,14 @@ distrobox enter fedora-dev -- bash -c 'cd /var/home/admin/Documents/Code/Steelse
 
 Expected: clean.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add src/clips/backend.rs
-git commit -m "clips: add backend Pause/Resume handlers"
+git add src/clips/mod.rs src/clips/backend.rs
+git commit -m "clips: add Pause/Resume command variants + backend handlers"
 ```
+
+### Task B3: (RESERVED — merged into B2 to keep every commit building)
 
 ### Task B4: Add `save_hotkey_display` field to `ClipSettings`
 
@@ -1788,7 +2020,9 @@ match proxy.list_shortcuts(&session).await {
 }
 ```
 
-The `settings_cell` is `Option<Rc<RefCell<ClipSettings>>>` and must be threaded into `run_global_shortcuts` from its caller. If the function signature doesn't already have it, add a parameter and update the call site in `src/app.rs` accordingly (this is one of the action-registration cluster touches in your `app.rs` region).
+The `settings_cell: Option<Rc<RefCell<ClipSettings>>>` must be threaded into `run_global_shortcuts` (around `src/clips/hotkey.rs:114`) and `rebind_shortcuts` (likewise). Update their callers in `src/app.rs:1017` and `src/app.rs:1107` — both are within Implementer B's **second declared `app.rs` region** (see "Coordination point" below). Pass `Some(settings_cell.clone())` where `settings_cell` is the same `Rc<RefCell<ClipSettings>>` the existing `clips_settings_ctx_partial` already carries.
+
+To minimize signature churn: add `settings_cell: Option<Rc<RefCell<ClipSettings>>>` as the last parameter of both `run_global_shortcuts` and `rebind_shortcuts`; existing other callers (if any) pass `None`.
 
 - [ ] **Step 3: Update stale ashpd 0.10 comments**
 
@@ -1949,7 +2183,9 @@ git add src/window.rs
 git commit -m "window: add build_clips_section + ClipsSectionWidgets"
 ```
 
-### Task B7: Remove the clips indicator from `build_status_card`
+### Task B7: Remove the clips indicator from `build_status_card` AND attach the new section to grid row 1
+
+> Merged with prior B8 because removing the indicator from Status without immediately providing a new home for `Widgets.clips_indicator` leaves the build broken.
 
 **Files:**
 - Modify: `src/window.rs`
@@ -1962,42 +2198,18 @@ grep -n "clips_indicator\|clips_row\|build_status_indicator" src/window.rs
 
 The indicator is added as a third row inside `build_status_card`'s PreferencesGroup, around lines 616-637.
 
-- [ ] **Step 2: Remove the `clips_indicator` + `clips_row` from `build_status_card` and `StatusResult`**
+- [ ] **Step 2: Remove the `clips_indicator` + `clips_row` from `build_status_card` and `StatusResult`, AND attach the new section**
 
-Delete the block in `build_status_card` that builds the indicator and adds it as a row. Remove `clips_indicator` and `clips_row` fields from `StatusResult`. Remove the `row_height.add_widget(&status_result.clips_row);` line from `build_dashboard_page`.
+Combined commit. Edit `build_status_card` to delete the block that builds the indicator and adds it as a row. Remove `clips_indicator` and `clips_row` fields from `StatusResult`. Remove the `row_height.add_widget(&status_result.clips_row);` line from `build_dashboard_page`.
 
-The top-level `Widgets.clips_indicator` field should be sourced from `build_clips_section`'s return value in Task B8 below.
-
-- [ ] **Step 3: Build to confirm the deletion is clean**
-
-```bash
-distrobox enter fedora-dev -- bash -c 'cd /var/home/admin/Documents/Code/SteelseriesFlatpak-clips-ui && cargo build 2>&1 | tail -10'
-```
-
-Expected: build error because `Widgets.clips_indicator` is referenced from `build_dashboard_page` but no longer has a source. Task B8 fixes this.
-
-- [ ] **Step 4: Commit (deliberately broken — will fix in B8)**
-
-```bash
-git add src/window.rs
-git commit -m "window: remove clips indicator from Status card"
-```
-
-### Task B8: Attach `build_clips_section` to dashboard grid row 1
-
-**Files:**
-- Modify: `src/window.rs`
-
-- [ ] **Step 1: Add the call in `build_dashboard_page`**
-
-After the existing `grid.attach(&device_card, 1, 0, 1, 1);` line, add:
+Then in `build_dashboard_page`, after the existing `grid.attach(&device_card, 1, 0, 1, 1);` line, add:
 
 ```rust
 let (clips_section, clips_section_widgets) = build_clips_section();
 grid.attach(&clips_section, 0, 1, 2, 1);  // column span 2
 ```
 
-And update the `Widgets` construction to source `clips_indicator: clips_section_widgets.indicator` from the new section. Add a `clips_section: Some(clips_section_widgets)` field on `Widgets`:
+Update the `Widgets` struct to add `clips_section`:
 
 ```rust
 pub struct Widgets {
@@ -2006,21 +2218,32 @@ pub struct Widgets {
 }
 ```
 
-Initialize as `clips_section: Some(clips_section_widgets)` in `build_dashboard_page`'s return. Inside `ChatMixWindow::new`, after the buffer/settings are available, call `widgets.clips_section.as_ref().map(|s| s.refresh(state, paused, &settings));` at the appropriate refresh sites.
+Source `clips_indicator: clips_section_widgets.indicator.clone()` (or a shared `Rc` — Implementer B picks). Initialize as `clips_section: Some(clips_section_widgets)` in `build_dashboard_page`'s return.
 
-- [ ] **Step 2: Update the on-state-change refresh path**
-
-Find where `clips_indicator.set_state` is currently called (`grep -n clips_indicator.set_state src/window.rs`). Add an adjacent call to refresh the section's pause-button label and labels:
+Add a public accessor on `ChatMixWindow`:
 
 ```rust
-if let Some(section) = &widgets.clips_section {
-    section.refresh(state, /*user_paused*/ buffer.borrow().user_paused(), &settings.borrow());
+impl ChatMixWindow {
+    pub fn refresh_clips_section(
+        &self,
+        state: crate::clips::buffer::BufferState,
+        paused: bool,
+        settings: &crate::clips::settings::ClipSettings,
+    ) {
+        if let Some(section) = &self.inner.borrow().clips_section {
+            section.refresh(state, paused, settings);
+        }
+    }
 }
 ```
 
-(Adapt to the available variables at each refresh site — `state`, `user_paused`, `settings` may come from different closures.)
+The action handler (Task B9) will call `window.refresh_clips_section(...)` rather than poking the private `inner` field directly.
 
-- [ ] **Step 3: Build**
+- [ ] **Step 3: Update the on-state-change refresh path**
+
+Find where `clips_indicator.set_state` is currently called (`grep -n clips_indicator.set_state src/window.rs`). Add an adjacent call to refresh the section's pause-button label and labels via the new accessor pattern in `ChatMixWindow::set_clips_state` (or wherever the indicator update lives now).
+
+- [ ] **Step 4: Build**
 
 ```bash
 distrobox enter fedora-dev -- bash -c 'cd /var/home/admin/Documents/Code/SteelseriesFlatpak-clips-ui && cargo build 2>&1 | tail -10'
@@ -2028,12 +2251,14 @@ distrobox enter fedora-dev -- bash -c 'cd /var/home/admin/Documents/Code/Steelse
 
 Expected: clean.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/window.rs
-git commit -m "window: attach clips section to dashboard grid row 1, full-width"
+git commit -m "window: relocate clips indicator to dedicated row-1 section"
 ```
+
+### Task B8: (RESERVED — merged into B7 to keep every commit building)
 
 ### Task B9: Add `app.pause-recording-toggle` GAction
 
@@ -2054,6 +2279,7 @@ Insert after the `app.add_action_entries([save_action]);` for `save-clip`:
 {
     let buffer = buffer.clone();
     let cmd_tx = cmd_tx.clone();
+    let settings_cell_for_action = settings_cell.clone();  // Rc<RefCell<ClipSettings>>
     let window_for_refresh = window.clone();
     let toggle_action = gtk::gio::ActionEntry::builder("pause-recording-toggle")
         .activate(move |_app: &adw::Application, _action, _param| {
@@ -2065,20 +2291,18 @@ Insert after the `app.add_action_entries([save_action]);` for `save-clip`:
                 buffer.borrow_mut().resume();
                 let _ = cmd_tx.send(crate::clips::ClipCommand::ResumeRecording);
             }
-            // Refresh the clips section UI to reflect new state.
-            if let Some(section) = &window_for_refresh.widgets.borrow().clips_section {
-                let state = buffer.borrow().state();
-                let paused = buffer.borrow().user_paused();
-                let settings = window_for_refresh.settings.borrow();
-                section.refresh(state, paused, &settings);
-            }
+            // Refresh the clips section UI via the public accessor on ChatMixWindow.
+            let state = buffer.borrow().state();
+            let paused = buffer.borrow().user_paused();
+            let settings = settings_cell_for_action.borrow();
+            window_for_refresh.refresh_clips_section(state, paused, &settings);
         })
         .build();
     app.add_action_entries([toggle_action]);
 }
 ```
 
-(Adapt variable names to match what's in scope at the action cluster — `buffer`, `cmd_tx`, `window` are already accessible there from the existing `save-clip` action setup.)
+(Variable names: `buffer`, `cmd_tx`, `settings_cell`, `window` are all in scope at the action cluster region. Verify by reading around line 715-788 before editing.)
 
 - [ ] **Step 3: Build**
 
@@ -2247,6 +2471,18 @@ Runs the manual verification recipes from the spec's Testing section:
 Reports back to the team lead with pass/fail per recipe.
 
 ---
+
+## Coordination point: `src/app.rs`
+
+Five edit regions in `src/app.rs`, all mutually disjoint:
+
+- **Implementer A region 1:** state-sync watcher block (approximately `app.rs:1391–1395`).
+- **Implementer A region 2:** `connect_shutdown` handler — volume capture (approximately `app.rs:1462–1478`).
+- **Implementer A region 3:** `init_pipeline` — apply-volumes loop after `VirtualSinks::create()` (approximately `app.rs:1502–1517`).
+- **Implementer B region 1:** action-registration cluster — new `app.pause-recording-toggle` (approximately `app.rs:715–788`).
+- **Implementer B region 2:** `run_global_shortcuts` and `rebind_shortcuts` call sites — pass `Some(settings_cell.clone())` as a new last parameter (approximately `app.rs:1017` and `app.rs:1107`).
+
+After both bundles land their changes, a `git merge` of the two worktrees produces no conflicts because no two regions overlap or are adjacent. If a conflict marker appears: take both edits verbatim. Verifier check: `git diff --stat main..merged -- src/app.rs` should show one consolidated diff.
 
 ## Teammate involvement (this plan's own)
 
