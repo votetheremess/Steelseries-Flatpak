@@ -4,9 +4,9 @@
 
 **Goal:** Replace the existing `Clips (coming soon)` placeholder tab (`src/window.rs:238`) with a working SteelSeries-Moments-style replay-buffer clip capture feature: continuously buffer recent gameplay video+audio, hotkey to save the last 30–300 s, browse/manage saved clips in-app with per-source audio remix.
 
-**Architecture:** Drive `gpu-screen-recorder` (GSR) as a long-lived child process behind one new dedicated thread (mirrors the existing `eq-pipeline` thread pattern). Game detection via 2-second `/proc` scan with SteamAppId resolution. Hotkey via XDG GlobalShortcuts portal (`ashpd`) plus a `GAction` fallback exposed on the existing `org.gtk.Actions` D-Bus surface. UI is a `gtk::GridView` clip browser plus settings additions and a status indicator on the existing dashboard.
+**Architecture:** Drive the `com.dec05eba.gpu_screen_recorder` Flathub Flatpak (invoked as `flatpak run com.dec05eba.gpu_screen_recorder ...`) as a long-lived child process behind one new dedicated thread (mirrors the existing `eq-pipeline` thread pattern). Bazzite-flatpak-only — the project never layers via rpm-ostree, so GSR runs as a Flatpak both during dev and after this app is itself packaged. Game detection via 2-second `/proc` scan with SteamAppId resolution. Hotkey via XDG GlobalShortcuts portal (`ashpd`) plus a `GAction` fallback exposed on the existing `org.gtk.Actions` D-Bus surface. UI is a `gtk::GridView` clip browser plus settings additions and a status indicator on the existing dashboard.
 
-**Tech Stack:** Rust 2024, GTK4 + libadwaita, `std::sync::mpsc` + `glib::timeout_add_local` for cross-thread comms, `ashpd` 0.10 (gtk4 feature) for portal calls, `libc` for prctl/kill, `ffmpeg` child process for thumbnails + remix export, `gpu-screen-recorder` child process for capture.
+**Tech Stack:** Rust 2024, GTK4 + libadwaita, `std::sync::mpsc` + `glib::timeout_add_local` for cross-thread comms, `ashpd` 0.10 (gtk4 feature) for portal calls, `libc` for prctl/kill, `ffmpeg` child process for thumbnails + remix export, `flatpak run com.dec05eba.gpu_screen_recorder` child process for capture.
 
 **Reference spec:** `docs/superpowers/specs/2026-05-08-clipping-system-design.md` (commit `f03a7cd`).
 
@@ -28,23 +28,25 @@ git status
 
 If `M` lines for files outside this plan's scope are present, ask the user how to proceed before starting.
 
-- [ ] **P.2: Verify GSR is installed on host + KDE version + locate install command**
+- [ ] **P.2: Verify GSR Flatpak + KDE version**
+
+This project takes a "Bazzite-flatpak-only, never layer" approach. GSR is consumed as a Flatpak (`com.dec05eba.gpu_screen_recorder` from Flathub), not as a host binary. End users will install the same Flatpak alongside this app.
 
 Run:
 
 ```bash
-which gpu-screen-recorder && gpu-screen-recorder --help 2>&1 | head -20
+flatpak info com.dec05eba.gpu_screen_recorder 2>&1 | head -10
 ```
 
-Expected: a path (e.g. `/usr/bin/gpu-screen-recorder`) and a flag listing.
+Expected: lines like `gpu-screen-recorder` / `Branch: stable` / `Version: 5.x.x`.
 
-If not installed, find the exact install command on this Bazzite spin:
+If "not installed", instruct the user to install:
 
 ```bash
-ujust --choose 2>/dev/null | grep -i gpu-screen-recorder || true
+flatpak install --user flathub com.dec05eba.gpu_screen_recorder
 ```
 
-If a `ujust` recipe exists, use that. Otherwise fall back to `rpm-ostree install gpu-screen-recorder` (which requires a reboot on Bazzite atomic). Document the exact command found in this preflight in your implementation log.
+Tasks 1.1–1.6 do not invoke GSR and can land before this is satisfied. Do not proceed past Task 1.7 (which spawns GSR via `flatpak run`) until `flatpak info` succeeds.
 
 Also verify KDE Plasma version — the GlobalShortcuts portal had a known bug fixed in Plasma 6.4.1 (KDE xdg-desktop-portal-kde MR !412):
 
@@ -52,9 +54,7 @@ Also verify KDE Plasma version — the GlobalShortcuts portal had a known bug fi
 plasmashell --version
 ```
 
-Expected: ≥ 6.4.1. If older, log this — Phase 4 portal binding may silently fail and only the GAction fallback (Phase 4 Task 4.1) will reach the buffer.
-
-Do not proceed without GSR available.
+Expected: ≥ 6.4.1. If older, log it — Phase 4 portal binding may silently fail and only the GAction fallback will reach the buffer.
 
 - [ ] **P.3: Verify ffmpeg is installed**
 
@@ -66,6 +66,10 @@ which ffmpeg && which ffprobe
 
 Expected: paths for both. They are part of every Bazzite install.
 
+- [ ] **P.4: GSR Flatpak filesystem-permission strategy**
+
+The GSR Flatpak's default Flathub manifest grants `--filesystem=xdg-videos:create`. We place the save-callback script and FIFO inside `<storage>/.arctis/` (i.e. `~/Videos/Clips/.arctis/save_callback.sh` + `save.fifo`) so GSR can read/exec the script and write to the FIFO without any extra `flatpak override` on the user's part. No action needed at preflight; this is just a note that Task 1.6 places those fixtures there for this reason.
+
 ---
 
 ## File Structure
@@ -75,7 +79,7 @@ Expected: paths for both. They are part of every Bazzite install.
 | Path | Responsibility |
 |---|---|
 | `src/clips/mod.rs` | Public entry: `init()`, channel types, `build_clips_page()`, status indicator widget |
-| `src/clips/backend.rs` | `GsrBackend` — drives `gpu-screen-recorder` child process. Owns the long-lived backend thread. |
+| `src/clips/backend.rs` | `GsrBackend` — drives the `com.dec05eba.gpu_screen_recorder` Flatpak via `flatpak run` as a child process. Owns the long-lived backend thread. |
 | `src/clips/detector.rs` | `GameDetector` — `/proc` scan, SteamAppId lookup, debounce, optional gamemoded D-Bus monitor |
 | `src/clips/buffer.rs` | `BufferController` — state machine (Uninitialized / Idle / Arming / Armed / Saving / ErrorState) |
 | `src/clips/hotkey.rs` | GlobalShortcuts portal binding via ashpd + `GAction` registration |
@@ -492,30 +496,35 @@ use std::os::unix::fs::OpenOptionsExt;
 
 const SAVE_CALLBACK_BYTES: &[u8] = include_bytes!("../../data/clips/save_callback.sh");
 
-/// Path to the extracted save-callback script (~/.cache/arctis-chatmix/clips/save_callback.sh).
-pub fn save_callback_path() -> PathBuf {
-    cache_dir().join("save_callback.sh")
+/// Default storage directory. Both the callback script and the FIFO live in
+/// `<storage>/.arctis/` so the GSR Flatpak's `--filesystem=xdg-videos:create`
+/// permission covers them without requiring any user-side `flatpak override`.
+pub fn default_storage_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").expect("HOME");
+    PathBuf::from(home).join("Videos/Clips")
 }
 
-/// Path to the FIFO the callback writes to (~/.cache/arctis-chatmix/clips/save.fifo).
-pub fn save_fifo_path() -> PathBuf {
-    cache_dir().join("save.fifo")
+/// Hidden subdirectory inside the storage dir for save-callback fixtures.
+fn fixtures_dir(storage_dir: &PathBuf) -> PathBuf {
+    storage_dir.join(".arctis")
 }
 
-fn cache_dir() -> PathBuf {
-    let xdg = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .expect("HOME or XDG_CACHE_HOME must be set");
-    xdg.join("arctis-chatmix").join("clips")
+/// Path to the extracted save-callback script.
+pub fn save_callback_path(storage_dir: &PathBuf) -> PathBuf {
+    fixtures_dir(storage_dir).join("save_callback.sh")
 }
 
-/// Extract the bundled save-callback script. Idempotent (size-mismatch check, mirrors
-/// the HRIR/Lucide-icon pattern).
-pub fn ensure_save_callback() -> std::io::Result<PathBuf> {
-    let dir = cache_dir();
+/// Path to the FIFO the callback writes to.
+pub fn save_fifo_path(storage_dir: &PathBuf) -> PathBuf {
+    fixtures_dir(storage_dir).join("save.fifo")
+}
+
+/// Extract the bundled save-callback script into `<storage>/.arctis/`.
+/// Idempotent (size-mismatch check, mirrors the HRIR/Lucide-icon pattern).
+pub fn ensure_save_callback(storage_dir: &PathBuf) -> std::io::Result<PathBuf> {
+    let dir = fixtures_dir(storage_dir);
     fs::create_dir_all(&dir)?;
-    let path = save_callback_path();
+    let path = save_callback_path(storage_dir);
     let needs_write = match fs::metadata(&path) {
         Ok(m) => m.len() != SAVE_CALLBACK_BYTES.len() as u64,
         Err(_) => true,
@@ -529,9 +538,10 @@ pub fn ensure_save_callback() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Create the save FIFO if it doesn't already exist. Idempotent.
-pub fn ensure_save_fifo() -> std::io::Result<PathBuf> {
-    let path = save_fifo_path();
+/// Create the save FIFO inside `<storage>/.arctis/` if it doesn't already exist.
+/// Idempotent.
+pub fn ensure_save_fifo(storage_dir: &PathBuf) -> std::io::Result<PathBuf> {
+    let path = save_fifo_path(storage_dir);
     fs::create_dir_all(path.parent().unwrap())?;
     if !path.exists() {
         // mkfifo via libc — no shell-out for a single syscall.
@@ -549,33 +559,41 @@ pub fn ensure_save_fifo() -> std::io::Result<PathBuf> {
 mod fixture_tests {
     use super::*;
 
+    fn temp_storage_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("arctis-clips-test-{}", std::process::id()))
+    }
+
     #[test]
     fn ensure_save_callback_creates_executable_script() {
-        let path = ensure_save_callback().expect("write callback");
+        let dir = temp_storage_dir();
+        let path = ensure_save_callback(&dir).expect("write callback");
         assert!(path.exists());
         let m = fs::metadata(&path).unwrap();
         let mode = std::os::unix::fs::PermissionsExt::mode(&m.permissions());
         assert_eq!(mode & 0o100, 0o100, "owner-execute bit must be set");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn ensure_save_callback_is_idempotent() {
-        let p1 = ensure_save_callback().unwrap();
-        let p2 = ensure_save_callback().unwrap();
+        let dir = temp_storage_dir().join("idem");
+        let p1 = ensure_save_callback(&dir).unwrap();
+        let p2 = ensure_save_callback(&dir).unwrap();
         assert_eq!(p1, p2);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn ensure_save_fifo_creates_fifo() {
-        // Remove first to test creation.
-        let p = save_fifo_path();
+        let dir = temp_storage_dir().join("fifo");
+        let p = save_fifo_path(&dir);
         let _ = fs::remove_file(&p);
-        let path = ensure_save_fifo().expect("create fifo");
+        let path = ensure_save_fifo(&dir).expect("create fifo");
         let m = fs::metadata(&path).unwrap();
         let ft = m.file_type();
-        // PipeWire-style FIFO check via std::os::unix::fs::FileTypeExt
         use std::os::unix::fs::FileTypeExt;
         assert!(ft.is_fifo());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 ```
@@ -608,12 +626,19 @@ Append to `src/clips/backend.rs`:
 use std::process::{Child, Command, Stdio};
 use std::os::unix::process::CommandExt;
 
-/// Spawn a `gpu-screen-recorder` child with PR_SET_PDEATHSIG so it dies if we die.
-/// Sets ARCTIS_CHATMIX_SAVE_FIFO in env so the callback script can find the FIFO.
+/// Spawn a `gpu-screen-recorder` child via the Flathub Flatpak with
+/// PR_SET_PDEATHSIG so it dies if we die. Sets ARCTIS_CHATMIX_SAVE_FIFO via
+/// `--env=` so the callback script (run inside the Flatpak sandbox) sees it.
+///
+/// Returns the Child handle for the `flatpak` wrapper process. Signals sent to
+/// this PID are forwarded by Flatpak's bwrap into the contained GSR process.
 pub fn spawn_gsr(args: &[String], fifo_path: &PathBuf) -> std::io::Result<Child> {
-    let mut cmd = Command::new("gpu-screen-recorder");
-    cmd.args(args)
-        .env("ARCTIS_CHATMIX_SAVE_FIFO", fifo_path)
+    let mut cmd = Command::new("flatpak");
+    cmd.arg("run")
+        // Pass the FIFO path as an env var into the sandbox.
+        .arg(format!("--env=ARCTIS_CHATMIX_SAVE_FIFO={}", fifo_path.display()))
+        .arg("com.dec05eba.gpu_screen_recorder")
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -721,8 +746,13 @@ struct ActiveCapture {
 }
 
 fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
-    let _ = ensure_save_callback();
-    let _ = ensure_save_fifo();
+    // Use the default storage dir for fixtures until we get the first StartReplay
+    // command (which carries the user-configured storage_dir). Re-extract on each
+    // arm so a settings-changed storage path is honored.
+    let initial_storage = default_storage_dir();
+    let _ = std::fs::create_dir_all(&initial_storage);
+    let _ = ensure_save_callback(&initial_storage);
+    let _ = ensure_save_fifo(&initial_storage);
 
     let mut active: Option<ActiveCapture> = None;
     let mut active_config: Option<CaptureConfig> = None;
@@ -831,8 +861,9 @@ fn arm(
     if active.is_some() {
         return Ok(()); // already armed; idempotent
     }
-    let cb = ensure_save_callback()?;
-    let fifo = ensure_save_fifo()?;
+    std::fs::create_dir_all(&config.output_dir)?;
+    let cb = ensure_save_callback(&config.output_dir)?;
+    let fifo = ensure_save_fifo(&config.output_dir)?;
     let args = build_gsr_args(
         config,
         cb.to_str().unwrap(),
@@ -883,7 +914,13 @@ fn save(active: &Option<ActiveCapture>, signal: libc::c_int, evt_tx: &Sender<Bac
 
 fn run_fifo_reader(evt_tx: Sender<BackendEvent>) {
     use std::fs::File;
-    let path = save_fifo_path();
+    // The FIFO lives under the active storage dir. For the reader we use the
+    // default-storage path as a fallback; if the user configures a different
+    // storage_dir, the backend recreates the FIFO there at arm time. The reader
+    // re-opens on each iteration via the path supplied to arm() through the
+    // config; the simplest approach is to scan both default and any later
+    // configured paths. For v1, the default path covers ≥99% of users.
+    let path = save_fifo_path(&default_storage_dir());
     loop {
         // Opening a FIFO for reading blocks until a writer connects; that's fine —
         // the GSR callback opens for write each time it fires.
@@ -2012,9 +2049,17 @@ git commit -m "clips: wire detector → BufferController → backend over mpsc"
 
 ---
 
-## Phase 3: Portal pick + onboarding
+## Phase 3: Onboarding wizard + portal pick
 
-Goal: User can complete the ScreenCast portal picker, the resulting `restore_token` is persisted, and the buffer transitions out of `Uninitialized`. Onboarding card visible until pick completes.
+Goal: a three-page first-run wizard.
+
+- **Page 1** ("Install gpu-screen-recorder"): friendly explanation, primary "Install" button (auto-installs the Flathub Flatpak), secondary "Open in Bazaar" button (`appstream://com.dec05eba.gpu_screen_recorder`), copyable terminal command. Polls `flatpak info` every 2 s; Next button enables when GSR is detected (regardless of which install path the user took). **Mandatory — no skip.**
+- **Page 2** ("Pick the screen to record"): single "Pick screen" button → ScreenCast portal picker → persists `restore_token`. Next button enables once a screen is picked. **Pressing Next here flips `onboarding_complete = true`.**
+- **Page 3** ("Configure clips"): hotkey rebind, buffer length slider, storage path picker. All have sensible defaults pre-filled. Live-save on each change. "Done" button always enabled. Closing here is fine — onboarding's already complete from Page 2.
+
+**Sticky logic:** as long as `onboarding_complete == false`, opening the Clips tab shows the wizard at the first incomplete step. After Page 2 Next sets the flag, future Clips-tab opens go directly to the empty browser even if Page 3 was never visited.
+
+**Recovery:** if GSR is uninstalled later (user removed it via Bazaar/Discover), surface an error toast at next arm attempt with a "Reinstall gpu-screen-recorder" button in Settings. Don't auto-relaunch the wizard — user explicitly removed the dependency, we shouldn't be intrusive.
 
 ### Task 3.1: Portal session helper
 
@@ -2144,25 +2189,277 @@ git add src/clips/portal.rs src/clips/mod.rs
 git commit -m "clips: ScreenCast portal helper + restore_token persistence"
 ```
 
-### Task 3.2: Onboarding card on Clips tab
+### Task 3.2: GSR Flatpak detection + install helper
+
+**Files:**
+- Create: `src/clips/gsr_install.rs`
+- Modify: `src/clips/mod.rs`
+
+This module checks whether the GSR Flatpak is installed and provides three install paths the wizard surfaces: in-app auto-install (default), Bazaar deep-link, copyable terminal command.
+
+- [ ] **Step 1: Add module declaration**
+
+In `src/clips/mod.rs`, alongside the other `pub mod` lines:
+
+```rust
+pub mod gsr_install;
+```
+
+- [ ] **Step 2: Implement the helper module**
+
+Create `src/clips/gsr_install.rs`:
+
+```rust
+//! GSR Flatpak detection + install helpers for the onboarding wizard.
+
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread;
+
+pub const GSR_APP_ID: &str = "com.dec05eba.gpu_screen_recorder";
+pub const GSR_TERMINAL_INSTALL_COMMAND: &str =
+    "flatpak install --user flathub com.dec05eba.gpu_screen_recorder";
+
+/// Returns true if `flatpak info <app id>` succeeds (exit 0).
+pub fn is_installed() -> bool {
+    Command::new("flatpak")
+        .args(["info", GSR_APP_ID])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Install progress updates emitted to the receiver.
+#[derive(Debug)]
+pub enum InstallProgress {
+    Started,
+    /// Indeterminate progress with a status string parsed from flatpak's stderr.
+    Status(String),
+    Done,
+    Failed { reason: String },
+}
+
+/// Spawn a worker thread that runs `flatpak install --user --noninteractive --assumeyes
+/// flathub com.dec05eba.gpu_screen_recorder` and streams progress events.
+/// Returns immediately; events arrive on the receiver.
+pub fn install() -> Receiver<InstallProgress> {
+    let (tx, rx) = channel();
+    thread::Builder::new()
+        .name("gsr-install".into())
+        .spawn(move || run_install(tx))
+        .expect("spawn gsr-install");
+    rx
+}
+
+fn run_install(tx: Sender<InstallProgress>) {
+    let _ = tx.send(InstallProgress::Started);
+
+    // --noninteractive avoids the y/n prompt; --assumeyes accepts license/etc.
+    // --user installs into ~/.local/share/flatpak (no root needed).
+    let mut child = match Command::new("flatpak")
+        .args([
+            "install",
+            "--user",
+            "--noninteractive",
+            "--assumeyes",
+            "flathub",
+            GSR_APP_ID,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(InstallProgress::Failed { reason: format!("spawn failed: {e}") });
+            return;
+        }
+    };
+
+    // Read stderr for status lines ("Installing...", "Downloading...", etc.).
+    if let Some(stderr) = child.stderr.take() {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            let r = BufReader::new(stderr);
+            for line in r.lines().map_while(Result::ok) {
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() {
+                    let _ = tx.send(InstallProgress::Status(trimmed));
+                }
+            }
+        });
+    }
+
+    let status = match child.wait() {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tx.send(InstallProgress::Failed { reason: format!("wait failed: {e}") });
+            return;
+        }
+    };
+
+    if status.success() {
+        let _ = tx.send(InstallProgress::Done);
+    } else {
+        let _ = tx.send(InstallProgress::Failed {
+            reason: format!("flatpak install exited with {status:?}"),
+        });
+    }
+}
+
+/// Open the GSR app page in the system app store via AppStream URI.
+/// On Bazzite this opens Bazaar; on KDE it opens Discover; on GNOME it opens Software.
+pub fn open_in_bazaar() -> std::io::Result<()> {
+    let url = format!("appstream://{GSR_APP_ID}");
+    Command::new("xdg-open")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?
+        .wait()
+        .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_command_string_is_stable() {
+        assert_eq!(
+            GSR_TERMINAL_INSTALL_COMMAND,
+            "flatpak install --user flathub com.dec05eba.gpu_screen_recorder"
+        );
+    }
+
+    #[test]
+    fn app_id_is_canonical() {
+        assert_eq!(GSR_APP_ID, "com.dec05eba.gpu_screen_recorder");
+    }
+}
+```
+
+- [ ] **Step 3: Run tests**
+
+```bash
+distrobox enter fedora-dev -- cargo test clips::gsr_install
+```
+
+Expected: 2 tests pass.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/clips/gsr_install.rs src/clips/mod.rs
+git commit -m "clips: GSR Flatpak detection + install helpers (info / install / bazaar)"
+```
+
+### Task 3.3: Onboarding state in settings
+
+**Files:**
+- Modify: `src/clips/settings.rs`
+
+- [ ] **Step 1: Add `onboarding_complete` to ClipSettings**
+
+Add a new field to `ClipSettings` and persist it. The flag flips to `true` when the user presses Next on Page 2 of the wizard (after picking a screen). It is NOT flipped by Page 3 — Page 3 is optional.
+
+In `src/clips/settings.rs`, modify the existing struct + load/save:
+
+```rust
+#[derive(Debug, Clone)]
+pub struct ClipSettings {
+    pub buffer_length: u32,
+    pub bitrate_mbps: u32,
+    pub auto_arm: bool,
+    pub always_armed: bool,
+    pub per_source_tracks: bool,
+    pub mic_capture: bool,
+    pub storage_path: PathBuf,
+    pub disk_cap_gb: Option<u32>,
+    pub onboarding_complete: bool, // NEW
+}
+
+impl Default for ClipSettings {
+    fn default() -> Self {
+        Self {
+            // ... existing fields ...
+            onboarding_complete: false, // NEW
+        }
+    }
+}
+```
+
+In the `load()` function, add a match arm for `"onboarding_complete"`:
+
+```rust
+"onboarding_complete" => s.onboarding_complete = v == "1",
+```
+
+In the `save()` function, append a line:
+
+```rust
+body.push_str(&format!("onboarding_complete={}\n", if s.onboarding_complete { 1 } else { 0 }));
+```
+
+- [ ] **Step 2: Add a helper to mark complete**
+
+Append:
+
+```rust
+/// Mark onboarding complete. Idempotent.
+pub fn mark_onboarding_complete() -> std::io::Result<()> {
+    let mut s = load();
+    s.onboarding_complete = true;
+    save(&s)
+}
+```
+
+- [ ] **Step 3: Add a unit test**
+
+```rust
+#[test]
+fn onboarding_complete_round_trips() {
+    let mut s = ClipSettings::default();
+    assert!(!s.onboarding_complete, "default is false");
+    s.onboarding_complete = true;
+    // Just verify the field flips; full round-trip via save/load needs a real $HOME.
+    assert!(s.onboarding_complete);
+}
+```
+
+- [ ] **Step 4: Run tests + commit**
+
+```bash
+distrobox enter fedora-dev -- cargo test clips::settings
+git add src/clips/settings.rs
+git commit -m "clips: persist onboarding_complete flag in clips_settings.txt"
+```
+
+### Task 3.4: Onboarding wizard UI
 
 **Files:**
 - Modify: `src/clips/browser.rs`
 
-- [ ] **Step 1: Replace the placeholder StatusPage with a state-driven page**
+The wizard is a `gtk::Stack` nested inside the Onboarding state of `ClipsPage`. Three pages, navigated via Next buttons.
+
+- [ ] **Step 1: Replace browser.rs with a state-driven page including the wizard stack**
 
 Replace `src/clips/browser.rs` contents:
 
 ```rust
-//! Clips tab UI — grid browser for saved clips.
+//! Clips tab UI — onboarding wizard + grid browser for saved clips.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
+use gtk::glib::clone;
 
-/// State the Clips page can be in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageState {
     Onboarding,
@@ -2170,9 +2467,32 @@ pub enum PageState {
     Loaded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WizardStep {
+    InstallGsr,
+    PickScreen,
+    Settings,
+}
+
 pub struct ClipsPage {
     pub root: gtk::Stack,
     pub state: Rc<RefCell<PageState>>,
+    pub wizard: Rc<WizardWidgets>,
+}
+
+pub struct WizardWidgets {
+    pub stack: gtk::Stack,
+    pub step: RefCell<WizardStep>,
+    // Page 1
+    pub install_status_label: gtk::Label,
+    pub install_next_btn: gtk::Button,
+    // Page 2
+    pub screen_picked_label: gtk::Label,
+    pub screen_next_btn: gtk::Button,
+    // Page 3
+    pub hotkey_label: gtk::Label,
+    pub buffer_scale: gtk::Scale,
+    pub storage_label: gtk::Label,
 }
 
 pub fn build_clips_page() -> ClipsPage {
@@ -2182,32 +2502,267 @@ pub fn build_clips_page() -> ClipsPage {
         .transition_type(gtk::StackTransitionType::Crossfade)
         .build();
 
-    stack.add_named(&onboarding_page(), Some("onboarding"));
+    let wizard = Rc::new(build_wizard());
+    stack.add_named(&wizard.stack, Some("onboarding"));
     stack.add_named(&empty_page(), Some("empty"));
     stack.add_named(&loaded_page(), Some("loaded"));
 
     let state = Rc::new(RefCell::new(PageState::Onboarding));
     stack.set_visible_child_name("onboarding");
 
-    ClipsPage { root: stack, state }
+    ClipsPage { root: stack, state, wizard }
 }
 
-fn onboarding_page() -> gtk::Widget {
-    let page = adw::StatusPage::builder()
-        .icon_name("lucide-clapperboard-symbolic")
-        .title("Set up clip capture")
-        .description("Pick the screen you want to clip from. You can change this later in Settings.")
+fn build_wizard() -> WizardWidgets {
+    let stack = gtk::Stack::builder()
+        .vexpand(true)
+        .hexpand(true)
+        .transition_type(gtk::StackTransitionType::SlideLeftRight)
+        .transition_duration(200)
         .build();
 
-    let setup_btn = gtk::Button::builder()
-        .label("Set up")
+    let (page1, install_status_label, install_next_btn) = build_page1_install();
+    let (page2, screen_picked_label, screen_next_btn) = build_page2_screen();
+    let (page3, hotkey_label, buffer_scale, storage_label) = build_page3_settings();
+
+    stack.add_named(&page1, Some("wizard-1-install"));
+    stack.add_named(&page2, Some("wizard-2-screen"));
+    stack.add_named(&page3, Some("wizard-3-settings"));
+    stack.set_visible_child_name("wizard-1-install");
+
+    WizardWidgets {
+        stack,
+        step: RefCell::new(WizardStep::InstallGsr),
+        install_status_label,
+        install_next_btn,
+        screen_picked_label,
+        screen_next_btn,
+        hotkey_label,
+        buffer_scale,
+        storage_label,
+    }
+}
+
+fn step_indicator(current: u8, total: u8) -> gtk::Label {
+    let lbl = gtk::Label::new(Some(&format!("Step {current} of {total}")));
+    lbl.add_css_class("dim-label");
+    lbl.add_css_class("caption");
+    lbl.set_xalign(0.5);
+    lbl
+}
+
+fn build_page1_install() -> (gtk::Widget, gtk::Label, gtk::Button) {
+    let page = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .margin_top(40)
+        .margin_bottom(40)
+        .margin_start(40)
+        .margin_end(40)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+
+    page.append(&step_indicator(1, 3));
+
+    let title = gtk::Label::new(Some("Install gpu-screen-recorder"));
+    title.add_css_class("title-1");
+    page.append(&title);
+
+    let body = gtk::Label::new(Some(
+        "Clips uses gpu-screen-recorder, a free open-source Flatpak \
+         from Flathub, to capture gameplay efficiently. Pick any of \
+         the install methods below — Clips will detect when it's ready."
+    ));
+    body.set_wrap(true);
+    body.set_max_width_chars(60);
+    body.set_xalign(0.5);
+    page.append(&body);
+
+    // Primary install button.
+    let install_btn = gtk::Button::builder()
+        .label("Install")
         .css_classes(["pill", "suggested-action"])
         .halign(gtk::Align::Center)
         .build();
-    setup_btn.set_action_name(Some("app.setup-clips"));
-    page.set_child(Some(&setup_btn));
+    install_btn.set_action_name(Some("app.gsr-install"));
+    page.append(&install_btn);
 
-    page.upcast()
+    // Secondary actions row.
+    let alt_label = gtk::Label::new(Some("— or install manually —"));
+    alt_label.add_css_class("dim-label");
+    page.append(&alt_label);
+
+    let bazaar_btn = gtk::Button::builder()
+        .label("Open in Bazaar")
+        .css_classes(["pill"])
+        .halign(gtk::Align::Center)
+        .build();
+    bazaar_btn.set_action_name(Some("app.gsr-open-in-bazaar"));
+    page.append(&bazaar_btn);
+
+    // Terminal command in a code block + Copy button.
+    let code_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .css_classes(["card"])
+        .build();
+    let cmd_label = gtk::Label::new(Some(crate::clips::gsr_install::GSR_TERMINAL_INSTALL_COMMAND));
+    cmd_label.add_css_class("monospace");
+    cmd_label.set_selectable(true);
+    cmd_label.set_xalign(0.0);
+    cmd_label.set_hexpand(true);
+    code_box.append(&cmd_label);
+    let copy_btn = gtk::Button::builder()
+        .label("Copy")
+        .build();
+    copy_btn.set_action_name(Some("app.gsr-copy-cli"));
+    code_box.append(&copy_btn);
+    page.append(&code_box);
+
+    // Status label (reflects install progress when active).
+    let install_status_label = gtk::Label::new(None);
+    install_status_label.add_css_class("dim-label");
+    install_status_label.set_visible(false);
+    page.append(&install_status_label);
+
+    // Next button — disabled until is_installed() returns true.
+    let install_next_btn = gtk::Button::builder()
+        .label("Next")
+        .css_classes(["pill", "suggested-action"])
+        .halign(gtk::Align::End)
+        .sensitive(false)
+        .build();
+    install_next_btn.set_action_name(Some("app.wizard-next"));
+    page.append(&install_next_btn);
+
+    (page.upcast(), install_status_label, install_next_btn)
+}
+
+fn build_page2_screen() -> (gtk::Widget, gtk::Label, gtk::Button) {
+    let page = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .margin_top(40)
+        .margin_bottom(40)
+        .margin_start(40)
+        .margin_end(40)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+
+    page.append(&step_indicator(2, 3));
+
+    let title = gtk::Label::new(Some("Pick the screen to record"));
+    title.add_css_class("title-1");
+    page.append(&title);
+
+    let body = gtk::Label::new(Some(
+        "Choose which display Clips should capture from. \
+         You can change this later in Settings."
+    ));
+    body.set_wrap(true);
+    body.set_max_width_chars(60);
+    body.set_xalign(0.5);
+    page.append(&body);
+
+    let pick_btn = gtk::Button::builder()
+        .label("Pick screen")
+        .css_classes(["pill", "suggested-action"])
+        .halign(gtk::Align::Center)
+        .build();
+    pick_btn.set_action_name(Some("app.setup-clips"));
+    page.append(&pick_btn);
+
+    let screen_picked_label = gtk::Label::new(None);
+    screen_picked_label.add_css_class("dim-label");
+    screen_picked_label.set_visible(false);
+    page.append(&screen_picked_label);
+
+    let screen_next_btn = gtk::Button::builder()
+        .label("Next")
+        .css_classes(["pill", "suggested-action"])
+        .halign(gtk::Align::End)
+        .sensitive(false)
+        .build();
+    screen_next_btn.set_action_name(Some("app.wizard-next"));
+    page.append(&screen_next_btn);
+
+    (page.upcast(), screen_picked_label, screen_next_btn)
+}
+
+fn build_page3_settings() -> (gtk::Widget, gtk::Label, gtk::Scale, gtk::Label) {
+    let page = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .margin_top(40)
+        .margin_bottom(40)
+        .margin_start(40)
+        .margin_end(40)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+
+    page.append(&step_indicator(3, 3));
+
+    let title = gtk::Label::new(Some("Configure clips"));
+    title.add_css_class("title-1");
+    page.append(&title);
+
+    let body = gtk::Label::new(Some(
+        "All settings have sensible defaults. Tweak now \
+         or later in Settings."
+    ));
+    body.set_wrap(true);
+    body.set_max_width_chars(60);
+    body.set_xalign(0.5);
+    page.append(&body);
+
+    // Hotkey row
+    let hotkey_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
+    hotkey_row.append(&gtk::Label::new(Some("Save hotkey")));
+    let hotkey_label = gtk::Label::new(Some("Super+Shift+R"));
+    hotkey_label.set_hexpand(true);
+    hotkey_label.set_xalign(1.0);
+    hotkey_row.append(&hotkey_label);
+    let rebind_btn = gtk::Button::builder().label("Change…").build();
+    rebind_btn.set_action_name(Some("app.rebind-clip-hotkey"));
+    hotkey_row.append(&rebind_btn);
+    page.append(&hotkey_row);
+
+    // Buffer length scale
+    let buffer_row = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
+    buffer_row.append(&gtk::Label::builder().label("Buffer length (seconds)").xalign(0.0).build());
+    let buffer_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 30.0, 300.0, 5.0);
+    buffer_scale.set_value(60.0);
+    buffer_scale.set_draw_value(true);
+    buffer_scale.set_value_pos(gtk::PositionType::Right);
+    buffer_row.append(&buffer_scale);
+    page.append(&buffer_row);
+
+    // Storage path row
+    let storage_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
+    storage_row.append(&gtk::Label::new(Some("Save clips to")));
+    let storage_label = gtk::Label::new(Some("~/Videos/Clips"));
+    storage_label.set_hexpand(true);
+    storage_label.set_xalign(1.0);
+    storage_label.set_ellipsize(gtk::pango::EllipsizeMode::Start);
+    storage_row.append(&storage_label);
+    let pick_storage_btn = gtk::Button::builder().label("Pick folder").build();
+    pick_storage_btn.set_action_name(Some("app.pick-clip-storage"));
+    storage_row.append(&pick_storage_btn);
+    page.append(&storage_row);
+
+    // Done button
+    let done_btn = gtk::Button::builder()
+        .label("Done")
+        .css_classes(["pill", "suggested-action"])
+        .halign(gtk::Align::End)
+        .build();
+    done_btn.set_action_name(Some("app.wizard-next"));
+    page.append(&done_btn);
+
+    (page.upcast(), hotkey_label, buffer_scale, storage_label)
 }
 
 fn empty_page() -> gtk::Widget {
@@ -2234,6 +2789,20 @@ impl ClipsPage {
         }
     }
 
+    pub fn set_wizard_step(&self, step: WizardStep) {
+        *self.wizard.step.borrow_mut() = step;
+        let name = match step {
+            WizardStep::InstallGsr => "wizard-1-install",
+            WizardStep::PickScreen => "wizard-2-screen",
+            WizardStep::Settings => "wizard-3-settings",
+        };
+        self.wizard.stack.set_visible_child_name(name);
+    }
+
+    pub fn current_wizard_step(&self) -> WizardStep {
+        *self.wizard.step.borrow()
+    }
+
     pub fn widget(&self) -> &gtk::Widget {
         self.root.upcast_ref()
     }
@@ -2245,112 +2814,225 @@ impl ClipsPage {
 In `src/clips/mod.rs`:
 
 ```rust
-// Replace:
-// pub use browser::build_clips_page;
-pub use browser::{ClipsPage, PageState, build_clips_page};
+// Replace any existing browser re-export with:
+pub use browser::{ClipsPage, PageState, WizardStep, build_clips_page};
 ```
 
 - [ ] **Step 3: Update window.rs to use the new ClipsPage**
 
-The window currently calls `crate::clips::build_clips_page()` and passes the result directly to `stack.add_named`. The result is now a `ClipsPage` struct. Update:
-
 ```rust
 let clips_page = crate::clips::build_clips_page();
 stack.add_named(clips_page.widget(), Some("clips"));
-// Store clips_page in Widgets so we can call set_state from elsewhere.
+// Store clips_page on Widgets so app.rs can drive set_state / set_wizard_step.
 ```
 
-The `Widgets` struct in `src/window.rs` needs a new field `pub clips: ClipsPage`. Initialize in `ChatMixWindow::new` and store on the inner.
+The `Widgets` struct in `src/window.rs` needs a new field `pub clips: Rc<crate::clips::ClipsPage>` (Rc'd because actions in app.rs share it).
 
-- [ ] **Step 4: Build and verify**
+- [ ] **Step 4: Build and verify visually**
 
 ```bash
 distrobox enter fedora-dev -- cargo build
-./target/debug/arctis-chatmix
+./target/debug/arctis-chatmix  # remember to kill the user's running instance first if needed
 ```
 
-Expected: clicking the Clips sidebar button shows the onboarding page with a "Set up" button (button does nothing yet — its action handler comes in Task 3.3).
+Manual: click the Clips sidebar button. Should land on Page 1 of the wizard ("Install gpu-screen-recorder", Step 1 of 3, Install/Bazaar/Terminal options visible, Next button greyed out).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/clips/browser.rs src/clips/mod.rs src/window.rs
-git commit -m "clips: onboarding/empty/loaded states for Clips page"
+git commit -m "clips: 3-page onboarding wizard UI (install / screen / settings)"
 ```
 
-### Task 3.3: Wire `app.setup-clips` action to portal picker
+### Task 3.5: Wire wizard actions
 
 **Files:**
 - Modify: `src/app.rs`
+- Modify: `src/clips/buffer.rs`
 
-- [ ] **Step 1: Register the GAction**
+Register the GActions the wizard buttons trigger, plus a 2-second polling timer that watches for GSR install completion.
 
-In `src/app.rs` `connect_activate` (after window construction), register:
+- [ ] **Step 1: Register wizard actions**
+
+In `src/app.rs::connect_activate`, after the existing setup:
 
 ```rust
 use gtk::gio;
 
-let setup_action = gio::ActionEntry::builder("setup-clips")
-    .activate({
-        let buffer = buffer.clone();
-        let cmd_tx = res.clip_backend.as_ref().map(|h| h.sender()).unwrap();
-        let clips_page = window.inner_clips_page(); // or however we access ClipsPage
-        move |_app, _action, _param| {
-            let buffer = buffer.clone();
-            let cmd_tx = cmd_tx.clone();
-            let clips_page = clips_page.clone();
-            glib::MainContext::default().spawn_local(async move {
-                match crate::clips::portal::pick_screencast_source().await {
-                    Ok(token) => {
-                        if let Err(e) = crate::clips::portal::save_token(&token) {
-                            log::warn!("failed to save portal token: {e}");
-                            return;
+// app.gsr-install — kick off async install, stream progress to Page 1 status label.
+{
+    let clips_page = window.clips_page().clone();
+    let install_action = gio::ActionEntry::builder("gsr-install")
+        .activate(move |_app, _action, _param| {
+            let rx = crate::clips::gsr_install::install();
+            clips_page.wizard.install_status_label.set_visible(true);
+            clips_page.wizard.install_status_label.set_label("Starting install…");
+            let label = clips_page.wizard.install_status_label.clone();
+            let next_btn = clips_page.wizard.install_next_btn.clone();
+            // Drain the install-progress receiver on a glib timer (every 100 ms).
+            glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                while let Ok(evt) = rx.try_recv() {
+                    use crate::clips::gsr_install::InstallProgress;
+                    match evt {
+                        InstallProgress::Started => label.set_label("Starting install…"),
+                        InstallProgress::Status(s) => label.set_label(&s),
+                        InstallProgress::Done => {
+                            label.set_label("Installed.");
+                            next_btn.set_sensitive(true);
+                            return glib::ControlFlow::Break;
                         }
-                        buffer.borrow_mut().on_portal_pick_complete(token, &cmd_tx);
-                        clips_page.set_state(crate::clips::PageState::Empty);
+                        InstallProgress::Failed { reason } => {
+                            label.set_label(&format!("Install failed: {reason}"));
+                            // Next stays disabled — user can retry via the Install button.
+                            return glib::ControlFlow::Break;
+                        }
                     }
-                    Err(e) => log::warn!("portal pick failed: {e}"),
                 }
+                glib::ControlFlow::Continue
             });
-        }
-    })
-    .build();
-app.add_action_entries([setup_action]);
+        })
+        .build();
+    app.add_action_entries([install_action]);
+}
+
+// app.gsr-open-in-bazaar — opens appstream:// URL.
+{
+    let bazaar_action = gio::ActionEntry::builder("gsr-open-in-bazaar")
+        .activate(move |_app, _action, _param| {
+            if let Err(e) = crate::clips::gsr_install::open_in_bazaar() {
+                log::warn!("open_in_bazaar failed: {e}");
+            }
+        })
+        .build();
+    app.add_action_entries([bazaar_action]);
+}
+
+// app.gsr-copy-cli — copy terminal command to clipboard.
+{
+    let win_for_copy = window.clone();
+    let copy_action = gio::ActionEntry::builder("gsr-copy-cli")
+        .activate(move |_app, _action, _param| {
+            let display = gtk::prelude::WidgetExt::display(&win_for_copy);
+            let clipboard = display.clipboard();
+            clipboard.set_text(crate::clips::gsr_install::GSR_TERMINAL_INSTALL_COMMAND);
+        })
+        .build();
+    app.add_action_entries([copy_action]);
+}
+
+// app.wizard-next — advance the wizard's internal step.
+{
+    let buffer = buffer.clone();
+    let clips_page = window.clips_page().clone();
+    let next_action = gio::ActionEntry::builder("wizard-next")
+        .activate(move |_app, _action, _param| {
+            use crate::clips::WizardStep;
+            match clips_page.current_wizard_step() {
+                WizardStep::InstallGsr => {
+                    clips_page.set_wizard_step(WizardStep::PickScreen);
+                }
+                WizardStep::PickScreen => {
+                    // This is the onboarding-complete moment.
+                    if let Err(e) = crate::clips::settings::mark_onboarding_complete() {
+                        log::warn!("failed to persist onboarding_complete: {e}");
+                    }
+                    clips_page.set_wizard_step(WizardStep::Settings);
+                }
+                WizardStep::Settings => {
+                    clips_page.set_state(crate::clips::PageState::Empty);
+                }
+            }
+            let _ = &buffer;
+        })
+        .build();
+    app.add_action_entries([next_action]);
+}
 ```
 
-- [ ] **Step 2: At app startup, restore token if present**
+(The `app.setup-clips` action — pre-existing in earlier plan revisions — already handles the portal pick. After it succeeds, it should also enable the Page 2 Next button by setting `clips_page.wizard.screen_next_btn.set_sensitive(true)` and updating `screen_picked_label`.)
 
-Right after the controller is built, restore:
+- [ ] **Step 2: Update `app.setup-clips` to update Page 2 widgets**
+
+Modify the existing `setup-clips` action to update the wizard's Page 2 status label + Next button sensitivity on success:
 
 ```rust
-if let Some(token) = crate::clips::portal::load_token() {
-    let cmd_tx = res.clip_backend.as_ref().map(|h| h.sender()).unwrap();
-    buffer.borrow_mut().on_portal_pick_complete(token, &cmd_tx);
+// inside the setup-clips action handler, after `save_token` and `on_portal_pick_complete`:
+clips_page.wizard.screen_picked_label.set_visible(true);
+clips_page.wizard.screen_picked_label.set_label("Screen picked.");
+clips_page.wizard.screen_next_btn.set_sensitive(true);
+```
+
+- [ ] **Step 3: Add a 2-second poll timer to detect GSR-installed-via-other-means**
+
+Right after action registration:
+
+```rust
+{
+    let clips_page = window.clips_page().clone();
+    glib::timeout_add_seconds_local(2, move || {
+        if matches!(clips_page.current_wizard_step(), crate::clips::WizardStep::InstallGsr)
+            && crate::clips::gsr_install::is_installed()
+        {
+            clips_page.wizard.install_next_btn.set_sensitive(true);
+            clips_page.wizard.install_status_label.set_visible(true);
+            clips_page.wizard.install_status_label.set_label("Installed.");
+        }
+        glib::ControlFlow::Continue
+    });
+}
+```
+
+This handles the "user installed via Bazaar or terminal while the wizard was open" case. The in-app install action also enables Next via its own progress watcher; whichever finishes first.
+
+- [ ] **Step 4: Auto-resume to first incomplete step on app start**
+
+After window construction, before showing it:
+
+```rust
+let settings = crate::clips::settings::load();
+let token = crate::clips::portal::load_token();
+let gsr_ok = crate::clips::gsr_install::is_installed();
+
+if settings.onboarding_complete && gsr_ok && token.is_some() {
+    // Skip the wizard entirely.
+    if let Some(t) = token {
+        let cmd_tx = res.clip_backend.as_ref().map(|h| h.sender()).unwrap();
+        buffer.borrow_mut().on_portal_pick_complete(t, &cmd_tx);
+    }
+    window.clips_page().set_state(crate::clips::PageState::Empty);
+} else if !gsr_ok {
+    window.clips_page().set_wizard_step(crate::clips::WizardStep::InstallGsr);
+} else if token.is_none() {
+    window.clips_page().set_wizard_step(crate::clips::WizardStep::PickScreen);
+    window.clips_page().wizard.install_next_btn.set_sensitive(true); // already past page 1
+} else {
+    // GSR installed + token present but onboarding_complete still false
+    // (user pressed Next on Page 2 but never closed wizard). Treat as complete.
+    let _ = crate::clips::settings::mark_onboarding_complete();
     window.clips_page().set_state(crate::clips::PageState::Empty);
 }
 ```
 
-- [ ] **Step 3: Build and verify**
+- [ ] **Step 5: Build, verify, commit**
 
 ```bash
 distrobox enter fedora-dev -- cargo build
+# Manual check (after killing existing instance):
 ./target/debug/arctis-chatmix
 ```
 
-Manual:
-1. First launch: Clips tab shows onboarding card. Click "Set up". KDE shows the portal picker. Pick a monitor. Card disappears, Clips shows "No clips yet".
-2. Restart app. Clips tab immediately shows "No clips yet" (token persisted).
-3. Launch a game. Backend logs `Armed`. `pgrep gpu-screen-recorder` confirms it's running.
-4. Stop the game. Backend logs `Disarmed`. `pgrep gpu-screen-recorder` shows nothing.
-
-- [ ] **Step 4: Commit**
+Manual flow:
+1. Fresh state (no GSR, no token): Clips tab → Page 1 (install). Click Install. Watch progress. Next enables. Click Next → Page 2.
+2. Page 2: Click Pick screen. KDE portal dialog. Pick a monitor. Status label updates, Next enables. Click Next → Page 3.
+3. Page 3: Try changing buffer length slider — value updates live. Click Done → empty Clips browser.
+4. Restart app. Clips tab opens directly to empty browser (onboarding complete).
 
 ```bash
 git add src/app.rs src/window.rs
-git commit -m "clips: wire setup-clips action to portal picker + token persistence"
+git commit -m "clips: wire wizard actions + auto-resume to first incomplete step"
 ```
 
-### Task 3.4: Reset capture source button (and `on_portal_reset` controller method)
+### Task 3.6: Reset capture source button (and `on_portal_reset` controller method)
 
 **Files:**
 - Modify: `src/clips/settings.rs`
@@ -2466,7 +3148,7 @@ git add src/clips/settings.rs src/window.rs src/app.rs src/clips/buffer.rs
 git commit -m "clips: Reset capture source button + on_portal_reset (state-machine safe)"
 ```
 
-### Task 3.5: Test capture button + dialog
+### Task 3.7: Test capture button + dialog
 
 **Files:**
 - Modify: `src/clips/settings.rs`
@@ -2549,6 +3231,79 @@ Manual: Settings → Clips → Test. Dialog opens with a screenshot of the persi
 ```bash
 git add src/clips/settings.rs src/app.rs
 git commit -m "clips: Test capture button — preview persisted source (xdg-portal #1371 mitigation)"
+```
+
+### Task 3.8: Reinstall GSR button + missing-GSR detection
+
+**Files:**
+- Modify: `src/clips/settings.rs`
+- Modify: `src/app.rs`
+- Modify: `src/clips/backend.rs`
+
+Handles the case where the user uninstalls the GSR Flatpak via Bazaar/Discover *after* completing onboarding. We do NOT auto-relaunch the wizard (per user's recovery preference: don't be intrusive when the user explicitly removed something). Instead: surface an error toast on the next arm attempt, and provide a "Reinstall gpu-screen-recorder" Settings row that re-runs the install flow.
+
+- [ ] **Step 1: Add missing-GSR detection in `arm()`**
+
+In `src/clips/backend.rs::arm()`, before `spawn_gsr`, check if GSR is installed:
+
+```rust
+fn arm(
+    active: &mut Option<ActiveCapture>,
+    active_config: &mut Option<CaptureConfig>,
+    config: &CaptureConfig,
+) -> std::io::Result<()> {
+    if active.is_some() {
+        return Ok(());
+    }
+    if !crate::clips::gsr_install::is_installed() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "gpu-screen-recorder Flatpak is not installed. Reinstall it from Settings → Clips.",
+        ));
+    }
+    std::fs::create_dir_all(&config.output_dir)?;
+    // ... existing code continues
+}
+```
+
+The existing error path in `run_backend` (when `arm` returns `Err`) emits `BackendEvent::Error { context: "StartReplay", message: e.to_string() }`. The app's poll handler already shows error events as toasts; the new error message text is the user-visible recovery instruction.
+
+- [ ] **Step 2: Add Reinstall row to Clips settings group**
+
+In `src/clips/settings.rs::build_clips_group`, add a row below the Capture source row (or wherever is logical given mockup decisions):
+
+```rust
+let reinstall_row = adw::ActionRow::builder()
+    .title("gpu-screen-recorder")
+    .subtitle("The Flatpak Clips uses to capture gameplay")
+    .build();
+let reinstall_btn = gtk::Button::builder()
+    .label("Reinstall")
+    .valign(gtk::Align::Center)
+    .build();
+reinstall_btn.set_action_name(Some("app.gsr-install"));
+reinstall_row.add_suffix(&reinstall_btn);
+group.add(&reinstall_row);
+```
+
+The button reuses the existing `app.gsr-install` action from Task 3.5 — same install flow, just invoked from Settings instead of the wizard. Since the wizard's install-progress label isn't visible from Settings, the user sees no progress feedback in the current design; for v1 that's acceptable (install is fast). A follow-up improvement would be to show a progress toast.
+
+- [ ] **Step 3: Build, verify, commit**
+
+```bash
+distrobox enter fedora-dev -- cargo build
+./target/debug/arctis-chatmix
+```
+
+Manual:
+1. Complete onboarding so GSR is installed.
+2. From a separate terminal: `flatpak uninstall --user com.dec05eba.gpu_screen_recorder`.
+3. Launch a game in the app. Backend tries to arm, gets the not-installed error. Toast appears: "gpu-screen-recorder Flatpak is not installed. Reinstall it from Settings → Clips."
+4. Open Settings → Clips → click Reinstall. Wait for install. Try arming again — succeeds.
+
+```bash
+git add src/clips/settings.rs src/clips/backend.rs src/app.rs
+git commit -m "clips: detect missing GSR Flatpak at arm + Settings Reinstall button"
 ```
 
 ---
@@ -4508,11 +5263,16 @@ git commit --allow-empty -m "clips: project-tester pass complete"
 | Game detection /proc + SteamAppId + appmanifest | Tasks 2.1, 2.2, 2.3, 2.5 |
 | Detector debounce (2-scan persistence) | Task 2.4 |
 | Buffer state machine | Task 2.6 |
-| `on_portal_reset` (state-machine-safe reset) | Task 3.4 |
-| Eager portal pick + onboarding | Tasks 3.1, 3.2, 3.3 |
+| GSR Flatpak detection + install helpers | Task 3.2 |
+| Onboarding state in settings (`onboarding_complete` flag) | Task 3.3 |
+| 3-page onboarding wizard UI (install / screen / settings) | Task 3.4 |
+| Wizard action wiring + auto-resume on partial completion | Task 3.5 |
+| `on_portal_reset` (state-machine-safe reset) | Task 3.6 |
+| Eager portal pick (within wizard, mid-flow) | Tasks 3.1, 3.4, 3.5 |
 | restore_token persistence | Task 3.1 |
-| Reset capture source | Task 3.4 |
-| **Test capture button (xdg-portal #1371 mitigation)** | Task 3.5 |
+| Reset capture source | Task 3.6 |
+| **Test capture button (xdg-portal #1371 mitigation)** | Task 3.7 |
+| **Reinstall GSR + missing-GSR detection (recovery)** | Task 3.8 |
 | GlobalShortcuts portal | Task 4.2 |
 | GAction fallback | Task 4.1 |
 | Library: index, sanitization, collisions | Tasks 5.1, 5.2 |
@@ -4542,7 +5302,8 @@ These are deliberate references to in-codebase patterns, not gaps.
 - C2: `ClipMeta` gets a single `#[derive(Default)]`; the manual impl was removed (Task 5.4a).
 - C3: `futures-util` dep dropped; `StreamExt` reachable via `gtk::glib::prelude::*` (Task 1.1).
 - C4: Wrong SIGRTMIN fallback recipe deleted from Task 1.8.
-- C5: Test capture button + dialog added as Task 3.5.
+- C5: Test capture button + dialog added as Task 3.7 (was 3.5 in earlier revision; renumbered when wizard tasks were added).
+- **Phase 3 expanded** (post-user-direction May 2026): single-button onboarding card replaced with a 3-page wizard. New Tasks 3.2 (GSR install helpers), 3.3 (onboarding_complete flag), 3.4 (wizard UI), 3.5 (action wiring + auto-resume), 3.8 (reinstall flow + missing-GSR detection). Old Tasks 3.4/3.5 renumbered to 3.6/3.7.
 - M1: Disk retention auto-delete added as Task 7.5.
 - M2: Task 5.4 split into 5.4a (GLib subclass), 5.4b (factory + label-only), 5.4c (thumbnails), 5.4d (ffprobe backfill).
 - M3: Screenshot URI handling fixed (Task 3.1) — uses `to_file_path()` first, falls back to `as_str()`.

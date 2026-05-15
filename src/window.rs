@@ -3,13 +3,41 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
+use std::sync::mpsc::Sender;
+
 use crate::audio::{persistence, sinks};
 use crate::autostart;
+use crate::clips::settings::ClipSettings;
+use crate::clips::{BufferController, ClipCommand, ClipsPage};
 use crate::eq::model::{Band, EqTarget, SpatialState, NUM_BANDS};
 use crate::hid::protocol::NoiseMode;
 use crate::mixer::MixerWidgets;
 
-const PLACEHOLDER: &str = "—";
+const PLACEHOLDER: &str = "-";
+
+/// Hooks the clips Settings page needs to live-react to user changes.
+///
+/// `app.rs` builds the partial form (everything but `clips_page`, which
+/// it doesn't have access to) and passes it to `ChatMixWindow::new`,
+/// which attaches its own `clips_page` and produces the full context
+/// before forwarding to `build_settings_page`. Splitting the type
+/// avoids leaking the page-construction order between the two modules.
+pub struct ClipsSettingsContextPartial {
+    pub clip_settings: Rc<RefCell<ClipSettings>>,
+    pub buffer: Rc<RefCell<BufferController>>,
+    pub cmd_tx: Sender<ClipCommand>,
+    pub headset_sink_monitor: String,
+}
+
+/// Full settings hook bundle, with the runtime browser page attached.
+/// Consumed by `build_settings_page` and `build_clips_group`.
+pub struct ClipsSettingsContext {
+    pub clip_settings: Rc<RefCell<ClipSettings>>,
+    pub buffer: Rc<RefCell<BufferController>>,
+    pub cmd_tx: Sender<ClipCommand>,
+    pub headset_sink_monitor: String,
+    pub clips_page: Rc<ClipsPage>,
+}
 
 pub struct ChatMixWindow {
     pub window: adw::ApplicationWindow,
@@ -24,7 +52,22 @@ struct Widgets {
     spare_battery_label: gtk::Label,
     spare_battery_icon: gtk::Image,
     balance_scale: gtk::Scale,
+    /// Cloned reference to the indicator inside `clips_section`. Kept here
+    /// so `set_clips_state` can keep its existing signature; the underlying
+    /// GObject is shared, so mutations from either path are reflected in
+    /// the visible widget.
+    clips_indicator: crate::clips::StatusIndicator,
+    /// Owned by the dashboard row-1 section. `None` only in tests / partial
+    /// builds; in normal operation always `Some` after `build_dashboard_page`.
+    clips_section: Option<ClipsSectionWidgets>,
     mixer: Option<MixerWidgets>,
+    clips: Option<Rc<crate::clips::ClipsPage>>,
+    /// Sidebar Clips toggle button. Held so `show_clips_tab()` can flip it
+    /// active, which triggers the bound `connect_toggled` handler that
+    /// switches the content stack — the same path the user takes when
+    /// clicking the sidebar themselves. Set during `ChatMixWindow::new`
+    /// after the sidebar is built.
+    clips_sidebar_btn: Option<gtk::ToggleButton>,
 }
 
 fn battery_icon(percent: u8) -> (&'static str, bool) {
@@ -45,6 +88,7 @@ impl ChatMixWindow {
         on_reroute: Option<Rc<dyn Fn(&str, &str)>>,
         on_mic_reroute: Option<Rc<dyn Fn(&str)>>,
         headset_sink: Option<String>,
+        clips_settings_ctx_partial: Option<ClipsSettingsContextPartial>,
     ) -> Self {
         let window = adw::ApplicationWindow::builder()
             .application(app)
@@ -81,24 +125,44 @@ impl ChatMixWindow {
         );
         widgets.mixer = mixer_widgets;
         stack.add_named(&eq_page, Some("eq"));
-        stack.add_named(
-            &build_placeholder_page("Clips", "lucide-clapperboard-symbolic", "Coming soon"),
-            Some("clips"),
-        );
+        let clips_page = Rc::new(crate::clips::build_clips_page());
+        stack.add_named(clips_page.widget(), Some("clips"));
+        widgets.clips = Some(clips_page.clone());
         stack.add_named(
             &build_placeholder_page("Engine", "lucide-sliders-horizontal-symbolic", "Coming soon"),
             Some("engine"),
         );
-        stack.add_named(&build_settings_page(app), Some("settings"));
+        // Promote the partial context to the full context by attaching the
+        // runtime browser page we just built. Building inside ChatMixWindow
+        // (rather than in app.rs) keeps the page-construction order
+        // encapsulated: app.rs never touches `clips_page` directly.
+        let clips_settings_ctx = clips_settings_ctx_partial.map(|p| ClipsSettingsContext {
+            clip_settings: p.clip_settings,
+            buffer: p.buffer,
+            cmd_tx: p.cmd_tx,
+            headset_sink_monitor: p.headset_sink_monitor,
+            clips_page: clips_page.clone(),
+        });
+        stack.add_named(&build_settings_page(app, clips_settings_ctx), Some("settings"));
 
         content_area.append(&stack);
 
-        // Build sidebar and wire to stack
+        // Build sidebar and wire to stack. The clips toggle button is held
+        // on `Widgets` so `show_clips_tab()` (called from the `app.show-clip`
+        // GAction handler in app.rs) can flip it active programmatically.
         let sidebar = build_sidebar(&stack);
-        root.append(&sidebar);
+        widgets.clips_sidebar_btn = Some(sidebar.clips_btn.clone());
+        root.append(&sidebar.container);
         root.append(&content_area);
 
-        window.set_content(Some(&root));
+        // Wrap the entire root in an AdwToastOverlay so saved-clip toasts
+        // (Phase 7 Task 7.1) can be presented from `clips::notifications`.
+        // Structure becomes: Window → ToastOverlay → root: Box → [sidebar | content].
+        // `find_toast_overlay` in `clips::notifications` walks the descendant
+        // chain to locate the overlay at notification time.
+        let toast_overlay = adw::ToastOverlay::new();
+        toast_overlay.set_child(Some(&root));
+        window.set_content(Some(&toast_overlay));
 
         let css = gtk::CssProvider::new();
         css.load_from_string(
@@ -135,7 +199,16 @@ impl ChatMixWindow {
              .mixer-ch-aux scale trough highlight    { background-color: rgba(242,140,64,0.85); } \
              .mixer-ch-mic scale trough highlight    { background-color: rgba(179,102,230,0.85); } \
              .mixer-device-dropdown { font-size: 75%; } \
-             .mixer-device-dropdown > button { min-height: 0; padding-top: 4px; padding-bottom: 4px; }"
+             .mixer-device-dropdown > button { min-height: 0; padding-top: 4px; padding-bottom: 4px; } \
+             .clip-indicator { padding: 4px 10px; border-radius: 8px; \
+               background-color: alpha(currentColor, 0.08); } \
+             .clip-indicator label { font-size: 90%; } \
+             .clip-indicator .dot-armed { color: rgb(77,204,179); } \
+             .clip-indicator .dot-saving { color: rgb(242,205,64); } \
+             .clip-indicator .dot-error  { color: rgb(230,77,77); } \
+             .clip-indicator .dot-setup  { color: alpha(currentColor, 0.5); } \
+             .clip-indicator .dot-paused { color: rgb(160,160,160); } \
+             .clips-row-card { padding: 14px 18px; }"
         );
         gtk::style_context_add_provider_for_display(
             &gtk::prelude::WidgetExt::display(&window),
@@ -190,6 +263,70 @@ impl ChatMixWindow {
         }
     }
 
+    /// Returns the `ClipsPage` for this window, panicking if the window was
+    /// constructed without one (which never happens in normal use — the field
+    /// is always populated during `ChatMixWindow::new`).
+    pub fn clips_page(&self) -> Rc<crate::clips::ClipsPage> {
+        self.inner
+            .borrow()
+            .clips
+            .clone()
+            .expect("clips page is always set during window construction")
+    }
+
+    /// Switch the content stack to the Clips tab.
+    ///
+    /// Called from the `app.show-clip` GAction handler when the user clicks
+    /// "Show" on a clip-saved toast/notification. Activating the sidebar
+    /// toggle button triggers the same `connect_toggled` handler the user's
+    /// own click goes through, so the stack switches and the radio-group
+    /// state is consistent with the visible page.
+    pub fn show_clips_tab(&self) {
+        if let Some(btn) = self.inner.borrow().clips_sidebar_btn.as_ref() {
+            btn.set_active(true);
+        }
+    }
+
+    /// Update the dashboard's clip-status badge. Driven from the backend
+    /// event poll in `app.rs` after each `BufferController::on_backend_event`
+    /// + after the auto-resume block at startup so the badge reflects the
+    /// initial buffer state without flicker.
+    ///
+    /// Also refreshes the row-1 Clips section's Pause button so its label /
+    /// sensitivity tracks state transitions (Idle / Armed → button enabled,
+    /// Saving / Error → disabled). `user_paused` is derived from the state
+    /// because `Paused` is the only state where the buffer's `user_paused`
+    /// flag is true, and this method's callers don't have the buffer ref
+    /// handy.
+    pub fn set_clips_state(
+        &self,
+        state: crate::clips::BufferState,
+        game: Option<&str>,
+    ) {
+        let w = self.inner.borrow();
+        w.clips_indicator.set_state(state, game);
+        if let Some(section) = &w.clips_section {
+            section.refresh_state(state, matches!(state, crate::clips::BufferState::Paused));
+        }
+    }
+
+    /// Refresh the dashboard's row-1 Clips section: pause-button label /
+    /// sensitivity, duration label, hotkey hint. Indicator state is updated
+    /// separately via `set_clips_state` (no game name needed here).
+    /// Called by the `app.pause-recording-toggle` GAction handler and any
+    /// other site that wants the section's controls to reflect a new
+    /// buffer state / settings snapshot.
+    pub fn refresh_clips_section(
+        &self,
+        state: crate::clips::BufferState,
+        paused: bool,
+        settings: &crate::clips::settings::ClipSettings,
+    ) {
+        if let Some(section) = &self.inner.borrow().clips_section {
+            section.refresh(state, paused, settings);
+        }
+    }
+
     pub fn set_battery(&self, headset: u8, spare: u8) {
         let w = self.inner.borrow();
 
@@ -217,7 +354,12 @@ fn apply_critical_class(image: &gtk::Image, critical: bool) {
 // Sidebar rail
 // ---------------------------------------------------------------------------
 
-fn build_sidebar(stack: &gtk::Stack) -> gtk::Widget {
+struct SidebarResult {
+    container: gtk::Widget,
+    clips_btn: gtk::ToggleButton,
+}
+
+fn build_sidebar(stack: &gtk::Stack) -> SidebarResult {
     let rail = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -235,8 +377,7 @@ fn build_sidebar(stack: &gtk::Stack) -> gtk::Widget {
     let eq_btn = sidebar_button("lucide-audio-lines-symbolic", "Equalizer");
     eq_btn.set_group(Some(&home_btn));
 
-    let clips_btn = sidebar_button("lucide-clapperboard-symbolic", "Clips (coming soon)");
-    clips_btn.set_sensitive(false);
+    let clips_btn = sidebar_button("lucide-clapperboard-symbolic", "Clips");
     clips_btn.set_group(Some(&home_btn));
 
     let engine_btn = sidebar_button("lucide-sliders-horizontal-symbolic", "Engine (coming soon)");
@@ -270,7 +411,10 @@ fn build_sidebar(stack: &gtk::Stack) -> gtk::Widget {
     container.append(&rail);
     container.append(&gtk::Separator::new(gtk::Orientation::Vertical));
 
-    container.upcast()
+    SidebarResult {
+        container: container.upcast(),
+        clips_btn,
+    }
 }
 
 fn sidebar_button(icon_name: &str, tooltip: &str) -> gtk::ToggleButton {
@@ -324,7 +468,7 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
     let (status_card, status_result) = build_status_card();
     let (device_card, dev_widgets) = build_device_card();
 
-    // SizeGroup forces all rows to match the tallest (Device card's ActionRows)
+    // SizeGroup forces all rows to match the tallest (Device card's ActionRows).
     let row_height = gtk::SizeGroup::new(gtk::SizeGroupMode::Vertical);
     row_height.add_widget(&dev_widgets.0);
     row_height.add_widget(&dev_widgets.1);
@@ -338,6 +482,12 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
 
     grid.attach(&status_card, 0, 0, 1, 1);
     grid.attach(&device_card, 1, 0, 1, 1);
+
+    // Row 1: full-width Clips section. Holds the indicator (cloned from the
+    // section widgets so `set_clips_state` continues to update one shared
+    // dot/label) plus the Save/Pause buttons + duration/hotkey hints.
+    let (clips_section, clips_section_widgets) = build_clips_section();
+    grid.attach(&clips_section, 0, 1, 2, 1);
 
     let footer = gtk::Label::builder()
         .label("Assign apps to SteelSeries sinks in your system sound settings. Assignments are remembered between sessions.")
@@ -359,6 +509,9 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
     clamp.set_child(Some(&content));
     scroll.set_child(Some(&clamp));
 
+    // `StatusIndicator` is Clone (all fields are GObject refs) so the
+    // dashboard's set_clips_state path and the section's own indicator
+    // refer to the same widget tree under the hood.
     let widgets = Widgets {
         device_row: dev_widgets.0,
         noise_row: dev_widgets.1,
@@ -367,10 +520,167 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
         spare_battery_label: status_result.spare_battery_label,
         spare_battery_icon: status_result.spare_battery_icon,
         balance_scale: status_result.balance_scale,
+        clips_indicator: clips_section_widgets.indicator.clone(),
+        clips_section: Some(clips_section_widgets),
         mixer: None,
+        clips: None,
+        clips_sidebar_btn: None,
     };
 
     (scroll.upcast(), widgets)
+}
+
+// -- Clips section (row 1, full-width) --
+//
+// Sits on its own row beneath the Status / Device cards. Shows the live
+// indicator at the top and a compact action row underneath: Save / Pause
+// buttons on the left, recording-duration + hotkey-hint labels on the right.
+// Owned by `Widgets.clips_section` so the action handler in app.rs and the
+// backend-event poll can both refresh it in lockstep with state changes.
+
+pub struct ClipsSectionWidgets {
+    pub indicator: crate::clips::StatusIndicator,
+    pub save_button: gtk::Button,
+    pub pause_button: gtk::Button,
+    pub duration_label: gtk::Label,
+    pub hotkey_label: gtk::Label,
+}
+
+impl ClipsSectionWidgets {
+    /// Refresh the pause button (label + sensitivity), the duration hint,
+    /// and the hotkey hint. The indicator itself updates via the separate
+    /// `set_clips_state` path so the action handler doesn't need a game
+    /// name to call refresh.
+    pub fn refresh(
+        &self,
+        buffer_state: crate::clips::buffer::BufferState,
+        user_paused: bool,
+        settings: &crate::clips::settings::ClipSettings,
+    ) {
+        self.refresh_state(buffer_state, user_paused);
+
+        // Duration label — round to the nicest unit at the breakpoints.
+        let secs = settings.buffer_length;
+        let text = if secs < 60 {
+            format!("Recording last {secs} seconds")
+        } else if secs < 3600 {
+            format!("Recording last {} minutes", (secs as f64 / 60.0).round() as u32)
+        } else {
+            format!(
+                "Recording last {} hour{}",
+                secs / 3600,
+                if secs >= 7200 { "s" } else { "" }
+            )
+        };
+        self.duration_label.set_label(&text);
+
+        // Hotkey label — falls back to the suggested default if the portal
+        // hasn't filled in the display string yet.
+        let hk = if settings.save_hotkey_display.is_empty() {
+            "Hotkey: ALT+S".to_string()
+        } else {
+            format!("Hotkey: {}", settings.save_hotkey_display)
+        };
+        self.hotkey_label.set_label(&hk);
+    }
+
+    /// Refresh just the pause button (label + sensitivity), without
+    /// touching duration / hotkey labels (those don't change on backend
+    /// state transitions and require a settings ref). Called from
+    /// `ChatMixWindow::set_clips_state` so the button tracks state changes
+    /// driven by the backend-event poll without needing a settings cell on
+    /// that path.
+    pub fn refresh_state(
+        &self,
+        buffer_state: crate::clips::buffer::BufferState,
+        user_paused: bool,
+    ) {
+        use crate::clips::buffer::BufferState as S;
+        let (base_label, sensitive) = match buffer_state {
+            S::Uninitialized => ("Pause Recording", false),
+            S::Idle | S::Arming | S::Armed => ("Pause Recording", true),
+            S::Saving => ("Pause Recording", false),
+            S::ErrorState => ("Pause Recording", false),
+            S::Paused => ("Resume Recording", true),
+        };
+        // `user_paused` takes precedence on the label: even if the state
+        // briefly says Idle (after a Pause → Resume race), the button copy
+        // tracks intent.
+        let label = if user_paused { "Resume Recording" } else { base_label };
+        self.pause_button.set_label(label);
+        self.pause_button.set_sensitive(sensitive);
+    }
+}
+
+fn build_clips_section() -> (adw::PreferencesGroup, ClipsSectionWidgets) {
+    let group = adw::PreferencesGroup::builder().title("Clips").build();
+
+    // Row 1: status indicator (re-used widget — clones share the underlying
+    // GObject so `set_state` from elsewhere updates the same dot/label).
+    let indicator = crate::clips::build_status_indicator();
+    let indicator_holder = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .halign(gtk::Align::Center)
+        .margin_top(8)
+        .margin_bottom(4)
+        .build();
+    indicator_holder.append(&indicator.root);
+    let row_indicator = gtk::ListBoxRow::builder()
+        .child(&indicator_holder)
+        .activatable(false)
+        .selectable(false)
+        .build();
+    group.add(&row_indicator);
+
+    // Row 2: action row — Save / Pause buttons on the left, duration +
+    // hotkey hints on the right.
+    let action_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_start(15)
+        .margin_end(15)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+
+    let save_button = gtk::Button::builder().label("Save Clip Now").build();
+    save_button.add_css_class("suggested-action");
+    save_button.set_action_name(Some("app.save-clip"));
+    action_box.append(&save_button);
+
+    let pause_button = gtk::Button::builder().label("Pause Recording").build();
+    pause_button.set_action_name(Some("app.pause-recording-toggle"));
+    pause_button.set_tooltip_text(Some(
+        "Pause recording. The last N seconds of recording will be lost.",
+    ));
+    action_box.append(&pause_button);
+
+    let spacer = gtk::Box::builder().hexpand(true).build();
+    action_box.append(&spacer);
+
+    let duration_label = gtk::Label::builder().label("Recording last 60 seconds").build();
+    duration_label.add_css_class("dim-label");
+    action_box.append(&duration_label);
+
+    let hotkey_label = gtk::Label::builder().label("Hotkey: ALT+S").build();
+    hotkey_label.add_css_class("dim-label");
+    action_box.append(&hotkey_label);
+
+    let row_action = gtk::ListBoxRow::builder()
+        .child(&action_box)
+        .activatable(false)
+        .selectable(false)
+        .build();
+    group.add(&row_action);
+
+    let widgets = ClipsSectionWidgets {
+        indicator,
+        save_button,
+        pause_button,
+        duration_label,
+        hotkey_label,
+    };
+    (group, widgets)
 }
 
 // -- Status card (battery + chatmix) --
@@ -495,7 +805,10 @@ fn build_device_card() -> (adw::PreferencesGroup, (adw::ActionRow, adw::ActionRo
 // Settings page
 // ---------------------------------------------------------------------------
 
-fn build_settings_page(app: &adw::Application) -> gtk::Widget {
+fn build_settings_page(
+    app: &adw::Application,
+    clips_settings_ctx: Option<ClipsSettingsContext>,
+) -> gtk::Widget {
     let page = adw::PreferencesPage::new();
 
     // General
@@ -518,6 +831,20 @@ fn build_settings_page(app: &adw::Application) -> gtk::Widget {
     });
     general_group.add(&autostart_row);
     page.add(&general_group);
+
+    // Clips — only buildable if we have the runtime hooks. The pipeline
+    // can fail to initialize on first launch (no headset, missing
+    // permissions, etc.); in that case we skip the Clips section rather
+    // than show settings the user can't actually act on.
+    if let Some(ctx) = clips_settings_ctx {
+        page.add(&crate::clips::settings::build_clips_group(
+            ctx.clip_settings,
+            ctx.buffer,
+            ctx.cmd_tx,
+            ctx.headset_sink_monitor,
+            ctx.clips_page,
+        ));
+    }
 
     // Data
     let data_group = adw::PreferencesGroup::builder().title("Data").build();

@@ -158,9 +158,20 @@ fn parse_volume_percent(output: &str) -> Result<u32, String> {
     Err("Could not parse volume percentage from pactl output".to_string())
 }
 
+/// Per-physical-source record: node_name, description, plus the optional
+/// stable-id fields `device.product.name`, `device.bus_path`,
+/// `api.bluez5.address` (so the mic-hotplug picker can re-attach to the
+/// same physical device after a USB-port change or a Bluetooth rename).
+pub type PhysicalSourceRecord = (
+    String,         // node_name
+    String,         // description
+    Option<String>, // device.product.name
+    Option<String>, // device.bus_path
+    Option<String>, // api.bluez5.address
+);
+
 /// List physical output sinks (excludes our virtual sinks and EQ filter-chain nodes).
-/// Returns `(node_name, description)` pairs.
-pub fn list_physical_sinks() -> Vec<(String, String)> {
+pub fn list_physical_sinks() -> Vec<PhysicalSourceRecord> {
     parse_device_list("sinks", |name| {
         ALL_SINKS.iter().any(|(n, _, _)| *n == name)
             || ALL_SOURCES.iter().any(|(n, _, _)| *n == name)
@@ -169,8 +180,7 @@ pub fn list_physical_sinks() -> Vec<(String, String)> {
 }
 
 /// List physical input sources (excludes our virtual source, monitors, and EQ nodes).
-/// Returns `(node_name, description)` pairs.
-pub fn list_physical_sources() -> Vec<(String, String)> {
+pub fn list_physical_sources() -> Vec<PhysicalSourceRecord> {
     parse_device_list("sources", |name| {
         name == MIC_SOURCE_NAME
             || name.ends_with(".monitor")
@@ -179,52 +189,121 @@ pub fn list_physical_sources() -> Vec<(String, String)> {
     })
 }
 
-/// Parse `pactl list <kind>` output to extract (Name, Description) pairs,
-/// filtering out entries where `exclude(name)` returns true.
-fn parse_device_list<F: Fn(&str) -> bool>(kind: &str, exclude: F) -> Vec<(String, String)> {
-    let Ok(output) = Command::new("pactl")
-        .args(["list", kind])
-        .output()
-    else {
-        return Vec::new();
+/// Parse `pactl list <kind>` output. Public to the module so tests can drive
+/// it with a literal string instead of an actual `pactl` invocation.
+fn parse_device_list(kind: &str, exclude: impl Fn(&str) -> bool) -> Vec<PhysicalSourceRecord> {
+    let Ok(output) = Command::new("pactl").args(["list", kind]).output() else {
+        return vec![];
     };
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_device_list_inner(&text, exclude)
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut results = Vec::new();
-    let mut current_name: Option<String> = None;
-    let mut current_desc: Option<String> = None;
+#[cfg(test)]
+pub(crate) fn parse_device_list_for_test(text: &str) -> Vec<PhysicalSourceRecord> {
+    parse_device_list_inner(text, |_| false)
+}
 
-    for line in stdout.lines() {
-        let trimmed = line.trim();
+fn parse_device_list_inner(
+    text: &str,
+    exclude: impl Fn(&str) -> bool,
+) -> Vec<PhysicalSourceRecord> {
+    let mut out = Vec::new();
+    let mut name: Option<String> = None;
+    let mut description: Option<String> = None;
+    let mut product: Option<String> = None;
+    let mut bus_path: Option<String> = None;
+    let mut bluez_addr: Option<String> = None;
+    let mut in_properties = false;
 
-        // New block starts with "Sink #" or "Source #"
-        if trimmed.starts_with("Sink #") || trimmed.starts_with("Source #") {
-            // Flush previous entry
-            if let (Some(name), Some(desc)) = (current_name.take(), current_desc.take()) {
-                if !exclude(&name) {
-                    results.push((name, desc));
-                }
+    fn flush(
+        out: &mut Vec<PhysicalSourceRecord>,
+        exclude: &impl Fn(&str) -> bool,
+        name: &mut Option<String>,
+        desc: &mut Option<String>,
+        product: &mut Option<String>,
+        bus: &mut Option<String>,
+        bt: &mut Option<String>,
+    ) {
+        if let Some(n) = name.take() {
+            if !exclude(&n) {
+                out.push((
+                    n,
+                    desc.take().unwrap_or_default(),
+                    product.take(),
+                    bus.take(),
+                    bt.take(),
+                ));
             }
-            current_name = None;
-            current_desc = None;
+        }
+        desc.take();
+        product.take();
+        bus.take();
+        bt.take();
+    }
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let is_indented = line != trimmed && !trimmed.is_empty();
+
+        if line.starts_with("Source #") || line.starts_with("Sink #") {
+            flush(
+                &mut out,
+                &exclude,
+                &mut name,
+                &mut description,
+                &mut product,
+                &mut bus_path,
+                &mut bluez_addr,
+            );
+            in_properties = false;
+            continue;
+        }
+        if trimmed.is_empty() {
+            in_properties = false;
             continue;
         }
 
-        if let Some(val) = trimmed.strip_prefix("Name: ") {
-            current_name = Some(val.to_string());
-        } else if let Some(val) = trimmed.strip_prefix("Description: ") {
-            current_desc = Some(val.to_string());
+        if let Some(rest) = trimmed.strip_prefix("Name: ") {
+            name = Some(rest.to_string());
+            in_properties = false;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Description: ") {
+            description = Some(rest.to_string());
+            in_properties = false;
+            continue;
+        }
+        if trimmed == "Properties:" {
+            in_properties = true;
+            continue;
+        }
+
+        if in_properties && is_indented {
+            if let Some((key, value)) = trimmed.split_once(" = ") {
+                let v = value.trim_matches('"').to_string();
+                match key {
+                    "device.product.name" => product = Some(v),
+                    "device.bus_path" => bus_path = Some(v),
+                    "api.bluez5.address" => bluez_addr = Some(v),
+                    _ => {}
+                }
+            }
+        } else if !is_indented {
+            in_properties = false;
         }
     }
-
-    // Flush last entry
-    if let (Some(name), Some(desc)) = (current_name, current_desc) {
-        if !exclude(&name) {
-            results.push((name, desc));
-        }
-    }
-
-    results
+    // Flush trailing record
+    flush(
+        &mut out,
+        &exclude,
+        &mut name,
+        &mut description,
+        &mut product,
+        &mut bus_path,
+        &mut bluez_addr,
+    );
+    out
 }
 
 fn create_pw_node(
@@ -268,5 +347,43 @@ fn cleanup_orphaned() {
     }
     for (old_name, _) in LEGACY_SINK_MIGRATIONS {
         destroy_pw_node(old_name);
+    }
+}
+
+#[cfg(test)]
+mod parse_device_list_tests {
+    use super::*;
+
+    const SAMPLE_OUTPUT: &str = "\
+Source #45
+\tState: SUSPENDED
+\tName: alsa_input.usb-FOO-00
+\tDescription: Foo USB Mic
+\tProperties:
+\t\tdevice.product.name = \"Foo Mic Pro\"
+\t\tdevice.bus_path = \"usb-0000:00:14.0-3\"
+Source #46
+\tState: SUSPENDED
+\tName: bluez_input.AA:BB:CC:DD:EE:FF.headset-head-unit
+\tDescription: Sony WH-1000XM4
+\tProperties:
+\t\tapi.bluez5.address = \"AA:BB:CC:DD:EE:FF\"
+\t\tdevice.product.name = \"WH-1000XM4\"
+";
+
+    #[test]
+    fn parses_properties_block_for_two_records() {
+        let out = parse_device_list_for_test(SAMPLE_OUTPUT);
+        assert_eq!(out.len(), 2);
+        let (name, _desc, prod, bus, bt) = &out[0];
+        assert_eq!(name, "alsa_input.usb-FOO-00");
+        assert_eq!(prod.as_deref(), Some("Foo Mic Pro"));
+        assert_eq!(bus.as_deref(), Some("usb-0000:00:14.0-3"));
+        assert!(bt.is_none());
+        let (name, _, prod, bus, bt) = &out[1];
+        assert_eq!(name, "bluez_input.AA:BB:CC:DD:EE:FF.headset-head-unit");
+        assert_eq!(prod.as_deref(), Some("WH-1000XM4"));
+        assert!(bus.is_none());
+        assert_eq!(bt.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
     }
 }
