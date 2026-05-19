@@ -197,12 +197,13 @@ pub fn build_clips_page() -> ClipsPage {
         .hexpand(true)
         .build();
 
-    // The on_remix closure: invoked from a per-card kebab's `clip.remix`
-    // action with the clicked clip's full path. Builds a fresh RemixPanel
-    // for that clip and switches the page Stack to "remix". Captures
-    // clones of stack / state / model / storage_dir / remix_container so
-    // it doesn't hold a ClipsPage ref (which doesn't exist yet at this
-    // point in construction).
+    // The on_remix closure: invoked from a card's click-to-edit gesture
+    // (attached in `bind_clip_card` to the inner content Box) with the
+    // clicked clip's full path. Builds a fresh RemixPanel for that clip
+    // and switches the page Stack to "remix". Captures clones of stack /
+    // state / model / storage_dir / remix_container so it doesn't hold a
+    // ClipsPage ref (which doesn't exist yet at this point in
+    // construction).
     let on_remix: Rc<dyn Fn(PathBuf)> = {
         let stack_for_remix = stack.clone();
         let state_for_remix = state.clone();
@@ -644,7 +645,7 @@ fn empty_page() -> gtk::Widget {
     let page = adw::StatusPage::builder()
         .icon_name("lucide-clapperboard-symbolic")
         .title("No clips yet")
-        .description("Press the save hotkey while gaming to capture the last 60 seconds.")
+        .description("Press the save hotkey to capture the last 60 seconds of screen recording.")
         .build();
     page.upcast()
 }
@@ -657,9 +658,16 @@ fn empty_page() -> gtk::Widget {
 /// The `card` field is the outer `gtk::Overlay` — we hold it explicitly
 /// because `connect_bind` needs to call `insert_action_group("clip", …)`
 /// on it to wire the kebab menu's per-card actions to *this row's* clip.
+///
+/// `content` is the inner vertical box (thumb + title). We attach the
+/// click-to-edit `GestureClick` to this widget rather than `card` so the
+/// kebab MenuButton (which sits on the overlay layer) keeps its own
+/// click swallowing — clicking the kebab opens the menu without also
+/// triggering the editor.
 #[derive(Clone)]
 struct CardWidgets {
     card: gtk::Overlay,
+    content: gtk::Box,
     image: gtk::Picture,
     title: gtk::Label,
     kebab: gtk::MenuButton,
@@ -697,8 +705,11 @@ fn build_clip_card() -> (gtk::Overlay, CardWidgets) {
     // prefix — connect_bind will install a SimpleActionGroup under that
     // prefix on this overlay, capturing the bound clip's filename and
     // storage_dir into each action's callback.
+    //
+    // Note: there is no "Remix" entry. The whole card is now click-to-
+    // edit (the editor IS the remix panel) — see `bind_clip_card`'s
+    // GestureClick on `content`.
     let menu = gio::Menu::new();
-    menu.append(Some("Remix…"), Some("clip.remix"));
     menu.append(Some("Rename…"), Some("clip.rename"));
     menu.append(Some("Open in Folder"), Some("clip.open-folder"));
     // Section break so Delete sits visually separate from the safe
@@ -722,7 +733,7 @@ fn build_clip_card() -> (gtk::Overlay, CardWidgets) {
     kebab.set_menu_model(Some(&menu));
     card.add_overlay(&kebab);
 
-    (card.clone(), CardWidgets { card, image, title, kebab })
+    (card.clone(), CardWidgets { card, content, image, title, kebab })
 }
 
 fn bind_clip_card(
@@ -734,12 +745,52 @@ fn bind_clip_card(
 ) {
     let meta = clip.meta();
     let clip_storage_dir = clip.storage_dir();
-    let game = if meta.game_name.is_empty() {
-        "Untitled"
-    } else {
-        meta.game_name.as_str()
-    };
-    widgets.title.set_label(game);
+    // Card title: use the filename stem (no extension). With game
+    // detection removed, the filename is the only thing the user has
+    // chosen — falling back to "Untitled" if the stem is unexpectedly
+    // empty (e.g., a file literally named ".mp4").
+    let title = std::path::Path::new(&meta.filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Untitled");
+    widgets.title.set_label(title);
+
+    // Click-on-card → open editor (remix panel). We attach to the inner
+    // `content` Box, NOT the outer `card` Overlay: the kebab MenuButton
+    // sits on the Overlay layer and swallows its own clicks, so attaching
+    // here keeps kebab activations from also triggering the editor.
+    //
+    // The gesture is re-wired on every bind because ListView recycles
+    // CardWidgets across model items — without removing the previous
+    // gesture, recycled widgets would fire `on_remix` for *every* clip
+    // they were ever bound to. `observe_controllers()` returns a live
+    // `gio::ListModel`; we snapshot via `into_iter()` so removing during
+    // iteration is safe.
+    let existing: Vec<_> = widgets
+        .content
+        .observe_controllers()
+        .iter::<glib::Object>()
+        .flatten()
+        .filter_map(|c| c.downcast::<gtk::GestureClick>().ok())
+        .collect();
+    for c in existing {
+        widgets.content.remove_controller(&c);
+    }
+    let gesture = gtk::GestureClick::builder().button(1).build();
+    {
+        let on_remix = on_remix.clone();
+        let storage_dir = storage_dir.clone();
+        let filename = meta.filename.clone();
+        gesture.connect_released(move |g, _n_press, _x, _y| {
+            // released_event fires after the user lifts the mouse; ignore
+            // synthetic events from other widgets bubbling up.
+            g.set_state(gtk::EventSequenceState::Claimed);
+            let dir = storage_dir.borrow().clone();
+            on_remix(dir.join(&filename));
+        });
+    }
+    widgets.content.add_controller(gesture);
 
     // Wire the per-card actions for the kebab menu. Each invocation
     // creates a fresh SimpleActionGroup with closures that capture *this*
@@ -753,7 +804,6 @@ fn bind_clip_card(
         meta.filename.clone(),
         storage_dir.clone(),
         model.clone(),
-        on_remix.clone(),
     );
     widgets.card.insert_action_group("clip", Some(&actions));
 
@@ -784,33 +834,19 @@ fn bind_clip_card(
 
 /// Build a fresh per-card action group for the kebab menu. Captures the
 /// bound clip's filename + a clone of the page-level `Rc<RefCell<PathBuf>>`
-/// for the storage_dir + model so that Rename / Delete / Open-in-Folder /
-/// Remix can mutate disk state or switch to the remix panel without
-/// walking widget trees or holding ClipsPage refs. The Rc means a live
-/// `set_storage_dir()` change is seen by any subsequent kebab activation.
+/// for the storage_dir + model so that Rename / Delete / Open-in-Folder
+/// can mutate disk state without walking widget trees or holding
+/// ClipsPage refs. The Rc means a live `set_storage_dir()` change is
+/// seen by any subsequent kebab activation. The Remix entry was removed
+/// when the click-to-edit gesture landed on `CardWidgets.content` —
+/// see `bind_clip_card`.
 fn build_clip_actions(
     widgets: &CardWidgets,
     filename: String,
     storage_dir: Rc<RefCell<PathBuf>>,
     model: gio::ListStore,
-    on_remix: Rc<dyn Fn(PathBuf)>,
 ) -> gio::SimpleActionGroup {
     let group = gio::SimpleActionGroup::new();
-
-    // Remix — switches the page Stack to the remix panel for this clip.
-    // The on_remix callback (provided by `build_clips_page`) takes the
-    // full clip path and is responsible for rebuilding the panel and
-    // flipping the page state.
-    {
-        let remix = gio::SimpleAction::new("remix", None);
-        let storage_dir = storage_dir.clone();
-        let filename = filename.clone();
-        remix.connect_activate(move |_, _| {
-            let dir = storage_dir.borrow().clone();
-            on_remix(dir.join(&filename));
-        });
-        group.add_action(&remix);
-    }
 
     // Rename
     {
@@ -882,11 +918,12 @@ fn parent_window_of(widget: &impl IsA<gtk::Widget>) -> Option<gtk::Window> {
 }
 
 /// Replace `filename` in the on-disk index with `new_filename`, preserving
-/// the metadata (game_name, duration_ms, bitrate, resolution). Without
+/// the metadata (duration_ms, bitrate, resolution, created_unix). Without
 /// this, `library::reconcile()` would drop the renamed file's index entry
 /// (file gone) and re-add a default-meta entry for the new name, losing
-/// game name / duration. Best-effort — index errors are logged and
-/// swallowed since the .mp4 itself has already been renamed at this point.
+/// the ffprobe-backfilled duration. Best-effort — index errors are logged
+/// and swallowed since the .mp4 itself has already been renamed at this
+/// point.
 fn rename_in_index(old: &str, new: &str) {
     let mut idx = crate::clips::library::load_index();
     let mut changed = false;

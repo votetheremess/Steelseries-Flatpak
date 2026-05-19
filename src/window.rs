@@ -52,11 +52,6 @@ struct Widgets {
     spare_battery_label: gtk::Label,
     spare_battery_icon: gtk::Image,
     balance_scale: gtk::Scale,
-    /// Cloned reference to the indicator inside `clips_section`. Kept here
-    /// so `set_clips_state` can keep its existing signature; the underlying
-    /// GObject is shared, so mutations from either path are reflected in
-    /// the visible widget.
-    clips_indicator: crate::clips::StatusIndicator,
     /// Owned by the dashboard row-1 section. `None` only in tests / partial
     /// builds; in normal operation always `Some` after `build_dashboard_page`.
     clips_section: Option<ClipsSectionWidgets>,
@@ -68,6 +63,10 @@ struct Widgets {
     /// clicking the sidebar themselves. Set during `ChatMixWindow::new`
     /// after the sidebar is built.
     clips_sidebar_btn: Option<gtk::ToggleButton>,
+    /// Sidebar Settings toggle button. Same pattern as `clips_sidebar_btn`:
+    /// `show_settings_tab()` flips it active so the new Duration / Hotkey
+    /// jump buttons can navigate to Settings via a single GAction.
+    settings_sidebar_btn: Option<gtk::ToggleButton>,
 }
 
 fn battery_icon(percent: u8) -> (&'static str, bool) {
@@ -147,11 +146,15 @@ impl ChatMixWindow {
 
         content_area.append(&stack);
 
-        // Build sidebar and wire to stack. The clips toggle button is held
-        // on `Widgets` so `show_clips_tab()` (called from the `app.show-clip`
-        // GAction handler in app.rs) can flip it active programmatically.
+        // Build sidebar and wire to stack. The clips + settings toggle
+        // buttons are held on `Widgets` so `show_clips_tab()` (from the
+        // `app.show-clip` GAction handler) and `show_settings_tab()` (from
+        // the new `app.show-clips-settings` GAction, fired by the home
+        // page's Duration / Hotkey buttons) can flip them active
+        // programmatically.
         let sidebar = build_sidebar(&stack);
         widgets.clips_sidebar_btn = Some(sidebar.clips_btn.clone());
+        widgets.settings_sidebar_btn = Some(sidebar.settings_btn.clone());
         root.append(&sidebar.container);
         root.append(&content_area);
 
@@ -200,14 +203,18 @@ impl ChatMixWindow {
              .mixer-ch-mic scale trough highlight    { background-color: rgba(179,102,230,0.85); } \
              .mixer-device-dropdown { font-size: 75%; } \
              .mixer-device-dropdown > button { min-height: 0; padding-top: 4px; padding-bottom: 4px; } \
-             .clip-indicator { padding: 4px 10px; border-radius: 8px; \
-               background-color: alpha(currentColor, 0.08); } \
-             .clip-indicator label { font-size: 90%; } \
-             .clip-indicator .dot-armed { color: rgb(77,204,179); } \
-             .clip-indicator .dot-saving { color: rgb(242,205,64); } \
-             .clip-indicator .dot-error  { color: rgb(230,77,77); } \
-             .clip-indicator .dot-setup  { color: alpha(currentColor, 0.5); } \
-             .clip-indicator .dot-paused { color: rgb(160,160,160); } \
+             .clip-dot { min-width: 10px; min-height: 10px; border-radius: 5px; \
+               transition: background-color 200ms; } \
+             .clip-dot.dot-paused    { background-color: rgb(160,160,160); } \
+             .clip-dot.dot-capturing { background-color: rgb(77,204,179); \
+               animation: clip-pulse 1.6s infinite; } \
+             .clip-dot.dot-saving    { background-color: rgb(242,205,64); } \
+             .clip-dot.dot-error     { background-color: rgb(230,77,77); } \
+             @keyframes clip-pulse { \
+               0%   { opacity: 0.55; } \
+               50%  { opacity: 1.0;  } \
+               100% { opacity: 0.55; } \
+             } \
              .clips-row-card { padding: 14px 18px; }"
         );
         gtk::style_context_add_provider_for_display(
@@ -287,35 +294,39 @@ impl ChatMixWindow {
         }
     }
 
-    /// Update the dashboard's clip-status badge. Driven from the backend
-    /// event poll in `app.rs` after each `BufferController::on_backend_event`
-    /// + after the auto-resume block at startup so the badge reflects the
-    /// initial buffer state without flicker.
+    /// Switch the content stack to the Settings tab.
     ///
-    /// Also refreshes the row-1 Clips section's Pause button so its label /
-    /// sensitivity tracks state transitions (Idle / Armed → button enabled,
-    /// Saving / Error → disabled). `user_paused` is derived from the state
-    /// because `Paused` is the only state where the buffer's `user_paused`
-    /// flag is true, and this method's callers don't have the buffer ref
-    /// handy.
-    pub fn set_clips_state(
-        &self,
-        state: crate::clips::BufferState,
-        game: Option<&str>,
-    ) {
+    /// Called from the `app.show-clips-settings` GAction handler, which is
+    /// bound to the home-page Clips card's Duration / Hotkey buttons. Same
+    /// mechanism as `show_clips_tab`: flip the sidebar toggle, let the
+    /// existing `connect_toggled` handler do the stack switch.
+    pub fn show_settings_tab(&self) {
+        if let Some(btn) = self.inner.borrow().settings_sidebar_btn.as_ref() {
+            btn.set_active(true);
+        }
+    }
+
+    /// Refresh the row-1 Clips section to reflect the new `BufferState`.
+    /// Driven from the backend event poll in `app.rs` after each
+    /// `BufferController::on_backend_event` + after the auto-resume block at
+    /// startup so the dot/label reflect the initial buffer state without
+    /// flicker. `user_paused` is derived from the state because `Paused` is
+    /// the only state where the buffer's `user_paused` flag is true, and
+    /// this method's callers don't have the buffer ref handy.
+    pub fn set_clips_state(&self, state: crate::clips::BufferState) {
         let w = self.inner.borrow();
-        w.clips_indicator.set_state(state, game);
         if let Some(section) = &w.clips_section {
             section.refresh_state(state, matches!(state, crate::clips::BufferState::Paused));
         }
     }
 
     /// Refresh the dashboard's row-1 Clips section: pause-button label /
-    /// sensitivity, duration label, hotkey hint. Indicator state is updated
-    /// separately via `set_clips_state` (no game name needed here).
-    /// Called by the `app.pause-recording-toggle` GAction handler and any
-    /// other site that wants the section's controls to reflect a new
-    /// buffer state / settings snapshot.
+    /// Full refresh of the row-1 Clips section: dot color, capture-toggle
+    /// label / sensitivity, Duration button text, Quick Capture button
+    /// text. Called by the `app.pause-recording-toggle` GAction handler
+    /// and any other site that wants the section's controls to reflect a
+    /// new buffer state / settings snapshot. The faster state-only
+    /// refresh (no settings needed) goes through `set_clips_state`.
     pub fn refresh_clips_section(
         &self,
         state: crate::clips::BufferState,
@@ -357,6 +368,7 @@ fn apply_critical_class(image: &gtk::Image, critical: bool) {
 struct SidebarResult {
     container: gtk::Widget,
     clips_btn: gtk::ToggleButton,
+    settings_btn: gtk::ToggleButton,
 }
 
 fn build_sidebar(stack: &gtk::Stack) -> SidebarResult {
@@ -414,6 +426,7 @@ fn build_sidebar(stack: &gtk::Stack) -> SidebarResult {
     SidebarResult {
         container: container.upcast(),
         clips_btn,
+        settings_btn,
     }
 }
 
@@ -509,9 +522,6 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
     clamp.set_child(Some(&content));
     scroll.set_child(Some(&clamp));
 
-    // `StatusIndicator` is Clone (all fields are GObject refs) so the
-    // dashboard's set_clips_state path and the section's own indicator
-    // refer to the same widget tree under the hood.
     let widgets = Widgets {
         device_row: dev_widgets.0,
         noise_row: dev_widgets.1,
@@ -520,11 +530,11 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
         spare_battery_label: status_result.spare_battery_label,
         spare_battery_icon: status_result.spare_battery_icon,
         balance_scale: status_result.balance_scale,
-        clips_indicator: clips_section_widgets.indicator.clone(),
         clips_section: Some(clips_section_widgets),
         mixer: None,
         clips: None,
         clips_sidebar_btn: None,
+        settings_sidebar_btn: None,
     };
 
     (scroll.upcast(), widgets)
@@ -532,25 +542,30 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
 
 // -- Clips section (row 1, full-width) --
 //
-// Sits on its own row beneath the Status / Device cards. Shows the live
-// indicator at the top and a compact action row underneath: Save / Pause
-// buttons on the left, recording-duration + hotkey-hint labels on the right.
-// Owned by `Widgets.clips_section` so the action handler in app.rs and the
-// backend-event poll can both refresh it in lockstep with state changes.
+// Single horizontal row inside an `adw::PreferencesGroup` titled "Clips".
+// Layout (left → right):
+//   [Save Clip] [● Capturing | Start Capturing] <spacer> [Duration: 60s] [Quick Capture: Alt + S]
+//
+// The capture-toggle button carries its own pulsing-green dot when the
+// buffer is armed; when paused the dot is muted gray. Duration / hotkey
+// labels are buttons themselves — clicking either jumps to the Settings
+// tab via `app.show-clips-settings`.
 
 pub struct ClipsSectionWidgets {
-    pub indicator: crate::clips::StatusIndicator,
     pub save_button: gtk::Button,
-    pub pause_button: gtk::Button,
-    pub duration_label: gtk::Label,
-    pub hotkey_label: gtk::Label,
+    pub capture_toggle: gtk::Button,
+    pub capture_dot: gtk::Widget,
+    pub capture_label: gtk::Label,
+    pub duration_btn: gtk::Button,
+    pub hotkey_btn: gtk::Button,
 }
 
 impl ClipsSectionWidgets {
-    /// Refresh the pause button (label + sensitivity), the duration hint,
-    /// and the hotkey hint. The indicator itself updates via the separate
-    /// `set_clips_state` path so the action handler doesn't need a game
-    /// name to call refresh.
+    /// Refresh both the high-frequency state (dot color, toggle label /
+    /// sensitivity) and the low-frequency settings-derived labels
+    /// (duration, hotkey). Called from the `app.pause-recording-toggle`
+    /// handler and from any callsite that has a fresh `ClipSettings`
+    /// snapshot to apply.
     pub fn refresh(
         &self,
         buffer_state: crate::clips::buffer::BufferState,
@@ -559,112 +574,150 @@ impl ClipsSectionWidgets {
     ) {
         self.refresh_state(buffer_state, user_paused);
 
-        // Duration label — round to the nicest unit at the breakpoints.
-        let secs = settings.buffer_length;
-        let text = if secs < 60 {
-            format!("Recording last {secs} seconds")
-        } else if secs < 3600 {
-            format!("Recording last {} minutes", (secs as f64 / 60.0).round() as u32)
-        } else {
-            format!(
-                "Recording last {} hour{}",
-                secs / 3600,
-                if secs >= 7200 { "s" } else { "" }
-            )
-        };
-        self.duration_label.set_label(&text);
+        // Duration button — literal seconds, no minute formatting, per
+        // the redesign spec.
+        self.duration_btn
+            .set_label(&format!("Duration: {}s", settings.buffer_length));
 
-        // Hotkey label — falls back to the suggested default if the portal
-        // hasn't filled in the display string yet.
+        // Hotkey button — falls back to "Alt + S" when the portal hasn't
+        // filled in the display string yet.
         let hk = if settings.save_hotkey_display.is_empty() {
-            "Hotkey: ALT+S".to_string()
+            "Alt + S".to_string()
         } else {
-            format!("Hotkey: {}", settings.save_hotkey_display)
+            settings.save_hotkey_display.clone()
         };
-        self.hotkey_label.set_label(&hk);
+        self.hotkey_btn
+            .set_label(&format!("Quick Capture: {hk}"));
     }
 
-    /// Refresh just the pause button (label + sensitivity), without
-    /// touching duration / hotkey labels (those don't change on backend
-    /// state transitions and require a settings ref). Called from
-    /// `ChatMixWindow::set_clips_state` so the button tracks state changes
-    /// driven by the backend-event poll without needing a settings cell on
-    /// that path.
+    /// Refresh just the dot / capture-toggle pair (cheap, called on every
+    /// backend event). Doesn't require a settings ref.
+    ///
+    /// State → visual table:
+    ///
+    /// | BufferState     | Dot class      | Toggle label       | Sensitive |
+    /// |-----------------|----------------|--------------------|-----------|
+    /// | Uninitialized   | dot-paused     | Start Capturing    | false     |
+    /// | Idle            | dot-paused     | Start Capturing    | true      |
+    /// | Arming / Armed  | dot-capturing  | Capturing          | true      |
+    /// | Saving          | dot-saving     | Saving…            | false     |
+    /// | ErrorState      | dot-error      | Start Capturing    | false     |
+    /// | Paused          | dot-paused     | Start Capturing    | true      |
+    ///
+    /// `user_paused` overrides the label for the Pause → Resume race
+    /// (state briefly reads Idle while the buffer transitions): if intent
+    /// is "paused", the label sticks to "Start Capturing" until the next
+    /// Armed event lands.
     pub fn refresh_state(
         &self,
         buffer_state: crate::clips::buffer::BufferState,
         user_paused: bool,
     ) {
         use crate::clips::buffer::BufferState as S;
-        let (base_label, sensitive) = match buffer_state {
-            S::Uninitialized => ("Pause Recording", false),
-            S::Idle | S::Arming | S::Armed => ("Pause Recording", true),
-            S::Saving => ("Pause Recording", false),
-            S::ErrorState => ("Pause Recording", false),
-            S::Paused => ("Resume Recording", true),
+
+        // Reset all state classes; reapply per the state below.
+        for cls in ["dot-paused", "dot-capturing", "dot-saving", "dot-error"] {
+            self.capture_dot.remove_css_class(cls);
+        }
+
+        let (dot_class, base_label, sensitive) = match buffer_state {
+            S::Uninitialized => ("dot-paused", "Start Capturing", false),
+            S::Idle => ("dot-paused", "Start Capturing", true),
+            S::Arming | S::Armed => ("dot-capturing", "Capturing", true),
+            S::Saving => ("dot-saving", "Saving…", false),
+            S::ErrorState => ("dot-error", "Start Capturing", false),
+            S::Paused => ("dot-paused", "Start Capturing", true),
         };
-        // `user_paused` takes precedence on the label: even if the state
-        // briefly says Idle (after a Pause → Resume race), the button copy
-        // tracks intent.
-        let label = if user_paused { "Resume Recording" } else { base_label };
-        self.pause_button.set_label(label);
-        self.pause_button.set_sensitive(sensitive);
+        self.capture_dot.add_css_class(dot_class);
+
+        // user_paused override — see doc comment.
+        let label = if user_paused && !matches!(buffer_state, S::Saving) {
+            "Start Capturing"
+        } else {
+            base_label
+        };
+        self.capture_label.set_label(label);
+        self.capture_toggle.set_sensitive(sensitive);
+
+        // Tooltip flips with state so hover hints match the action the
+        // click would perform.
+        let tip = match (buffer_state, user_paused) {
+            (S::Arming | S::Armed, false) => "Click to pause recording. The current rolling clip is lost.",
+            (S::Paused, _) | (_, true) => "Click to resume recording.",
+            (S::Idle, _) => "Click to start recording.",
+            (S::Saving, _) => "Saving the last clip…",
+            (S::ErrorState, _) => "Capture stopped. Open Settings to retry.",
+            (S::Uninitialized, _) => "Set up Clips first (Clips tab).",
+        };
+        self.capture_toggle.set_tooltip_text(Some(tip));
     }
 }
 
 fn build_clips_section() -> (adw::PreferencesGroup, ClipsSectionWidgets) {
     let group = adw::PreferencesGroup::builder().title("Clips").build();
 
-    // Row 1: status indicator (re-used widget — clones share the underlying
-    // GObject so `set_state` from elsewhere updates the same dot/label).
-    let indicator = crate::clips::build_status_indicator();
-    let indicator_holder = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .halign(gtk::Align::Center)
-        .margin_top(8)
-        .margin_bottom(4)
-        .build();
-    indicator_holder.append(&indicator.root);
-    let row_indicator = gtk::ListBoxRow::builder()
-        .child(&indicator_holder)
-        .activatable(false)
-        .selectable(false)
-        .build();
-    group.add(&row_indicator);
-
-    // Row 2: action row — Save / Pause buttons on the left, duration +
-    // hotkey hints on the right.
+    // Single horizontal row. Margins match `clips-row-card` (15/15/8/8 in
+    // the spec — we drive vertical via the action_box margins so the
+    // ListBoxRow doesn't add extra padding above/below).
     let action_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(12)
         .margin_start(15)
         .margin_end(15)
-        .margin_top(6)
-        .margin_bottom(6)
+        .margin_top(8)
+        .margin_bottom(8)
         .build();
 
-    let save_button = gtk::Button::builder().label("Save Clip Now").build();
+    // Save Clip — suggested-action keeps it visually primary.
+    let save_button = gtk::Button::builder().label("Save Clip").build();
     save_button.add_css_class("suggested-action");
     save_button.set_action_name(Some("app.save-clip"));
     action_box.append(&save_button);
 
-    let pause_button = gtk::Button::builder().label("Pause Recording").build();
-    pause_button.set_action_name(Some("app.pause-recording-toggle"));
-    pause_button.set_tooltip_text(Some(
-        "Pause recording. The last N seconds of recording will be lost.",
-    ));
-    action_box.append(&pause_button);
+    // Capture toggle — plain Button (not ToggleButton) so we can manage
+    // the visual state ourselves. The action is intentionally still
+    // `app.pause-recording-toggle` even though the UI verb flipped to
+    // "Capturing" / "Start Capturing" — renaming the action would break
+    // any external D-Bus scripts the user has wired up. (Critic Major 5.)
+    let dot = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .valign(gtk::Align::Center)
+        .build();
+    dot.add_css_class("clip-dot");
+    dot.add_css_class("dot-paused"); // initial — refresh_state will repaint
 
+    let capture_label = gtk::Label::builder().label("Start Capturing").build();
+
+    let toggle_content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .valign(gtk::Align::Center)
+        .build();
+    toggle_content.append(&dot);
+    toggle_content.append(&capture_label);
+
+    let capture_toggle = gtk::Button::builder().child(&toggle_content).build();
+    capture_toggle.set_action_name(Some("app.pause-recording-toggle"));
+    action_box.append(&capture_toggle);
+
+    // Spacer pushes the duration / hotkey buttons to the right.
     let spacer = gtk::Box::builder().hexpand(true).build();
     action_box.append(&spacer);
 
-    let duration_label = gtk::Label::builder().label("Recording last 60 seconds").build();
-    duration_label.add_css_class("dim-label");
-    action_box.append(&duration_label);
+    // Duration jump button — flat so it reads as a hint, not a primary
+    // action. Action fires `app.show-clips-settings` (registered in
+    // `app.rs`) which navigates to the Settings tab.
+    let duration_btn = gtk::Button::builder().label("Duration: 60s").build();
+    duration_btn.add_css_class("flat");
+    duration_btn.set_action_name(Some("app.show-clips-settings"));
+    duration_btn.set_tooltip_text(Some("Open Clips settings to change the recording length"));
+    action_box.append(&duration_btn);
 
-    let hotkey_label = gtk::Label::builder().label("Hotkey: ALT+S").build();
-    hotkey_label.add_css_class("dim-label");
-    action_box.append(&hotkey_label);
+    let hotkey_btn = gtk::Button::builder().label("Quick Capture: Alt + S").build();
+    hotkey_btn.add_css_class("flat");
+    hotkey_btn.set_action_name(Some("app.show-clips-settings"));
+    hotkey_btn.set_tooltip_text(Some("Open Clips settings to change the save-clip hotkey"));
+    action_box.append(&hotkey_btn);
 
     let row_action = gtk::ListBoxRow::builder()
         .child(&action_box)
@@ -674,11 +727,12 @@ fn build_clips_section() -> (adw::PreferencesGroup, ClipsSectionWidgets) {
     group.add(&row_action);
 
     let widgets = ClipsSectionWidgets {
-        indicator,
         save_button,
-        pause_button,
-        duration_label,
-        hotkey_label,
+        capture_toggle,
+        capture_dot: dot.upcast(),
+        capture_label,
+        duration_btn,
+        hotkey_btn,
     };
     (group, widgets)
 }

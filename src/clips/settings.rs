@@ -45,8 +45,6 @@ fn settings_path() -> PathBuf {
 pub struct ClipSettings {
     pub buffer_length: u32,
     pub bitrate_mbps: u32,
-    pub auto_arm: bool,
-    pub always_armed: bool,
     pub per_source_tracks: bool,
     pub mic_capture: bool,
     pub storage_path: PathBuf,
@@ -68,8 +66,6 @@ impl Default for ClipSettings {
         Self {
             buffer_length: 60,
             bitrate_mbps: 25,
-            auto_arm: true,
-            always_armed: false,
             per_source_tracks: true,
             mic_capture: true,
             storage_path: PathBuf::from(std::env::var("HOME").unwrap_or_default())
@@ -104,8 +100,6 @@ pub fn load() -> ClipSettings {
                     s.bitrate_mbps = n;
                 }
             }
-            "auto_arm" => s.auto_arm = v == "1",
-            "always_armed" => s.always_armed = v == "1",
             "per_source_tracks" => s.per_source_tracks = v == "1",
             "mic_capture" => s.mic_capture = v == "1",
             "storage_path" => s.storage_path = PathBuf::from(v),
@@ -124,11 +118,6 @@ pub fn save(s: &ClipSettings) -> std::io::Result<()> {
     let mut body = String::new();
     body.push_str(&format!("buffer_length={}\n", s.buffer_length));
     body.push_str(&format!("bitrate_mbps={}\n", s.bitrate_mbps));
-    body.push_str(&format!("auto_arm={}\n", if s.auto_arm { 1 } else { 0 }));
-    body.push_str(&format!(
-        "always_armed={}\n",
-        if s.always_armed { 1 } else { 0 }
-    ));
     body.push_str(&format!(
         "per_source_tracks={}\n",
         if s.per_source_tracks { 1 } else { 0 }
@@ -374,75 +363,6 @@ pub fn build_clips_group(
     dbus_box.append(&dbus_copy_btn);
     dbus_row.add_suffix(&dbus_box);
     group.add(&dbus_row);
-
-    // ------------------------------------------------------------------
-    // Auto-arm + Always armed (mutex pair).
-    //
-    // Mutex semantics: when "Always armed" is on, "Auto-arm" becomes
-    // insensitive — the underlying flag is preserved (so toggling Always
-    // back off restores the user's prior auto-arm preference) but it can't
-    // be edited while always-armed is in effect.
-    // ------------------------------------------------------------------
-    let auto_arm_row = adw::SwitchRow::builder()
-        .title("Auto-arm during games")
-        .subtitle("Start recording when a known game launches")
-        .active(clip_settings.borrow().auto_arm)
-        .build();
-    auto_arm_row.set_sensitive(!clip_settings.borrow().always_armed);
-
-    let always_row = adw::SwitchRow::builder()
-        .title("Always armed")
-        .subtitle("Record continuously, even outside games")
-        .active(clip_settings.borrow().always_armed)
-        .build();
-
-    {
-        let clip_settings = clip_settings.clone();
-        let buffer = buffer.clone();
-        let auto_arm_row_for_handler = auto_arm_row.clone();
-        auto_arm_row.connect_active_notify(move |row| {
-            let new_value = row.is_active();
-            {
-                let mut s = clip_settings.borrow_mut();
-                if s.auto_arm == new_value {
-                    return;
-                }
-                s.auto_arm = new_value;
-            }
-            buffer.borrow_mut().auto_arm = new_value;
-            if let Err(e) = save(&clip_settings.borrow()) {
-                log::warn!("clip settings save failed: {e}");
-            }
-            // No-op self-reference; keeps the row reachable for future
-            // sensitivity tweaks if Always-armed wiring expands.
-            let _ = &auto_arm_row_for_handler;
-        });
-    }
-
-    {
-        let clip_settings = clip_settings.clone();
-        let buffer = buffer.clone();
-        let auto_arm_row_for_always = auto_arm_row.clone();
-        always_row.connect_active_notify(move |row| {
-            let new_value = row.is_active();
-            {
-                let mut s = clip_settings.borrow_mut();
-                if s.always_armed == new_value {
-                    return;
-                }
-                s.always_armed = new_value;
-            }
-            buffer.borrow_mut().always_armed = new_value;
-            // Lock auto-arm switch when always-armed is on so the user
-            // can't put the buffer into a contradictory state.
-            auto_arm_row_for_always.set_sensitive(!new_value);
-            if let Err(e) = save(&clip_settings.borrow()) {
-                log::warn!("clip settings save failed: {e}");
-            }
-        });
-    }
-    group.add(&auto_arm_row);
-    group.add(&always_row);
 
     // ------------------------------------------------------------------
     // Per-source audio tracks.
@@ -701,8 +621,6 @@ mod tests {
         let s = ClipSettings::default();
         assert_eq!(s.buffer_length, 60);
         assert_eq!(s.bitrate_mbps, 25);
-        assert!(s.auto_arm);
-        assert!(!s.always_armed);
         assert!(s.per_source_tracks);
         assert!(s.mic_capture);
     }

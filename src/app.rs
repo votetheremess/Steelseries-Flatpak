@@ -198,10 +198,11 @@ pub fn run(start_hidden: bool) {
                 // token; preserve the None default. The auto-resume block
                 // below feeds the persisted token in via on_portal_pick_complete.
                 initial_cfg.portal_restore_token = None;
-                let mut buf = crate::clips::BufferController::new(initial_cfg);
-                // Copy controller-level (non-CaptureConfig) flags too.
-                buf.auto_arm = clip_settings.borrow().auto_arm;
-                buf.always_armed = clip_settings.borrow().always_armed;
+                let buf = crate::clips::BufferController::new(initial_cfg);
+                // No detector-driven flags to copy: `auto_arm` /
+                // `always_armed` were dropped with the game-detector
+                // removal. `onboarding_complete` is seeded later in the
+                // auto-resume block once we've reloaded settings.
                 Rc::new(RefCell::new(buf))
             };
 
@@ -568,6 +569,7 @@ pub fn run(start_hidden: bool) {
                 let buffer_for_next = buffer.clone();
                 let clips_page = window.clips_page();
                 let clip_settings_for_next = clip_settings.clone();
+                let resources_for_next = resources.clone();
                 let next_action = gtk::gio::ActionEntry::builder("wizard-next")
                     .activate(move |_app: &adw::Application, _action, _param| {
                         use crate::clips::WizardStep;
@@ -591,15 +593,27 @@ pub fn run(start_hidden: bool) {
                                         "wizard-next: onboarding_complete persisted to disk"
                                     );
                                 }
+                                // Mirror the disk flip into the running
+                                // BufferController so arming engages
+                                // without an app restart. The setter
+                                // re-evaluates maybe_arm internally if the
+                                // other gates are satisfied (portal
+                                // pick + not paused).
+                                if let Some(tx) = resources_for_next
+                                    .borrow()
+                                    .as_ref()
+                                    .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()))
+                                {
+                                    buffer_for_next
+                                        .borrow_mut()
+                                        .set_onboarding_complete(true, &tx);
+                                }
                                 clips_page.set_wizard_step(WizardStep::Settings);
                             }
                             WizardStep::Settings => {
                                 clips_page.set_state(crate::clips::PageState::Empty);
                             }
                         }
-                        // Buffer is held captured for symmetry with future
-                        // expansions (e.g., flushing settings to it on Done).
-                        let _ = &buffer_for_next;
                     })
                     .build();
                 app.add_action_entries([next_action]);
@@ -863,10 +877,7 @@ pub fn run(start_hidden: bool) {
                         if let Some(tx) = cmd_tx {
                             buffer_for_retry.borrow_mut().retry(&tx);
                             let buf = buffer_for_retry.borrow();
-                            window_for_retry.set_clips_state(
-                                buf.state(),
-                                buf.current_game().map(|g| g.name.as_str()),
-                            );
+                            window_for_retry.set_clips_state(buf.state());
                         } else {
                             log::warn!("no clip backend available for retry-clip-capture");
                         }
@@ -1038,6 +1049,25 @@ pub fn run(start_hidden: bool) {
                     })
                     .build();
                 app.add_action_entries([show_action]);
+            }
+
+            // app.show-clips-settings — bound to the home-page Clips
+            // card's Duration / Quick Capture buttons. Presents the
+            // window and flips the sidebar to Settings so the user can
+            // edit recording length / hotkey without hunting the menu.
+            // Settings page lays the Clips group near the top, so a
+            // plain tab jump is fine (no need to scroll the
+            // PreferencesPage).
+            {
+                let win_for_settings = window.clone();
+                let settings_jump = gtk::gio::ActionEntry::builder("show-clips-settings")
+                    .activate(move |_app: &adw::Application, _action, _param| {
+                        win_for_settings.window.set_visible(true);
+                        win_for_settings.window.present();
+                        win_for_settings.show_settings_tab();
+                    })
+                    .build();
+                app.add_action_entries([settings_jump]);
             }
 
             // app.rebind-clip-hotkey — re-open the GlobalShortcuts portal
@@ -1265,6 +1295,21 @@ pub fn run(start_hidden: bool) {
                     resumed_settings.onboarding_complete
                 );
 
+                // Seed the BufferController's onboarding gate from disk
+                // BEFORE any `on_portal_pick_complete` call below — without
+                // this, arm 4 (token saved but wizard incomplete) would
+                // auto-arm immediately on every relaunch, defeating the
+                // gate. (Critic Blocker 1.)
+                if let Some(tx) = resources
+                    .borrow()
+                    .as_ref()
+                    .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()))
+                {
+                    buffer
+                        .borrow_mut()
+                        .set_onboarding_complete(resumed_settings.onboarding_complete, &tx);
+                }
+
                 if resumed_settings.onboarding_complete && gsr_ok && token.is_some() {
                     log::info!(
                         "auto-resume: arm 1 (skip wizard, go to browser)"
@@ -1386,10 +1431,7 @@ pub fn run(start_hidden: bool) {
                 }
                 if state_changed {
                     let buf = buf_for_events.borrow();
-                    window_for_indicator.set_clips_state(
-                        buf.state(),
-                        buf.current_game().map(|g| g.name.as_str()),
-                    );
+                    window_for_indicator.set_clips_state(buf.state());
                 }
                 // Dispatch saved-clip notifications and retention. Done after
                 // releasing the resources borrow above so the worker threads
@@ -1408,10 +1450,7 @@ pub fn run(start_hidden: bool) {
             // on the dashboard).
             {
                 let buf = buffer.borrow();
-                window.set_clips_state(
-                    buf.state(),
-                    buf.current_game().map(|g| g.name.as_str()),
-                );
+                window.set_clips_state(buf.state());
             }
 
             // Battery query: send once immediately, then refresh periodically
@@ -1444,49 +1483,6 @@ pub fn run(start_hidden: bool) {
                     if let Some(router) = res.router.borrow_mut().as_mut() {
                         state_sync::tick(&mut state, router);
                     }
-                }
-                glib::ControlFlow::Continue
-            });
-
-            // Game detector: scan /proc every 2 seconds, feed the debouncing
-            // GameDetector, and forward state-change events into the
-            // BufferController. The controller is responsible for deciding
-            // whether to actually arm. Detector-driven state changes don't
-            // generate BackendEvents (game enter/exit only mutates
-            // `current_game` + sends StartReplay/StopReplay), so we have to
-            // refresh the indicator inline here too — without this, the
-            // badge would only update on Armed/Saved/etc.
-            let detector_state = Rc::new(RefCell::new(crate::clips::GameDetector::new()));
-            let buf_for_detector = buffer.clone();
-            let resources_for_detector = resources.clone();
-            let window_for_detector = window.clone();
-            glib::timeout_add_seconds_local(2, move || {
-                let games = crate::clips::detector::scan_once();
-                let evts = detector_state.borrow_mut().tick(&games);
-                if !evts.is_empty() {
-                    if let Some(res) = resources_for_detector.borrow().as_ref() {
-                        if let Some(tx) =
-                            res.clip_backend.as_ref().map(|h| h.sender())
-                        {
-                            let mut buf = buf_for_detector.borrow_mut();
-                            for e in evts {
-                                log::info!("detector event: {e:?}");
-                                match e {
-                                    crate::clips::DetectorEvent::GameStarted(g) => {
-                                        buf.on_game_started(g, &tx);
-                                    }
-                                    crate::clips::DetectorEvent::GameStopped { pid } => {
-                                        buf.on_game_stopped(pid, &tx);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let buf = buf_for_detector.borrow();
-                    window_for_detector.set_clips_state(
-                        buf.state(),
-                        buf.current_game().map(|g| g.name.as_str()),
-                    );
                 }
                 glib::ControlFlow::Continue
             });
