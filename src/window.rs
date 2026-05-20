@@ -601,13 +601,18 @@ impl ClipsSectionWidgets {
     /// | Idle            | dot-paused     | Start Capturing    | true      |
     /// | Arming / Armed  | dot-capturing  | Capturing          | true      |
     /// | Saving          | dot-saving     | Saving…            | false     |
-    /// | ErrorState      | dot-error      | Start Capturing    | false     |
+    /// | ErrorState      | dot-error      | Retry Capturing    | true      |
     /// | Paused          | dot-paused     | Start Capturing    | true      |
     ///
     /// `user_paused` overrides the label for the Pause → Resume race
     /// (state briefly reads Idle while the buffer transitions): if intent
     /// is "paused", the label sticks to "Start Capturing" until the next
     /// Armed event lands.
+    ///
+    /// ErrorState is sensitive=true because the pause-recording-toggle
+    /// action handler routes the click to `BufferController::retry` when
+    /// the buffer is in ErrorState (see `app.rs`). Without this, the user
+    /// has no UI recovery path after a save failure.
     pub fn refresh_state(
         &self,
         buffer_state: crate::clips::buffer::BufferState,
@@ -625,13 +630,16 @@ impl ClipsSectionWidgets {
             S::Idle => ("dot-paused", "Start Capturing", true),
             S::Arming | S::Armed => ("dot-capturing", "Capturing", true),
             S::Saving => ("dot-saving", "Saving…", false),
-            S::ErrorState => ("dot-error", "Start Capturing", false),
+            S::ErrorState => ("dot-error", "Retry Capturing", true),
             S::Paused => ("dot-paused", "Start Capturing", true),
         };
         self.capture_dot.add_css_class(dot_class);
 
-        // user_paused override — see doc comment.
-        let label = if user_paused && !matches!(buffer_state, S::Saving) {
+        // user_paused override — see doc comment. ErrorState is excluded
+        // from the override because "Retry Capturing" is the correct verb
+        // even if user_paused happens to be true (the user can't have
+        // paused while in ErrorState; pause() guards against that).
+        let label = if user_paused && !matches!(buffer_state, S::Saving | S::ErrorState) {
             "Start Capturing"
         } else {
             base_label
@@ -642,11 +650,11 @@ impl ClipsSectionWidgets {
         // Tooltip flips with state so hover hints match the action the
         // click would perform.
         let tip = match (buffer_state, user_paused) {
+            (S::ErrorState, _) => "Click to retry.",
             (S::Arming | S::Armed, false) => "Click to pause recording. The current rolling clip is lost.",
             (S::Paused, _) | (_, true) => "Click to resume recording.",
             (S::Idle, _) => "Click to start recording.",
             (S::Saving, _) => "Saving the last clip…",
-            (S::ErrorState, _) => "Capture stopped. Open Settings to retry.",
             (S::Uninitialized, _) => "Set up Clips first (Clips tab).",
         };
         self.capture_toggle.set_tooltip_text(Some(tip));

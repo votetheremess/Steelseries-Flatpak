@@ -555,4 +555,35 @@ mod tests {
         assert_eq!(bc.state(), BufferState::Uninitialized, "pause must not strand the user");
         assert!(!bc.user_paused());
     }
+
+    /// Round-4 Bug B: ErrorState must recover via the pause-recording-toggle
+    /// click path. The toggle handler in `app.rs` reads `state()` and dispatches
+    /// to `retry()` when ErrorState is observed; this test exercises the same
+    /// underlying transition that the handler triggers and asserts the buffer
+    /// re-arms when the standard gates (portal pick + onboarding complete + not
+    /// paused) are still satisfied.
+    #[test]
+    fn error_state_recovers_via_retry_and_re_arms() {
+        let (tx, rx) = channel();
+        let mut bc = BufferController::new(CaptureConfig::default());
+        bc.has_portal_pick = true;
+        bc.set_onboarding_complete(true, &tx);
+        // Drain the auto-arm StartReplay from set_onboarding_complete.
+        let _ = rx.try_recv();
+        // Simulate the backend transitioning to ErrorState (e.g., GSR child
+        // died during a save).
+        bc.set_state_for_test(BufferState::ErrorState);
+        assert_eq!(bc.state(), BufferState::ErrorState);
+        // What the toggle handler does on click while in ErrorState.
+        bc.retry(&tx);
+        assert_eq!(
+            bc.state(),
+            BufferState::Arming,
+            "retry must transition ErrorState → Idle → Arming when gates are satisfied"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(ClipCommand::StartReplay { .. })),
+            "retry must enqueue StartReplay so the backend re-arms"
+        );
+    }
 }
