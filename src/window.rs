@@ -210,6 +210,21 @@ impl ChatMixWindow {
                animation: clip-pulse 1.6s infinite; } \
              .clip-dot.dot-saving    { background-color: rgb(242,205,64); } \
              .clip-dot.dot-error     { background-color: rgb(230,77,77); } \
+             /* Clips card typography normalisation. Adwaita default.css line \
+                226 ships `button { font-weight: bold }` so a plain Button label \
+                renders heavier than an AdwActionRow title at the same font-size. \
+                The ActionRow title is a .title label whose rule (default.css \
+                line 1387) sets font-weight: inherit, so it lands on the document \
+                default (normal/400) and inherits our 125% font-size from window. \
+                Forcing the Clips-row buttons + their child labels back to \
+                normal weight is what matches the Noise Control row above. \
+                font-size is left to inherit from window so it stays in lock-step \
+                with the ActionRow title at any zoom level. */ \
+             .clips-card-row button, \
+             .clips-card-row button > label, \
+             .clips-card-row button > box label { \
+               font-weight: normal; \
+             } \
              @keyframes clip-pulse { \
                0%   { opacity: 0.55; } \
                50%  { opacity: 1.0;  } \
@@ -675,13 +690,21 @@ fn build_clips_section() -> (adw::PreferencesGroup, ClipsSectionWidgets) {
     let row = adw::ActionRow::new();
     row.set_activatable(false);
     row.set_selectable(false);
+    // Scopes the typography-normalising CSS rule (.clips-card-row …) to
+    // this row only — so the rest of the app's Buttons keep their default
+    // bold labels.
+    row.add_css_class("clips-card-row");
 
-    // Save Clip — suggested-action keeps it visually primary.
+    // Save Clip — plain Button (no suggested-action). The earlier rounds
+    // styled it as the primary action, but the typography goal here is to
+    // match every Clips-card text string to the "Noise Control" ActionRow
+    // title above: same font family, same 125% size inherited from
+    // `window`, same `font-weight: normal`. `suggested-action` would
+    // re-impose a bold accent-coloured chrome that breaks that match.
     let save_button = gtk::Button::builder()
         .label("Save Clip")
         .valign(gtk::Align::Center)
         .build();
-    save_button.add_css_class("suggested-action");
     save_button.set_action_name(Some("app.save-clip"));
     row.add_prefix(&save_button);
 
