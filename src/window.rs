@@ -214,11 +214,7 @@ impl ChatMixWindow {
                0%   { opacity: 0.55; } \
                50%  { opacity: 1.0;  } \
                100% { opacity: 0.55; } \
-             } \
-             .clips-row-card button { font-size: 85%; min-height: 0; \
-               padding-top: 4px; padding-bottom: 4px; \
-               padding-left: 10px; padding-right: 10px; } \
-             .clips-row-card label { font-size: 90%; }"
+             }"
         );
         gtk::style_context_add_provider_for_display(
             &gtk::prelude::WidgetExt::display(&window),
@@ -660,31 +656,26 @@ impl ClipsSectionWidgets {
 fn build_clips_section() -> (adw::PreferencesGroup, ClipsSectionWidgets) {
     let group = adw::PreferencesGroup::builder().title("Clips").build();
 
-    // Single horizontal row. Margins match `clips-row-card` (15/15/8/8 in
-    // the spec — we drive vertical via the action_box margins so the
-    // ListBoxRow doesn't add extra padding above/below).
-    //
-    // The `.clips-row-card` CSS class is applied here so the descendant
-    // selectors (`.clips-row-card button`, `.clips-row-card label`) only
-    // apply to widgets inside *this* row — not to the rest of the app
-    // (the global `window { font-size: 125%; }` would otherwise make the
-    // buttons here visually heavier than the ActionRows in the Status /
-    // Device cards above).
-    let action_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(12)
-        .margin_start(15)
-        .margin_end(15)
-        .margin_top(8)
-        .margin_bottom(8)
-        .build();
-    action_box.add_css_class("clips-row-card");
+    // Use `adw::ActionRow` (not a plain `gtk::ListBoxRow`-wrapped Box) so the
+    // row inherits Adwaita's typography hierarchy, padding, and button-in-row
+    // styling automatically — matching the Status / Device cards above which
+    // are also ActionRows. The earlier CSS-only approach (.clips-row-card
+    // button { font-size: 85% … }) couldn't fully match because Adwaita ties
+    // a whole stack of rules (line-height, label color, button min-height,
+    // row padding) to the ActionRow CSS node, and a plain Button in a
+    // ListBoxRow only gets a fraction of them.
+    let row = adw::ActionRow::new();
+    row.set_activatable(false);
+    row.set_selectable(false);
 
     // Save Clip — suggested-action keeps it visually primary.
-    let save_button = gtk::Button::builder().label("Save Clip").build();
+    let save_button = gtk::Button::builder()
+        .label("Save Clip")
+        .valign(gtk::Align::Center)
+        .build();
     save_button.add_css_class("suggested-action");
     save_button.set_action_name(Some("app.save-clip"));
-    action_box.append(&save_button);
+    row.add_prefix(&save_button);
 
     // Capture toggle — plain Button (not ToggleButton) so we can manage
     // the visual state ourselves. The action is intentionally still
@@ -708,35 +699,37 @@ fn build_clips_section() -> (adw::PreferencesGroup, ClipsSectionWidgets) {
     toggle_content.append(&dot);
     toggle_content.append(&capture_label);
 
-    let capture_toggle = gtk::Button::builder().child(&toggle_content).build();
+    let capture_toggle = gtk::Button::builder()
+        .child(&toggle_content)
+        .valign(gtk::Align::Center)
+        .build();
     capture_toggle.set_action_name(Some("app.pause-recording-toggle"));
-    action_box.append(&capture_toggle);
-
-    // Spacer pushes the duration / hotkey buttons to the right.
-    let spacer = gtk::Box::builder().hexpand(true).build();
-    action_box.append(&spacer);
+    row.add_prefix(&capture_toggle);
 
     // Duration jump button — flat so it reads as a hint, not a primary
     // action. Action fires `app.show-clips-settings` (registered in
-    // `app.rs`) which navigates to the Settings tab.
-    let duration_btn = gtk::Button::builder().label("Duration: 60s").build();
+    // `app.rs`) which navigates to the Settings tab. Added as suffix so it
+    // packs to the right edge of the row (matching the Status card's spare
+    // battery suffix and the Device card's switch placement).
+    let duration_btn = gtk::Button::builder()
+        .label("Duration: 60s")
+        .valign(gtk::Align::Center)
+        .build();
     duration_btn.add_css_class("flat");
     duration_btn.set_action_name(Some("app.show-clips-settings"));
     duration_btn.set_tooltip_text(Some("Open Clips settings to change the recording length"));
-    action_box.append(&duration_btn);
+    row.add_suffix(&duration_btn);
 
-    let hotkey_btn = gtk::Button::builder().label("Quick Capture: Alt + S").build();
+    let hotkey_btn = gtk::Button::builder()
+        .label("Quick Capture: Alt + S")
+        .valign(gtk::Align::Center)
+        .build();
     hotkey_btn.add_css_class("flat");
     hotkey_btn.set_action_name(Some("app.show-clips-settings"));
     hotkey_btn.set_tooltip_text(Some("Open Clips settings to change the save-clip hotkey"));
-    action_box.append(&hotkey_btn);
+    row.add_suffix(&hotkey_btn);
 
-    let row_action = gtk::ListBoxRow::builder()
-        .child(&action_box)
-        .activatable(false)
-        .selectable(false)
-        .build();
-    group.add(&row_action);
+    group.add(&row);
 
     let widgets = ClipsSectionWidgets {
         save_button,
