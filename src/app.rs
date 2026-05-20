@@ -246,6 +246,21 @@ pub fn run(start_hidden: bool) {
                 .clips_page()
                 .set_storage_dir(clip_settings.borrow().storage_path.clone());
 
+            // Now that the model has been reconciled against the persisted
+            // storage_path, switch the page-state to match the user's
+            // onboarding status. Without this the Clips sidebar tab opens
+            // on the wizard even when onboarding is long since complete and
+            // there are clips on disk — the previously-set
+            // `set_visible_child_name("onboarding")` in `build_clips_page`
+            // is the construction-time default and the auto-resume block
+            // below only runs after the wizard actions are registered, so
+            // a returning user with clips would still see the wizard for a
+            // moment (and silently — there are no log lines covering that
+            // transition).
+            window
+                .clips_page()
+                .sync_to_onboarding_state(clip_settings.borrow().onboarding_complete);
+
             // Seed the wizard Page 3 widgets with the persisted settings
             // so a returning user lands on their previous values (clip
             // length, storage folder name) rather than the build-time
@@ -611,7 +626,14 @@ pub fn run(start_hidden: bool) {
                                 clips_page.set_wizard_step(WizardStep::Settings);
                             }
                             WizardStep::Settings => {
-                                clips_page.set_state(crate::clips::PageState::Empty);
+                                // Onboarding is now complete (the flag was
+                                // flipped at the PickScreen step above);
+                                // hand to the helper so we land on Loaded
+                                // if there are already clips on disk, or
+                                // Empty otherwise. Using set_state(Empty)
+                                // unconditionally would hide existing
+                                // clips behind the empty placeholder.
+                                clips_page.sync_to_onboarding_state(true);
                             }
                         }
                     })
@@ -1324,7 +1346,15 @@ pub fn run(start_hidden: bool) {
                             buffer.borrow_mut().on_portal_pick_complete(t, &tx);
                         }
                     }
-                    window.clips_page().set_state(crate::clips::PageState::Empty);
+                    // Pick Loaded vs Empty based on the reconciled model.
+                    // The earlier post-`set_storage_dir` call already did
+                    // this once, but the auto-resume block runs late in
+                    // startup (after wizard actions are registered) so we
+                    // re-sync defensively in case anything ran in between
+                    // that would have flipped the state.
+                    window
+                        .clips_page()
+                        .sync_to_onboarding_state(true);
                 } else if !gsr_ok {
                     log::info!("auto-resume: arm 2 (Page 1 / install GSR)");
                     window

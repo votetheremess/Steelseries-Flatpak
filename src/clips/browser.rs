@@ -1374,6 +1374,39 @@ impl ClipsPage {
         }
     }
 
+    /// Sync the page-state / visible stack child to the user's
+    /// onboarding status. Called from app.rs after `set_storage_dir`
+    /// (so the model has been reconciled against the persisted clips
+    /// folder) and from the wizard "Done" handler.
+    ///
+    /// - `onboarding_complete = false` → Onboarding (wizard).
+    /// - `onboarding_complete = true`  → Loaded if any clips on disk,
+    ///                                    otherwise Empty.
+    ///
+    /// The Remix child is intentionally not handled here — that path
+    /// is only ever entered via a card click, which manages its own
+    /// state transition (and the user has to explicitly Close out of
+    /// it anyway).
+    ///
+    /// Reads `self.model.n_items()` rather than taking `has_clips`
+    /// as an argument so callers don't have to remember to reconcile
+    /// the model before calling. `refresh_clips_model()` already runs
+    /// at construction and from `set_storage_dir`, so by the time
+    /// this fires the model count is authoritative for what's on
+    /// disk.
+    pub fn sync_to_onboarding_state(&self, onboarding_complete: bool) {
+        if !onboarding_complete {
+            self.set_state(PageState::Onboarding);
+            return;
+        }
+        let new_state = if self.model.n_items() == 0 {
+            PageState::Empty
+        } else {
+            PageState::Loaded
+        };
+        self.set_state(new_state);
+    }
+
     pub fn set_wizard_step(&self, step: WizardStep) {
         *self.wizard.step.borrow_mut() = step;
         let name = match step {
