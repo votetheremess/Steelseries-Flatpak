@@ -783,8 +783,9 @@ fn bind_clip_card(
         let storage_dir = storage_dir.clone();
         let filename = meta.filename.clone();
         gesture.connect_released(move |g, _n_press, _x, _y| {
-            // released_event fires after the user lifts the mouse; ignore
-            // synthetic events from other widgets bubbling up.
+            // Left-click only (gesture is built with `.button(1)`); claim
+            // the sequence so the click doesn't propagate up and trigger
+            // any default activation on the card.
             g.set_state(gtk::EventSequenceState::Claimed);
             let dir = storage_dir.borrow().clone();
             on_remix(dir.join(&filename));
