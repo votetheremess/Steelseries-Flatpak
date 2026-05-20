@@ -203,7 +203,7 @@ impl ChatMixWindow {
              .mixer-ch-mic scale trough highlight    { background-color: rgba(179,102,230,0.85); } \
              .mixer-device-dropdown { font-size: 75%; } \
              .mixer-device-dropdown > button { min-height: 0; padding-top: 4px; padding-bottom: 4px; } \
-             .clip-dot { min-width: 10px; min-height: 10px; border-radius: 5px; \
+             .clip-dot { min-width: 8px; min-height: 8px; border-radius: 4px; \
                transition: background-color 200ms; } \
              .clip-dot.dot-paused    { background-color: rgb(160,160,160); } \
              .clip-dot.dot-capturing { background-color: rgb(77,204,179); \
@@ -215,7 +215,10 @@ impl ChatMixWindow {
                50%  { opacity: 1.0;  } \
                100% { opacity: 0.55; } \
              } \
-             .clips-row-card { padding: 14px 18px; }"
+             .clips-row-card button { font-size: 85%; min-height: 0; \
+               padding-top: 4px; padding-bottom: 4px; \
+               padding-left: 10px; padding-right: 10px; } \
+             .clips-row-card label { font-size: 90%; }"
         );
         gtk::style_context_add_provider_for_display(
             &gtk::prelude::WidgetExt::display(&window),
@@ -660,6 +663,13 @@ fn build_clips_section() -> (adw::PreferencesGroup, ClipsSectionWidgets) {
     // Single horizontal row. Margins match `clips-row-card` (15/15/8/8 in
     // the spec — we drive vertical via the action_box margins so the
     // ListBoxRow doesn't add extra padding above/below).
+    //
+    // The `.clips-row-card` CSS class is applied here so the descendant
+    // selectors (`.clips-row-card button`, `.clips-row-card label`) only
+    // apply to widgets inside *this* row — not to the rest of the app
+    // (the global `window { font-size: 125%; }` would otherwise make the
+    // buttons here visually heavier than the ActionRows in the Status /
+    // Device cards above).
     let action_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(12)
@@ -668,6 +678,7 @@ fn build_clips_section() -> (adw::PreferencesGroup, ClipsSectionWidgets) {
         .margin_top(8)
         .margin_bottom(8)
         .build();
+    action_box.add_css_class("clips-row-card");
 
     // Save Clip — suggested-action keeps it visually primary.
     let save_button = gtk::Button::builder().label("Save Clip").build();
