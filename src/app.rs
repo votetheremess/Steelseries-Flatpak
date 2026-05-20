@@ -853,8 +853,9 @@ pub fn run(start_hidden: bool) {
             // alongside the dashboard's clip-status badge when
             // BufferState::ErrorState is active. Calls
             // BufferController::retry which transitions ErrorState → Idle
-            // and runs maybe_arm so the buffer re-engages immediately if
-            // a known game is detected. No-op outside ErrorState (the
+            // and runs maybe_arm; maybe_arm now arms whenever the three
+            // always-armed gates are satisfied (portal token + onboarding
+            // complete + not user-paused). No-op outside ErrorState (the
             // button is hidden in non-error states, but the action is
             // still safe to dispatch from D-Bus or scripted callers).
             //
@@ -877,7 +878,7 @@ pub fn run(start_hidden: bool) {
                         if let Some(tx) = cmd_tx {
                             buffer_for_retry.borrow_mut().retry(&tx);
                             let buf = buffer_for_retry.borrow();
-                            window_for_retry.set_clips_state(buf.state());
+                            window_for_retry.set_clips_state(buf.state(), buf.user_paused());
                         } else {
                             log::warn!("no clip backend available for retry-clip-capture");
                         }
@@ -1431,7 +1432,7 @@ pub fn run(start_hidden: bool) {
                 }
                 if state_changed {
                     let buf = buf_for_events.borrow();
-                    window_for_indicator.set_clips_state(buf.state());
+                    window_for_indicator.set_clips_state(buf.state(), buf.user_paused());
                 }
                 // Dispatch saved-clip notifications and retention. Done after
                 // releasing the resources borrow above so the worker threads
@@ -1450,7 +1451,7 @@ pub fn run(start_hidden: bool) {
             // on the dashboard).
             {
                 let buf = buffer.borrow();
-                window.set_clips_state(buf.state());
+                window.set_clips_state(buf.state(), buf.user_paused());
             }
 
             // Battery query: send once immediately, then refresh periodically

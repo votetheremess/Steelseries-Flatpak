@@ -310,13 +310,15 @@ impl ChatMixWindow {
     /// Driven from the backend event poll in `app.rs` after each
     /// `BufferController::on_backend_event` + after the auto-resume block at
     /// startup so the dot/label reflect the initial buffer state without
-    /// flicker. `user_paused` is derived from the state because `Paused` is
-    /// the only state where the buffer's `user_paused` flag is true, and
-    /// this method's callers don't have the buffer ref handy.
-    pub fn set_clips_state(&self, state: crate::clips::BufferState) {
+    /// flicker. `user_paused` is passed through from the caller's buffer
+    /// snapshot (`BufferController::user_paused()`) rather than derived
+    /// from `state` — `state` is only `Paused` while the buffer is idle,
+    /// so during a `Saving + user_paused = true` window deriving from state
+    /// alone would flicker the dot/label until the next transition.
+    pub fn set_clips_state(&self, state: crate::clips::BufferState, user_paused: bool) {
         let w = self.inner.borrow();
         if let Some(section) = &w.clips_section {
-            section.refresh_state(state, matches!(state, crate::clips::BufferState::Paused));
+            section.refresh_state(state, user_paused);
         }
     }
 
@@ -496,9 +498,8 @@ fn build_dashboard_page() -> (gtk::Widget, Widgets) {
     grid.attach(&status_card, 0, 0, 1, 1);
     grid.attach(&device_card, 1, 0, 1, 1);
 
-    // Row 1: full-width Clips section. Holds the indicator (cloned from the
-    // section widgets so `set_clips_state` continues to update one shared
-    // dot/label) plus the Save/Pause buttons + duration/hotkey hints.
+    // Row 1: full-width Clips section with Save / capture-toggle buttons +
+    // pulsing-dot capture state + duration/hotkey jump labels.
     let (clips_section, clips_section_widgets) = build_clips_section();
     grid.attach(&clips_section, 0, 1, 2, 1);
 
