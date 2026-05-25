@@ -1,68 +1,15 @@
-//! Clip metadata index, directory scan, filename sanitization.
+//! Clip metadata index, directory scan, filename collision resolution.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClipMeta {
     pub filename: String,
     pub duration_ms: u64,
-    pub game_name: String,
     pub created_unix: u64,
     pub bitrate_kbps: u32,
     pub resolution: String,
-}
-
-/// Sanitize a game name for inclusion in a filename.
-/// - Whitespace -> hyphen
-/// - Non-alphanumeric (except hyphen) -> stripped
-/// - Truncate to 40 chars
-pub fn sanitize_game_name(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| if c.is_whitespace() { '-' } else { c })
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .collect();
-    s.chars().take(40).collect()
-}
-
-/// Build a base filename (no extension) from a creation timestamp + game name.
-/// Format: `YYYY-MM-DD-HHMM-<sanitized-game>` (local time).
-pub fn build_base_filename(created: SystemTime, game_name: &str) -> String {
-    use std::time::UNIX_EPOCH;
-    let secs = created
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let game = if game_name.is_empty() { "Untitled" } else { game_name };
-    let sanitized = sanitize_game_name(game);
-    let final_game = if sanitized.is_empty() {
-        "Untitled".to_string()
-    } else {
-        sanitized
-    };
-    // Convert Unix seconds to local-time `tm` via libc to avoid pulling in `chrono`.
-    // SAFETY: `localtime` returns a pointer to a thread-local static `tm` that is
-    // valid until the next call to localtime/gmtime on this thread. We copy it
-    // immediately into an owned value before any further libc calls.
-    let t = secs as libc::time_t;
-    let tm_ptr = unsafe { libc::localtime(&t) };
-    let date = if tm_ptr.is_null() {
-        // Fall back to epoch if localtime can't resolve (e.g., on extreme overflow).
-        "1970-01-01-0000".to_string()
-    } else {
-        let tm = unsafe { *tm_ptr };
-        format!(
-            "{:04}-{:02}-{:02}-{:02}{:02}",
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min
-        )
-    };
-    format!("{date}-{final_game}")
 }
 
 /// Resolve filename collisions by appending `-2`, `-3`, ... before the extension.
@@ -91,27 +38,43 @@ fn index_path() -> PathBuf {
 }
 
 /// Serialize a clip meta into one tab-separated index line.
+///
+/// Current (5-field) shape: `filename\tduration_ms\tcreated_unix\tbitrate_kbps\tresolution`.
+/// The legacy 6-field shape included a `game_name` after `duration_ms` — see
+/// [`parse_meta`] for the back-compat path.
 pub fn serialize_meta(m: &ClipMeta) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}",
-        m.filename, m.duration_ms, m.game_name, m.created_unix, m.bitrate_kbps, m.resolution
+        "{}\t{}\t{}\t{}\t{}",
+        m.filename, m.duration_ms, m.created_unix, m.bitrate_kbps, m.resolution
     )
 }
 
 /// Parse one index line. Returns `None` on malformed input.
+///
+/// Accepts both the current 5-field shape and the legacy 6-field shape
+/// (`filename\tduration_ms\tgame_name\tcreated_unix\tbitrate_kbps\tresolution`)
+/// produced by older builds. The `game_name` field is silently dropped
+/// when present.
 pub fn parse_meta(line: &str) -> Option<ClipMeta> {
     let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() != 6 {
-        return None;
+    match parts.len() {
+        5 => Some(ClipMeta {
+            filename: parts[0].to_string(),
+            duration_ms: parts[1].parse().ok()?,
+            created_unix: parts[2].parse().ok()?,
+            bitrate_kbps: parts[3].parse().ok()?,
+            resolution: parts[4].to_string(),
+        }),
+        6 => Some(ClipMeta {
+            filename: parts[0].to_string(),
+            duration_ms: parts[1].parse().ok()?,
+            // parts[2] = legacy game_name; dropped.
+            created_unix: parts[3].parse().ok()?,
+            bitrate_kbps: parts[4].parse().ok()?,
+            resolution: parts[5].to_string(),
+        }),
+        _ => None,
     }
-    Some(ClipMeta {
-        filename: parts[0].to_string(),
-        duration_ms: parts[1].parse().ok()?,
-        game_name: parts[2].to_string(),
-        created_unix: parts[3].parse().ok()?,
-        bitrate_kbps: parts[4].parse().ok()?,
-        resolution: parts[5].to_string(),
-    })
 }
 
 /// Load the on-disk clip index. Missing or unreadable file -> empty list.
@@ -158,7 +121,6 @@ pub fn reconcile(storage_dir: &Path) -> Vec<ClipMeta> {
             indexed.push(ClipMeta {
                 filename: filename.clone(),
                 duration_ms: 0,
-                game_name: String::new(),
                 created_unix: 0,
                 bitrate_kbps: 0,
                 resolution: String::new(),
@@ -317,30 +279,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitize_normal_name() {
-        assert_eq!(sanitize_game_name("Apex Legends"), "Apex-Legends");
-    }
-
-    #[test]
-    fn sanitize_strips_special_chars() {
-        assert_eq!(sanitize_game_name("ELDEN RING\u{2122} \u{00A9}"), "ELDEN-RING-");
-    }
-
-    #[test]
-    fn sanitize_truncates_to_40_chars() {
-        let s = sanitize_game_name(&"x".repeat(100));
-        assert_eq!(s.len(), 40);
-    }
-
-    #[test]
-    fn build_filename_includes_date_and_name() {
-        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1715000000);
-        let f = build_base_filename(t, "Apex Legends");
-        assert!(f.starts_with("20"));
-        assert!(f.ends_with("-Apex-Legends"));
-    }
-
-    #[test]
     fn collision_appends_suffix() {
         let dir = std::env::temp_dir();
         let base = format!("collision-test-{}", std::process::id());
@@ -357,9 +295,8 @@ mod index_tests {
 
     fn meta() -> ClipMeta {
         ClipMeta {
-            filename: "2026-05-08-1934-Apex-Legends.mp4".into(),
+            filename: "2026-05-08-1934-clip.mp4".into(),
             duration_ms: 60000,
-            game_name: "Apex Legends".into(),
             created_unix: 1715000000,
             bitrate_kbps: 25000,
             resolution: "1920x1080".into(),
@@ -377,7 +314,25 @@ mod index_tests {
     #[test]
     fn parse_rejects_malformed() {
         assert!(parse_meta("not enough tabs").is_none());
-        assert!(parse_meta("a\tb\tc\td\te").is_none());
+        // 4 fields — too few.
+        assert!(parse_meta("a\tb\tc\td").is_none());
+        // 7 fields — too many.
+        assert!(parse_meta("a\tb\tc\td\te\tf\tg").is_none());
+    }
+
+    /// Legacy 6-field shape (pre-deletion of game-detection): the
+    /// `game_name` field was the 3rd column. The current parser must
+    /// silently drop that field so a pre-existing `clips_index.txt` from
+    /// an earlier build still loads after upgrading.
+    #[test]
+    fn parse_meta_accepts_legacy_6_field_lines() {
+        let legacy = "2026-05-08-1934-Apex-Legends.mp4\t60000\tApex Legends\t1715000000\t25000\t1920x1080";
+        let m = parse_meta(legacy).expect("legacy 6-field line must parse");
+        assert_eq!(m.filename, "2026-05-08-1934-Apex-Legends.mp4");
+        assert_eq!(m.duration_ms, 60000);
+        assert_eq!(m.created_unix, 1715000000);
+        assert_eq!(m.bitrate_kbps, 25000);
+        assert_eq!(m.resolution, "1920x1080");
     }
 }
 
