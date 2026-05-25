@@ -330,8 +330,17 @@ use std::os::unix::process::CommandExt;
 /// command is the GUI (`gpu-screen-recorder-ui`); without this flag, our
 /// CLI args land in the GUI and pop a window over the user's game.
 ///
-/// Returns the Child handle for the `flatpak` wrapper process. Signals sent to
-/// this PID are forwarded by Flatpak's bwrap into the contained GSR process.
+/// Returns the Child handle for the `flatpak` wrapper process.
+///
+/// IMPORTANT: this is the OUTER `flatpak run` wrapper, NOT the inner
+/// `gpu-screen-recorder`. The real GSR runs two `bwrap` layers below this
+/// wrapper inside the Flatpak sandbox (`flatpak → bwrap → bwrap →
+/// gpu-screen-recorder`), and **bwrap does not forward SIGUSR1 / SIGRTMIN+N /
+/// SIGINT into the contained process.** Signalling this wrapper PID therefore
+/// never reaches GSR: saves silently no-op and exit-signals leak the inner GSR
+/// as an orphan. All signal sites must instead target the inner PID resolved
+/// via [`resolve_inner_gsr_pid`] (descend the process tree from this wrapper
+/// child). See `ActiveCapture::signal_target`.
 pub fn spawn_gsr(args: &[String], fifo_path: &PathBuf) -> std::io::Result<Child> {
     let mut cmd = Command::new("flatpak");
     cmd.arg("run")
@@ -386,6 +395,134 @@ pub fn send_signal(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// `/proc/<pid>/status` truncates `Name:` to 15 characters, so the comm of
+/// `gpu-screen-recorder` shows up as `gpu-screen-reco`. Match on either the
+/// full name or a 15-char truncated prefix of the target.
+fn comm_matches(name: &str, target: &str) -> bool {
+    !name.is_empty() && (name == target || (name.len() == 15 && target.starts_with(name)))
+}
+
+/// Pure tree-walk: given a `pid → ppid` map and a `pid → comm` map, find the
+/// first descendant of `root` whose comm matches `target_comm`. A process is a
+/// descendant of `root` if walking its PPid chain upward reaches `root`. This
+/// is used to locate THIS app's `gpu-screen-recorder` below the
+/// `flatpak → bwrap → bwrap → gsr` tree, uniquely (vs. a bare `pgrep`, which
+/// would also match orphaned GSRs from prior launches that share our args).
+///
+/// `root` itself is not considered a match (we want a descendant). The PPid
+/// walk is depth-capped so a corrupted/cyclic map can't loop forever.
+fn find_descendant_by_comm(
+    ppid_map: &std::collections::HashMap<u32, u32>,
+    comm_map: &std::collections::HashMap<u32, String>,
+    root: u32,
+    target_comm: &str,
+) -> Option<u32> {
+    // Deterministic order so the result is stable across runs/tests.
+    let mut pids: Vec<u32> = comm_map.keys().copied().collect();
+    pids.sort_unstable();
+    for &pid in &pids {
+        if pid == root {
+            continue;
+        }
+        let name = match comm_map.get(&pid) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !comm_matches(name, target_comm) {
+            continue;
+        }
+        // Walk the PPid chain upward looking for `root`.
+        let mut cur = pid;
+        let mut hops = 0;
+        while hops < 64 {
+            let parent = match ppid_map.get(&cur) {
+                Some(&p) => p,
+                None => break,
+            };
+            if parent == root {
+                return Some(pid);
+            }
+            if parent == 0 || parent == cur {
+                break; // reached init or a self-loop
+            }
+            cur = parent;
+            hops += 1;
+        }
+    }
+    None
+}
+
+/// Read `/proc` into `(ppid_map, comm_map)`. Best-effort: unreadable or
+/// vanished entries are skipped (the proc tree mutates while we walk it).
+fn read_proc_tables() -> (
+    std::collections::HashMap<u32, u32>,
+    std::collections::HashMap<u32, String>,
+) {
+    let mut ppid_map = std::collections::HashMap::new();
+    let mut comm_map = std::collections::HashMap::new();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return (ppid_map, comm_map),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let pid: u32 = match name.parse() {
+            Ok(p) => p,
+            Err(_) => continue, // non-pid entry (e.g. "self", "cpuinfo")
+        };
+        let status = match std::fs::read_to_string(entry.path().join("status")) {
+            Ok(s) => s,
+            Err(_) => continue, // process exited between read_dir and open
+        };
+        let mut comm: Option<String> = None;
+        let mut ppid: Option<u32> = None;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Name:") {
+                comm = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("PPid:") {
+                ppid = rest.trim().parse().ok();
+            }
+            if comm.is_some() && ppid.is_some() {
+                break;
+            }
+        }
+        if let Some(c) = comm {
+            comm_map.insert(pid, c);
+        }
+        if let Some(p) = ppid {
+            ppid_map.insert(pid, p);
+        }
+    }
+    (ppid_map, comm_map)
+}
+
+/// Descend the process tree from the `flatpak run` wrapper child to find the
+/// inner `gpu-screen-recorder` PID. Returns `None` if no matching descendant
+/// exists yet (GSR may take a beat to appear after spawn) or if `/proc` is
+/// unreadable.
+fn resolve_inner_gsr_pid(wrapper_pid: u32) -> Option<u32> {
+    let (ppid_map, comm_map) = read_proc_tables();
+    find_descendant_by_comm(&ppid_map, &comm_map, wrapper_pid, "gpu-screen-recorder")
+}
+
+/// True if `/proc/<pid>` still exists (process alive).
+fn pid_alive(pid: u32) -> bool {
+    std::path::Path::new("/proc").join(pid.to_string()).exists()
+}
+
+/// True if a `gpu-screen-recorder` process cmdline belongs to THIS app, i.e.
+/// it was launched with our pinned portal-session token path. The token path
+/// (`<storage>/.arctis/gsr_portal.token`) is unique to this app, so a cmdline
+/// containing it is definitively one of our orphans and safe to kill on a
+/// clean start. Pure for unit-testing against representative cmdlines.
+fn is_our_orphan(cmdline: &str, token_path: &str) -> bool {
+    !token_path.is_empty() && cmdline.contains(token_path)
 }
 
 use std::collections::VecDeque;
@@ -447,7 +584,100 @@ pub fn spawn_backend() -> (BackendHandle, Receiver<BackendEvent>) {
 }
 
 struct ActiveCapture {
+    /// The outer `flatpak run` wrapper. Signalling this does NOT reach GSR
+    /// (bwrap doesn't forward signals) — see `spawn_gsr` / `signal_target`.
     child: Child,
+    /// Lazily-resolved inner `gpu-screen-recorder` PID, descended from the
+    /// wrapper child's process tree. Resolved on first signal (GSR may not be
+    /// visible in `/proc` the instant after spawn) and re-resolved if the
+    /// cached PID dies.
+    inner_pid: Option<u32>,
+}
+
+impl ActiveCapture {
+    fn new(child: Child) -> Self {
+        ActiveCapture { child, inner_pid: None }
+    }
+
+    /// Resolve the PID that signals should target. Prefers the inner GSR PID;
+    /// re-resolves if the cache is stale (PID gone). Falls back to the wrapper
+    /// PID — with a warning — if the inner GSR can't be found, preserving the
+    /// pre-fix behaviour while making the failure diagnosable.
+    ///
+    /// A short retry covers the race where GSR hasn't yet appeared in `/proc`
+    /// the moment we first try to signal it.
+    fn signal_target(&mut self) -> u32 {
+        let wrapper = self.child.id();
+
+        // Drop a stale cached PID.
+        if let Some(p) = self.inner_pid {
+            if !pid_alive(p) {
+                self.inner_pid = None;
+            }
+        }
+
+        if self.inner_pid.is_none() {
+            // Try a few times: the inner GSR can lag the wrapper spawn.
+            for attempt in 0..5 {
+                if let Some(p) = resolve_inner_gsr_pid(wrapper) {
+                    self.inner_pid = Some(p);
+                    break;
+                }
+                if attempt < 4 {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+
+        match self.inner_pid {
+            Some(p) => p,
+            None => {
+                log::warn!(
+                    "clip-backend: could not resolve inner gpu-screen-recorder PID below \
+                     wrapper {wrapper}; falling back to signalling the wrapper (bwrap will \
+                     not forward it — save/disarm may no-op). Is GSR still starting up?"
+                );
+                wrapper
+            }
+        }
+    }
+}
+
+/// Kill any leftover `gpu-screen-recorder` processes from a previous run of
+/// THIS app, identified by our pinned portal-session token path in their
+/// cmdline. Mirrors `audio::router::cleanup_orphaned_loopbacks`: leaked
+/// children from a `pkill -9` / crash / logout (where the inner GSR reparents
+/// to the session reaper and keeps holding a portal screencast) get cleared on
+/// a clean start, where we know we have no legitimate GSR yet.
+///
+/// We match on the token path rather than descending a tree (there's no live
+/// wrapper to descend from at startup) — safe because the token path is unique
+/// to this app. We match the `.arctis/gsr_portal.token` suffix so any
+/// configured storage dir is covered, not just the default.
+fn cleanup_orphaned_gsr() {
+    const TOKEN_SUFFIX: &str = ".arctis/gsr_portal.token";
+    let (_, comm_map) = read_proc_tables();
+    let mut killed = 0;
+    for (&pid, name) in &comm_map {
+        if !comm_matches(name, "gpu-screen-recorder") {
+            continue;
+        }
+        let cmdline_path = std::path::Path::new("/proc").join(pid.to_string()).join("cmdline");
+        let raw = match std::fs::read(&cmdline_path) {
+            Ok(b) => b,
+            Err(_) => continue, // process vanished
+        };
+        // /proc/<pid>/cmdline is NUL-separated; join with spaces for matching.
+        let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+        if is_our_orphan(&cmdline, TOKEN_SUFFIX) {
+            log::warn!("clip-backend: killing orphaned gpu-screen-recorder pid {pid} from a prior run");
+            let _ = send_signal(pid, libc::SIGKILL);
+            killed += 1;
+        }
+    }
+    if killed > 0 {
+        log::info!("clip-backend: cleaned up {killed} orphaned gpu-screen-recorder process(es)");
+    }
 }
 
 fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
@@ -458,6 +688,12 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
     let _ = std::fs::create_dir_all(&initial_storage);
     let _ = ensure_save_callback(&initial_storage);
     let _ = ensure_save_fifo(&initial_storage);
+
+    // Kill any GSR leaked by a prior run (crash / `pkill -9` / logout) before
+    // we spawn our own — otherwise a stale GSR keeps holding a portal
+    // screencast session and recording forever. Safe on a clean start: we have
+    // no legitimate GSR of our own yet.
+    cleanup_orphaned_gsr();
 
     // Shared between the supervisor loop (writer, set inside arm()) and the
     // FIFO reader thread (reader, picked up on each open). Updates here
@@ -507,16 +743,16 @@ fn run_backend(cmd_rx: Receiver<ClipCommand>, evt_tx: Sender<BackendEvent>) {
                 let _ = evt_tx.send(BackendEvent::Disarmed);
             }
             Ok(ClipCommand::SaveClip) => {
-                save(&active, libc::SIGUSR1, &evt_tx);
+                save(&mut active, libc::SIGUSR1, &evt_tx);
             }
             Ok(ClipCommand::SaveClipShort) => {
-                save(&active, libc::SIGRTMIN() + 1, &evt_tx);
+                save(&mut active, libc::SIGRTMIN() + 1, &evt_tx);
             }
             Ok(ClipCommand::SaveClipMedium) => {
-                save(&active, libc::SIGRTMIN() + 2, &evt_tx);
+                save(&mut active, libc::SIGRTMIN() + 2, &evt_tx);
             }
             Ok(ClipCommand::SaveClipLong) => {
-                save(&active, libc::SIGRTMIN() + 3, &evt_tx);
+                save(&mut active, libc::SIGRTMIN() + 3, &evt_tx);
             }
             Ok(ClipCommand::Reconfigure { config }) => {
                 // Same rationale as StartReplay: user intent overrides any
@@ -659,7 +895,7 @@ fn arm(
         config.output_dir.to_str().unwrap(),
     );
     let child = spawn_gsr(&args, &fifo)?;
-    *active = Some(ActiveCapture { child });
+    *active = Some(ActiveCapture::new(child));
     *active_config = Some(config.clone());
     Ok(())
 }
@@ -667,27 +903,46 @@ fn arm(
 // GSR muxes the active replay buffer on SIGINT (faststart MP4 with moov-relocate).
 // 2 s covers the typical 60 s @ 25 Mbps buffer (~190 MB) on NVMe; spinning disks may
 // force the SIGKILL fallback. Future tuning: scale wait by configured buffer length.
+//
+// SIGINT must reach the INNER gpu-screen-recorder (bwrap does not forward signals
+// from the wrapper). We signal the resolved inner PID, then wait for the WRAPPER
+// child to exit (when the inner GSR exits cleanly, the wrapper follows). As a force
+// fallback we SIGKILL the wrapper AND the inner PID (if still alive), so we never
+// leave the inner GSR orphaned holding a portal session.
 fn disarm(active: &mut Option<ActiveCapture>) {
     if let Some(mut a) = active.take() {
-        let pid = a.child.id();
-        let _ = send_signal(pid, libc::SIGINT);
-        // Give it 2s to exit cleanly.
+        let inner = a.signal_target();
+        let _ = send_signal(inner, libc::SIGINT);
+        // Give the wrapper 2s to exit cleanly (it follows the inner GSR out).
+        let mut exited = false;
         for _ in 0..20 {
             if let Ok(Some(_)) = a.child.try_wait() {
-                return;
+                exited = true;
+                break;
             }
             thread::sleep(Duration::from_millis(100));
         }
-        // Force.
-        let _ = a.child.kill();
-        let _ = a.child.wait();
+        if !exited {
+            // Force-kill the wrapper.
+            let _ = a.child.kill();
+            let _ = a.child.wait();
+        }
+        // Belt-and-suspenders: if the inner GSR somehow outlived the wrapper
+        // (or we fell back to signalling the wrapper above and the inner never
+        // got the SIGINT), SIGKILL it directly so it can't keep recording.
+        if inner != a.child.id() && pid_alive(inner) {
+            log::warn!("clip-backend: inner GSR {inner} still alive after disarm; SIGKILL");
+            let _ = send_signal(inner, libc::SIGKILL);
+        }
     }
 }
 
-fn save(active: &Option<ActiveCapture>, signal: libc::c_int, evt_tx: &Sender<BackendEvent>) {
+fn save(active: &mut Option<ActiveCapture>, signal: libc::c_int, evt_tx: &Sender<BackendEvent>) {
     match active {
         Some(a) => {
-            let pid = a.child.id();
+            // Target the inner GSR — signalling the wrapper is silently dropped
+            // by bwrap and the save never fires.
+            let pid = a.signal_target();
             if let Err(e) = send_signal(pid, signal) {
                 let _ = evt_tx.send(BackendEvent::Error {
                     context: "SaveClip".into(),
@@ -1217,5 +1472,148 @@ mod fifo_validation_tests {
         assert!(cleaned.ends_with('…'));
         // 50 'a's + the ellipsis = 51 chars total.
         assert_eq!(cleaned.chars().count(), 51);
+    }
+}
+
+#[cfg(test)]
+mod pid_resolution_tests {
+    //! Tests for the inner-GSR PID resolution and orphan-detection helpers.
+    //!
+    //! Root cause they guard against: `spawn_gsr` returns the outer
+    //! `flatpak run` wrapper, but bwrap doesn't forward SIGUSR1/SIGRTMIN+N/
+    //! SIGINT into the contained process. We must descend
+    //! `flatpak → bwrap → bwrap → gpu-screen-recorder` to find the real PID.
+    //! The tree walk and the orphan-cmdline match are pure, so we exercise
+    //! them against synthetic fixtures with no /proc dependency.
+    use super::{comm_matches, find_descendant_by_comm, is_our_orphan};
+    use std::collections::HashMap;
+
+    /// Build the real-world tree observed live:
+    ///   120000 flatpak (wrapper, our spawn_gsr child)
+    ///     120148 bwrap
+    ///       120159 bwrap
+    ///         120160 gpu-screen-reco   <- 15-char-truncated comm
+    fn nested_gsr_tree() -> (HashMap<u32, u32>, HashMap<u32, String>) {
+        let mut ppid = HashMap::new();
+        let mut comm = HashMap::new();
+        ppid.insert(120000, 1); // wrapper parented to launcher
+        comm.insert(120000, "flatpak".to_string());
+        ppid.insert(120148, 120000);
+        comm.insert(120148, "bwrap".to_string());
+        ppid.insert(120159, 120148);
+        comm.insert(120159, "bwrap".to_string());
+        ppid.insert(120160, 120159);
+        comm.insert(120160, "gpu-screen-reco".to_string()); // truncated
+        (ppid, comm)
+    }
+
+    #[test]
+    fn comm_matches_full_and_truncated() {
+        assert!(comm_matches("gpu-screen-recorder", "gpu-screen-recorder"));
+        // /proc truncates to 15 chars.
+        assert!(comm_matches("gpu-screen-reco", "gpu-screen-recorder"));
+        assert_eq!("gpu-screen-reco".len(), 15);
+        // Non-matches.
+        assert!(!comm_matches("bwrap", "gpu-screen-recorder"));
+        assert!(!comm_matches("flatpak", "gpu-screen-recorder"));
+        assert!(!comm_matches("", "gpu-screen-recorder"));
+        // A short prefix must NOT match (only the full 15-char truncation may).
+        assert!(!comm_matches("gpu", "gpu-screen-recorder"));
+    }
+
+    #[test]
+    fn finds_gsr_descended_through_two_bwrap_layers() {
+        let (ppid, comm) = nested_gsr_tree();
+        let found = find_descendant_by_comm(&ppid, &comm, 120000, "gpu-screen-recorder");
+        assert_eq!(found, Some(120160));
+    }
+
+    #[test]
+    fn does_not_match_gsr_under_a_different_wrapper() {
+        // An orphaned GSR from a prior launch reparented to the session reaper
+        // (PID 2423) must NOT be returned when descending from OUR wrapper.
+        let (mut ppid, mut comm) = nested_gsr_tree();
+        ppid.insert(99999, 2423); // reaper-parented orphan
+        comm.insert(99999, "gpu-screen-reco".to_string());
+        ppid.insert(2423, 1);
+        comm.insert(2423, "systemd".to_string());
+        // Descending from a wrapper that has no GSR child yields nothing,
+        // proving we don't grab the unrelated orphan by comm alone.
+        let found = find_descendant_by_comm(&ppid, &comm, 555, "gpu-screen-recorder");
+        assert_eq!(found, None);
+        // And descending from our real wrapper still finds only ours.
+        let found = find_descendant_by_comm(&ppid, &comm, 120000, "gpu-screen-recorder");
+        assert_eq!(found, Some(120160));
+    }
+
+    #[test]
+    fn returns_none_when_gsr_absent() {
+        let mut ppid = HashMap::new();
+        let mut comm = HashMap::new();
+        ppid.insert(120000, 1);
+        comm.insert(120000, "flatpak".to_string());
+        ppid.insert(120148, 120000);
+        comm.insert(120148, "bwrap".to_string());
+        // GSR hasn't spawned yet — lazy-resolve must report None so the caller
+        // retries / falls back rather than signalling a bwrap layer.
+        let found = find_descendant_by_comm(&ppid, &comm, 120000, "gpu-screen-recorder");
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn cyclic_or_self_parent_does_not_loop_forever() {
+        // Defensive: a corrupted map with a self-parent must terminate.
+        let mut ppid = HashMap::new();
+        let mut comm = HashMap::new();
+        ppid.insert(10, 10); // self-loop
+        comm.insert(10, "gpu-screen-reco".to_string());
+        let found = find_descendant_by_comm(&ppid, &comm, 999, "gpu-screen-recorder");
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn root_itself_is_not_a_match() {
+        // If the root were (impossibly) GSR, we still want a descendant, not root.
+        let mut ppid = HashMap::new();
+        let mut comm = HashMap::new();
+        ppid.insert(500, 1);
+        comm.insert(500, "gpu-screen-reco".to_string());
+        let found = find_descendant_by_comm(&ppid, &comm, 500, "gpu-screen-recorder");
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn is_our_orphan_matches_our_token_path() {
+        // Representative GSR cmdline carrying our pinned token path.
+        let ours = "gpu-screen-recorder -w portal -restore-portal-session yes \
+            -portal-session-token-filepath /home/u/Videos/Clips/.arctis/gsr_portal.token \
+            -r 60 -o /home/u/Videos/Clips";
+        assert!(is_our_orphan(ours, ".arctis/gsr_portal.token"));
+
+        // Custom (non-default) storage dir still matches the suffix.
+        let custom = "gpu-screen-recorder -portal-session-token-filepath \
+            /mnt/games/clips/.arctis/gsr_portal.token -r 30";
+        assert!(is_our_orphan(custom, ".arctis/gsr_portal.token"));
+    }
+
+    #[test]
+    fn is_our_orphan_rejects_foreign_gsr_and_empty_token() {
+        // A standalone GSR the user runs themselves (default restore token,
+        // not our pinned path) must NOT be killed.
+        let foreign = "gpu-screen-recorder -w screen -r 30 \
+            -portal-session-token-filepath /home/u/.config/gpu-screen-recorder/restore_token";
+        assert!(!is_our_orphan(foreign, ".arctis/gsr_portal.token"));
+
+        let no_token = "gpu-screen-recorder -w screen -r 30 -o /home/u/Videos";
+        assert!(!is_our_orphan(no_token, ".arctis/gsr_portal.token"));
+
+        // An empty token path must never match anything (guards against a
+        // mis-derived path nuking every GSR on the box).
+        assert!(!is_our_orphan(foreign, ""));
+        assert!(!is_our_orphan(ours_like(), ""));
+    }
+
+    fn ours_like() -> &'static str {
+        "gpu-screen-recorder -portal-session-token-filepath /a/.arctis/gsr_portal.token"
     }
 }
