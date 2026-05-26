@@ -142,6 +142,23 @@ mod tests {
     }
 
     #[test]
+    fn gsr_status_spam_is_classified() {
+        // The two periodic-status shapes GSR emits ~1/sec.
+        assert!(is_gsr_status_spam("update fps: 60, damage fps: 60"));
+        assert!(is_gsr_status_spam("damage fps: 60"));
+        assert!(is_gsr_status_spam("  update fps: 30  "));
+        // Real errors / warnings must NOT be classified as spam.
+        assert!(!is_gsr_status_spam(
+            "error: Failed to create context: portal session expired"
+        ));
+        assert!(!is_gsr_status_spam(
+            "Warning: audio device 'SteelSeries_Mic' is not a valid audio device"
+        ));
+        assert!(!is_gsr_status_spam(""));
+        assert!(!is_gsr_status_spam("Started recording"));
+    }
+
+    #[test]
     fn build_args_includes_portal_session_token_filepath() {
         // GSR's default `-restore-portal-session yes` writes the token to
         // ~/.config/gpu-screen-recorder/restore_token, which a user running
@@ -373,19 +390,41 @@ pub fn spawn_gsr(args: &[String], fifo_path: &PathBuf) -> std::io::Result<Child>
     // blocks the child or (more often) we lose all diagnostic context when
     // GSR exits non-zero — the user just sees `ExitStatus(unix_wait_status(256))`
     // with no clue why. Mirrors the FIFO-reader pattern.
+    //
+    // GSR emits a periodic `update fps: 60, damage fps: 60` status line roughly
+    // once per second. Logging those at WARN floods the terminal and buries
+    // real diagnostics. We classify each line: status spam is demoted to TRACE
+    // (off by default), everything else stays at WARN so genuine errors remain
+    // visible. See `is_gsr_status_spam`.
     if let Some(stderr) = child.stderr.take() {
         let _ = std::thread::Builder::new()
             .name("gsr-stderr".into())
             .spawn(move || {
                 let r = std::io::BufReader::new(stderr);
                 for line in std::io::BufRead::lines(r).map_while(Result::ok) {
-                    if !line.trim().is_empty() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if is_gsr_status_spam(trimmed) {
+                        // Periodic fps/damage status — drop to TRACE so it
+                        // never floods the user's terminal at WARN.
+                        log::trace!("gsr stderr (status): {line}");
+                    } else {
                         log::warn!("gsr stderr: {line}");
                     }
                 }
             });
     }
     Ok(child)
+}
+
+/// True if a `gpu-screen-recorder` stderr line is one of its periodic status
+/// updates (`update fps: 60, damage fps: 60`), which GSR emits ~1/sec while
+/// recording. These carry no diagnostic value and would otherwise flood the
+/// terminal at WARN level. Cheap substring check — runs per stderr line.
+fn is_gsr_status_spam(line: &str) -> bool {
+    line.contains("update fps:") || line.contains("damage fps:")
 }
 
 /// Send a signal to the GSR child by PID.
