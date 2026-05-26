@@ -1520,6 +1520,22 @@ pub fn run(start_hidden: bool) {
                 // releasing the resources borrow above so the worker threads
                 // we spawn can re-borrow if they need to (none currently do,
                 // but the discipline makes adding new state lookups safer).
+                if !saved_paths.is_empty() {
+                    // A successful save must ALWAYS refresh the browser model,
+                    // even when the user is NOT on the Clips tab and even when
+                    // no retention deletion fires. Previously the only refresh
+                    // path was gated behind `disk_cap_gb.is_some() &&
+                    // !deleted.is_empty()` inside dispatch_saved_clip, so a
+                    // normal save under the cap never updated the model — the
+                    // new clip only appeared after a full page rebuild. Refresh
+                    // here unconditionally so the GridView is correct whenever
+                    // the user next looks at it.
+                    log::info!(
+                        "[clip-lib] {} Saved event(s) this tick; refreshing browser model",
+                        saved_paths.len()
+                    );
+                    window_for_clips.clips_page().refresh_clips_model();
+                }
                 for saved_path in saved_paths {
                     dispatch_saved_clip(&app_for_clips, &window_for_clips, saved_path);
                 }
@@ -1535,6 +1551,46 @@ pub fn run(start_hidden: bool) {
                 let buf = buffer.borrow();
                 window.set_clips_state(buf.state(), buf.user_paused());
             }
+
+            // Poll-while-visible library live-refresh (2 s). The clip browser
+            // model only refreshes on a handful of events (page build,
+            // set_storage_dir, remix export, post-save). It does NOT watch the
+            // storage folder, so a manual deletion in ~/Videos/Clips (or any
+            // externally-appearing file) wouldn't reflect while the user is
+            // viewing the Clips tab. This timer cheaply scans the .mp4 set when
+            // the loaded GridView is the visible page, and only rebuilds the
+            // model when the set actually changed (added or removed files) so
+            // we don't reset scroll/selection every tick. Uses std::fs only —
+            // no inotify/notify-crate dependency.
+            let window_for_libwatch = window.clone();
+            let last_mp4_set: Rc<RefCell<std::collections::HashSet<String>>> =
+                Rc::new(RefCell::new(std::collections::HashSet::new()));
+            glib::timeout_add_seconds_local(STREAM_WATCH_SECS, move || {
+                let cp = window_for_libwatch.clips_page();
+                if !cp.is_loaded_view_visible() {
+                    // Not on the loaded library view — don't churn. The set is
+                    // intentionally NOT reseeded here so that when the user
+                    // navigates back, the next tick still detects any changes
+                    // that happened while they were away. (A save while off the
+                    // tab is separately handled by the unconditional refresh in
+                    // the Saved-event poll above.)
+                    return glib::ControlFlow::Continue;
+                }
+                let dir = cp.storage_dir();
+                let current = crate::clips::library::current_mp4_set(&dir);
+                let mut last = last_mp4_set.borrow_mut();
+                if *last != current {
+                    log::info!(
+                        "[clip-lib] live-watch detected storage change ({} -> {} mp4); refreshing model",
+                        last.len(),
+                        current.len()
+                    );
+                    *last = current;
+                    drop(last);
+                    cp.refresh_clips_model();
+                }
+                glib::ControlFlow::Continue
+            });
 
             // Battery query: send once immediately, then refresh periodically
             if let Some(writer) = writer {

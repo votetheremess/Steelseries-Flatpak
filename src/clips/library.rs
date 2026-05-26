@@ -99,19 +99,29 @@ pub fn save_index(items: &[ClipMeta]) -> std::io::Result<()> {
     std::fs::write(p, body)
 }
 
+/// The set of `.mp4` filenames (basenames, non-recursive) directly under
+/// `storage_dir`. Returns an empty set if the directory can't be read.
+///
+/// Factored out so the poll-while-visible live-refresh in `app.rs` can cheaply
+/// detect add/remove changes (compare two of these sets) without rebuilding
+/// the whole index, and `reconcile` can reuse the same scan.
+pub fn current_mp4_set(storage_dir: &Path) -> std::collections::HashSet<String> {
+    std::fs::read_dir(storage_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".mp4"))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
 /// Scan the storage dir, reconcile with the index, return the reconciled list.
 /// - Removes index entries whose `.mp4` files no longer exist on disk.
 /// - Adds entries for `.mp4` files not yet indexed (with default metadata —
 ///   ffprobe-augmented later in a worker thread).
 pub fn reconcile(storage_dir: &Path) -> Vec<ClipMeta> {
     let mut indexed = load_index();
-    let on_disk: std::collections::HashSet<String> = std::fs::read_dir(storage_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".mp4"))
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
+    let on_disk = current_mp4_set(storage_dir);
 
     let indexed_before = indexed.len();
     indexed.retain(|m| on_disk.contains(&m.filename));
@@ -291,6 +301,65 @@ pub fn backfill_durations(storage_dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_set_dir(suffix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "arctis-mp4set-test-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            suffix
+        ))
+    }
+
+    #[test]
+    fn current_mp4_set_filters_to_mp4_only() {
+        let dir = unique_set_dir("filter");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("b.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        std::fs::write(dir.join("thumb.jpg"), b"x").unwrap();
+        let set = current_mp4_set(&dir);
+        assert_eq!(set.len(), 2, "only the two .mp4 files: {set:?}");
+        assert!(set.contains("a.mp4"));
+        assert!(set.contains("b.mp4"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_mp4_set_missing_dir_is_empty() {
+        let dir = unique_set_dir("missing").join("does-not-exist");
+        assert!(current_mp4_set(&dir).is_empty());
+    }
+
+    #[test]
+    fn current_mp4_set_detects_add_and_remove() {
+        // The poll-while-visible refresh fires only when this set changes
+        // (added OR removed files). Verify set inequality catches both.
+        let dir = unique_set_dir("diff");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mp4"), b"x").unwrap();
+        let before = current_mp4_set(&dir);
+
+        // Add a file -> set differs.
+        std::fs::write(dir.join("b.mp4"), b"x").unwrap();
+        let after_add = current_mp4_set(&dir);
+        assert_ne!(before, after_add, "adding a clip must change the set");
+
+        // Remove a file -> set differs again.
+        std::fs::remove_file(dir.join("a.mp4")).unwrap();
+        let after_remove = current_mp4_set(&dir);
+        assert_ne!(after_add, after_remove, "deleting a clip must change the set");
+
+        // No change -> sets equal (refresh would be skipped).
+        let again = current_mp4_set(&dir);
+        assert_eq!(after_remove, again, "no fs change must yield an equal set");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn collision_appends_suffix() {

@@ -1332,6 +1332,29 @@ impl ClipsPage {
         refresh_model_in_place(&self.model, &dir);
     }
 
+    /// True when the loaded clip-library GridView is the page the user is
+    /// actually looking at: the inner stack's visible child is "loaded" AND
+    /// the page widget is mapped (the Clips sidebar tab is the visible content
+    /// stack child). Used by the poll-while-visible live-refresh in app.rs so
+    /// it only reconciles the dir when the user can see the result, avoiding
+    /// needless GridView rebuilds (which would reset scroll/selection) while
+    /// the user is on another tab.
+    pub fn is_loaded_view_visible(&self) -> bool {
+        use gtk::prelude::WidgetExt;
+        let on_loaded = self
+            .root
+            .visible_child_name()
+            .map(|n| n == "loaded")
+            .unwrap_or(false);
+        on_loaded && self.root.is_mapped()
+    }
+
+    /// The current storage directory the browser is pointed at. Used by the
+    /// poll-while-visible live-refresh to cheaply scan for add/remove changes.
+    pub fn storage_dir(&self) -> PathBuf {
+        self.storage_dir.borrow().clone()
+    }
+
     /// Update the storage directory shown by the browser. Called from
     /// Settings → Clips → Pick folder and the wizard's Page 3 picker
     /// whenever the user changes `clips_settings.storage_path`. The
