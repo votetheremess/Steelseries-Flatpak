@@ -42,6 +42,27 @@ pub fn run(start_hidden: bool) {
     // Only honor --hidden on the first activate
     let first_activate_hidden: Rc<Cell<bool>> = Rc::new(Cell::new(start_hidden));
 
+    // Convert SIGTERM / SIGINT into a graceful GApplication quit on the main
+    // loop. Without this, `pkill arctis-chatmix` (SIGTERM) and logout terminate
+    // the process before `connect_shutdown` runs, so the clip backend's Drop →
+    // Shutdown → disarm path never executes and the inner gpu-screen-recorder
+    // (which bwrap shields from our PR_SET_PDEATHSIG) reparents to the session
+    // reaper and keeps recording, holding a portal screencast session forever.
+    //
+    // `glib::unix_signal_add_local` routes the signal through the main loop
+    // (async-signal-safe; no handler running in signal context), then we call
+    // `app.quit()` which emits `shutdown`, drops `AppResources`, and disarms
+    // GSR cleanly. `pkill -9` (SIGKILL) is uncatchable and will still orphan —
+    // unavoidable.
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        let app_for_signal = app.clone();
+        glib::unix_signal_add_local(sig, move || {
+            log::info!("Received termination signal ({sig}); quitting cleanly");
+            app_for_signal.quit();
+            glib::ControlFlow::Break
+        });
+    }
+
     {
         let resources = resources.clone();
         app.connect_startup(move |_| match init_pipeline() {
