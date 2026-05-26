@@ -1493,7 +1493,12 @@ pub fn run(start_hidden: bool) {
                             match rx.try_recv() {
                                 Ok(evt) => {
                                     log::info!("clip event: {evt:?}");
-                                    if let crate::clips::BackendEvent::Saved { path, .. } = &evt {
+                                    if let crate::clips::BackendEvent::Saved { path, duration_ms } = &evt {
+                                        log::info!(
+                                            "[clip-save] GTK side received Saved {{ path={}, duration_ms={} }}; queuing thumbnail/notification + library refresh",
+                                            path.display(),
+                                            duration_ms
+                                        );
                                         saved_paths.push(path.clone());
                                     }
                                     buf.on_backend_event(&evt, &tx);

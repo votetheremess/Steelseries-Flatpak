@@ -113,9 +113,13 @@ pub fn reconcile(storage_dir: &Path) -> Vec<ClipMeta> {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
 
+    let indexed_before = indexed.len();
     indexed.retain(|m| on_disk.contains(&m.filename));
+    let retained = indexed.len();
+    let dropped = indexed_before - retained;
     let known: std::collections::HashSet<String> =
         indexed.iter().map(|m| m.filename.clone()).collect();
+    let mut added = 0usize;
     for filename in &on_disk {
         if !known.contains(filename) {
             indexed.push(ClipMeta {
@@ -125,8 +129,18 @@ pub fn reconcile(storage_dir: &Path) -> Vec<ClipMeta> {
                 bitrate_kbps: 0,
                 resolution: String::new(),
             });
+            added += 1;
         }
     }
+    log::info!(
+        "[clip-lib] reconcile({}): {} mp4 on disk, {} index entries retained, {} dropped (file gone), {} new added -> {} total",
+        storage_dir.display(),
+        on_disk.len(),
+        retained,
+        dropped,
+        added,
+        indexed.len()
+    );
     indexed
 }
 

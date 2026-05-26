@@ -660,6 +660,10 @@ impl ActiveCapture {
             for attempt in 0..5 {
                 if let Some(p) = resolve_inner_gsr_pid(wrapper) {
                     self.inner_pid = Some(p);
+                    log::info!(
+                        "[clip-save] resolved inner gpu-screen-recorder PID {p} below wrapper {wrapper} (attempt {})",
+                        attempt + 1
+                    );
                     break;
                 }
                 if attempt < 4 {
@@ -672,9 +676,10 @@ impl ActiveCapture {
             Some(p) => p,
             None => {
                 log::warn!(
-                    "clip-backend: could not resolve inner gpu-screen-recorder PID below \
-                     wrapper {wrapper}; falling back to signalling the wrapper (bwrap will \
-                     not forward it — save/disarm may no-op). Is GSR still starting up?"
+                    "[clip-save] could not resolve inner gpu-screen-recorder PID below \
+                     wrapper {wrapper} after 5x100ms; falling back to signalling the wrapper \
+                     (bwrap will NOT forward it — this save/disarm will likely no-op). Is GSR \
+                     still starting up, or did -restart-replay-on-save just reset it?"
                 );
                 wrapper
             }
@@ -981,15 +986,34 @@ fn save(active: &mut Option<ActiveCapture>, signal: libc::c_int, evt_tx: &Sender
         Some(a) => {
             // Target the inner GSR — signalling the wrapper is silently dropped
             // by bwrap and the save never fires.
+            let wrapper = a.child.id();
             let pid = a.signal_target();
+            let hit_fallback = pid == wrapper;
+            log::info!(
+                "[clip-save] save requested: sending signal {signal} to pid {pid} \
+                 (wrapper={wrapper}, fallback_to_wrapper={hit_fallback})"
+            );
             if let Err(e) = send_signal(pid, signal) {
+                log::warn!("[clip-save] kill({pid}, {signal}) failed: {e}");
                 let _ = evt_tx.send(BackendEvent::Error {
                     context: "SaveClip".into(),
                     message: format!("kill({pid}, {signal}) failed: {e}"),
                 });
+            } else if hit_fallback {
+                log::warn!(
+                    "[clip-save] signal {signal} sent to WRAPPER pid {pid} (inner GSR \
+                     unresolved); bwrap will not forward it, so this save will likely \
+                     produce no FIFO callback"
+                );
+            } else {
+                log::info!(
+                    "[clip-save] signal {signal} delivered to inner GSR pid {pid}; \
+                     awaiting save.fifo callback"
+                );
             }
         }
         None => {
+            log::warn!("[clip-save] save requested but backend is NOT armed; nothing to save");
             let _ = evt_tx.send(BackendEvent::Error {
                 context: "SaveClip".into(),
                 message: "Not armed; nothing to save".into(),
@@ -1076,6 +1100,33 @@ fn validate_fifo_line(
     Ok(canon_path)
 }
 
+/// Best-effort extra detail for a rejected FIFO line, surfacing the file's
+/// mtime age vs `FIFO_MAX_MTIME_AGE`. Returns a string suffix to append to the
+/// reject log (empty if the path can't be stat'd). The point is to make the
+/// staleness threshold visible in the logs: a too-aggressive freshness check
+/// is a prime suspect for "save wrote a file but no library entry appeared".
+fn stale_reject_detail(raw: &str, now: SystemTime) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let meta = match std::fs::metadata(trimmed) {
+        Ok(m) => m,
+        Err(_) => return String::new(),
+    };
+    let mtime = match meta.modified() {
+        Ok(t) => t,
+        Err(_) => return String::new(),
+    };
+    let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
+    format!(
+        " [file mtime age={:.3}s, freshness threshold={}s, stale={}]",
+        age.as_secs_f64(),
+        FIFO_MAX_MTIME_AGE.as_secs(),
+        age > FIFO_MAX_MTIME_AGE
+    )
+}
+
 fn truncate_for_log(s: &str, max: usize) -> String {
     // We log lines that may be malicious; strip control chars so a
     // crafted line can't smuggle ANSI/escape sequences into the
@@ -1128,8 +1179,18 @@ fn run_fifo_reader(evt_tx: Sender<BackendEvent>, active_storage: Arc<Mutex<PathB
                 .lock()
                 .map(|g| g.clone())
                 .unwrap_or_else(|p| p.into_inner().clone());
-            match validate_fifo_line(&raw, &validation_storage, SystemTime::now()) {
+            let now = SystemTime::now();
+            log::info!(
+                "[clip-fifo] received save-callback line: {:?} (validating against storage {})",
+                truncate_for_log(&raw, FIFO_LOG_LINE_MAX),
+                validation_storage.display()
+            );
+            match validate_fifo_line(&raw, &validation_storage, now) {
                 Ok(canon) => {
+                    log::info!(
+                        "[clip-fifo] accepted save-callback line; emitting Saved {{ path={}, duration_ms=0 }} (duration filled in later by ffprobe backfill)",
+                        canon.display()
+                    );
                     // Don't ffprobe here — it blocks the reader. Emit Saved with
                     // duration_ms = 0; the thumbnail-extraction worker (or a
                     // dedicated Phase 5 ffprobe pass) fills it in via the index.
@@ -1140,8 +1201,13 @@ fn run_fifo_reader(evt_tx: Sender<BackendEvent>, active_storage: Arc<Mutex<PathB
                 }
                 Err(reason) => {
                     let cleaned = truncate_for_log(&raw, FIFO_LOG_LINE_MAX);
+                    // For the staleness reject specifically, the freshness check
+                    // is a prime suspect for "save succeeded on disk but nothing
+                    // shows" — log the file mtime/age vs the threshold so the
+                    // user's repro can confirm or rule it out.
+                    let detail = stale_reject_detail(&raw, now);
                     log::warn!(
-                        "clip-fifo-reader: rejecting save-callback line ({reason:?}): {cleaned:?}"
+                        "[clip-fifo] REJECTED save-callback line ({reason:?}){detail}: {cleaned:?}"
                     );
                 }
             }

@@ -1223,6 +1223,11 @@ fn refresh_model_in_place(model: &gio::ListStore, storage_dir: &PathBuf) {
     for meta in library::reconcile(storage_dir) {
         model.append(&ClipObject::new(meta, storage_dir.clone()));
     }
+    log::info!(
+        "[clip-lib] refresh_clips_model ran for {}; GridView model now has {} item(s)",
+        storage_dir.display(),
+        model.n_items()
+    );
 }
 
 fn loaded_page(
