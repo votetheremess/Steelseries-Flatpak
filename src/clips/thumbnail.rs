@@ -21,6 +21,13 @@ pub fn thumb_path(storage_dir: &Path, clip_filename: &str) -> PathBuf {
 /// Extract a 320x180 JPEG thumbnail at offset 1.0s into the clip.
 /// Idempotent — if the thumb file already exists with non-zero size, skip.
 /// Returns the path to the thumbnail (whether newly created or pre-existing).
+///
+/// The scale filter uses `force_original_aspect_ratio=increase` + `crop` so the
+/// source frame fills the 320x180 tile edge-to-edge WITHOUT distortion (a plain
+/// `scale=320:180` squishes non-16:9 sources — e.g. a 3440x1440 ultrawide gets
+/// vertically stretched). Crop-to-fill is preferred over letterbox here because
+/// the thumbnails render in rounded tiles, where black letterbox bars would look
+/// out of place against the rounded corners.
 pub fn ensure_thumbnail(storage_dir: &Path, clip_filename: &str) -> std::io::Result<PathBuf> {
     let thumb = thumb_path(storage_dir, clip_filename);
     if let Ok(m) = std::fs::metadata(&thumb) {
@@ -37,7 +44,9 @@ pub fn ensure_thumbnail(storage_dir: &Path, clip_filename: &str) -> std::io::Res
             "-vframes",
             "1",
             "-vf",
-            &format!("scale={THUMB_W}:{THUMB_H}"),
+            &format!(
+                "scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=increase,crop={THUMB_W}:{THUMB_H}"
+            ),
             "-q:v",
             "4",
         ])
