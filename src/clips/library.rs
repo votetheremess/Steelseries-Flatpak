@@ -10,10 +10,54 @@ pub struct ClipMeta {
     pub created_unix: u64,
     pub bitrate_kbps: u32,
     pub resolution: String,
+    /// User-facing label for the clip. Defaults to the file's creation time
+    /// rendered human-readable (see [`default_display_name`]); the kebab
+    /// "Rename…" action overwrites it with free text. Persisted as the 6th
+    /// tab-separated field in the index. Empty for index lines written by
+    /// older builds — the loader backfills those in [`reconcile`].
+    pub display_name: String,
+}
+
+/// Build the default human-readable display name for a clip from its
+/// creation time (unix seconds, local timezone). Format example:
+/// `"May 27, 2026 · 5:57 PM"` — note the middle dot (U+00B7), never an
+/// em/en dash (project bans those in user-facing strings).
+///
+/// Uses `glib::DateTime` so no extra crate dependency is pulled in. We
+/// format with the space-padded `%e` (day) and `%l` (12-hour) specifiers,
+/// then collapse the resulting double-spaces and trim — this yields clean
+/// output ("May 7" not "May  7", "5:00" not " 5:00") regardless of whether
+/// the GNU `%-` flag is honored by the underlying `g_date_time_format`.
+///
+/// Falls back to an empty string if the timestamp can't be converted or
+/// formatted (e.g. an out-of-range value); callers treat empty the same as
+/// "no custom name yet".
+pub fn default_display_name(unix_ts: i64) -> String {
+    let Ok(dt) = gtk::glib::DateTime::from_unix_local(unix_ts) else {
+        return String::new();
+    };
+    let Ok(raw) = dt.format("%B %e, %Y · %l:%M %p") else {
+        return String::new();
+    };
+    // Collapse the space-padding that `%e` / `%l` insert for single-digit
+    // values, then trim any leading/trailing remnants. We only ever expect
+    // a single doubled space (after the month or before the hour), but the
+    // loop is robust to either/both.
+    let mut s = raw.to_string();
+    while s.contains("  ") {
+        s = s.replace("  ", " ");
+    }
+    s.trim().to_string()
 }
 
 /// Resolve filename collisions by appending `-2`, `-3`, ... before the extension.
 /// Falls back to a PID suffix if 1000 candidates are all taken.
+///
+/// Retained as a library helper (and unit-tested) even though the kebab
+/// rename action no longer writes new filenames — renaming now edits the
+/// display-name label only, never the `.mp4` on disk. Kept available for any
+/// future code path that needs to mint a non-clobbering filename.
+#[allow(dead_code)]
 pub fn resolve_collision(dir: &Path, base: &str, ext: &str) -> String {
     let mut candidate = format!("{base}.{ext}");
     if !dir.join(&candidate).exists() {
@@ -39,22 +83,43 @@ fn index_path() -> PathBuf {
 
 /// Serialize a clip meta into one tab-separated index line.
 ///
-/// Current (5-field) shape: `filename\tduration_ms\tcreated_unix\tbitrate_kbps\tresolution`.
-/// The legacy 6-field shape included a `game_name` after `duration_ms` — see
-/// [`parse_meta`] for the back-compat path.
+/// Current (6-field) shape:
+/// `filename\tduration_ms\tcreated_unix\tbitrate_kbps\tresolution\tdisplay_name`.
+/// `display_name` may legitimately be empty (the loader backfills it). See
+/// [`parse_meta`] for the back-compat path that reads the older 5-field
+/// shape and the still-older legacy 6-field shape (which carried a
+/// `game_name` after `duration_ms`).
 pub fn serialize_meta(m: &ClipMeta) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}",
-        m.filename, m.duration_ms, m.created_unix, m.bitrate_kbps, m.resolution
+        "{}\t{}\t{}\t{}\t{}\t{}",
+        m.filename,
+        m.duration_ms,
+        m.created_unix,
+        m.bitrate_kbps,
+        m.resolution,
+        m.display_name
     )
 }
 
 /// Parse one index line. Returns `None` on malformed input.
 ///
-/// Accepts both the current 5-field shape and the legacy 6-field shape
-/// (`filename\tduration_ms\tgame_name\tcreated_unix\tbitrate_kbps\tresolution`)
-/// produced by older builds. The `game_name` field is silently dropped
-/// when present.
+/// Field-count disambiguation:
+/// - **5 fields** — the pre-display-name current shape
+///   (`filename\tduration_ms\tcreated_unix\tbitrate_kbps\tresolution`).
+///   `display_name` parses as empty and is backfilled by [`reconcile`].
+/// - **6 fields** — ambiguous between two historical shapes:
+///   1. the new shape with a trailing `display_name`, and
+///   2. the legacy game-detection shape
+///      (`filename\tduration_ms\tgame_name\tcreated_unix\tbitrate_kbps\tresolution`).
+///   We disambiguate by checking whether the 3rd field parses as the
+///   `created_unix` integer: in the new shape field[2] is `created_unix`
+///   (numeric) and field[3] is `bitrate_kbps` (numeric); in the legacy
+///   shape field[2] is the human `game_name` (typically non-numeric) and
+///   the numeric `created_unix` sits at field[3]. We treat it as the new
+///   shape when fields[2] AND fields[3] both parse as the expected integer
+///   types; otherwise we fall back to the legacy layout. A legacy clip
+///   whose game name happened to be all-digits is vanishingly unlikely and
+///   would at worst mislabel one entry, which the user can rename.
 pub fn parse_meta(line: &str) -> Option<ClipMeta> {
     let parts: Vec<&str> = line.split('\t').collect();
     match parts.len() {
@@ -64,15 +129,34 @@ pub fn parse_meta(line: &str) -> Option<ClipMeta> {
             created_unix: parts[2].parse().ok()?,
             bitrate_kbps: parts[3].parse().ok()?,
             resolution: parts[4].to_string(),
+            display_name: String::new(),
         }),
-        6 => Some(ClipMeta {
-            filename: parts[0].to_string(),
-            duration_ms: parts[1].parse().ok()?,
-            // parts[2] = legacy game_name; dropped.
-            created_unix: parts[3].parse().ok()?,
-            bitrate_kbps: parts[4].parse().ok()?,
-            resolution: parts[5].to_string(),
-        }),
+        6 => {
+            // Try the new (display-name) layout first: field[2]=created_unix,
+            // field[3]=bitrate_kbps must both be numeric.
+            let new_shape_ok =
+                parts[2].parse::<u64>().is_ok() && parts[3].parse::<u32>().is_ok();
+            if new_shape_ok {
+                Some(ClipMeta {
+                    filename: parts[0].to_string(),
+                    duration_ms: parts[1].parse().ok()?,
+                    created_unix: parts[2].parse().ok()?,
+                    bitrate_kbps: parts[3].parse().ok()?,
+                    resolution: parts[4].to_string(),
+                    display_name: parts[5].to_string(),
+                })
+            } else {
+                // Legacy game-detection layout: parts[2] = game_name (dropped).
+                Some(ClipMeta {
+                    filename: parts[0].to_string(),
+                    duration_ms: parts[1].parse().ok()?,
+                    created_unix: parts[3].parse().ok()?,
+                    bitrate_kbps: parts[4].parse().ok()?,
+                    resolution: parts[5].to_string(),
+                    display_name: String::new(),
+                })
+            }
+        }
         _ => None,
     }
 }
@@ -115,10 +199,27 @@ pub fn current_mp4_set(storage_dir: &Path) -> std::collections::HashSet<String> 
         .collect()
 }
 
+/// Read a file's mtime as unix seconds. Returns 0 on any failure (missing
+/// file, clock-before-epoch). Used by [`reconcile`] to stamp `created_unix`
+/// for clips the recorder didn't index with a real timestamp.
+fn mtime_unix_secs(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Scan the storage dir, reconcile with the index, return the reconciled list.
 /// - Removes index entries whose `.mp4` files no longer exist on disk.
-/// - Adds entries for `.mp4` files not yet indexed (with default metadata —
-///   ffprobe-augmented later in a worker thread).
+/// - Adds entries for `.mp4` files not yet indexed, stamping `created_unix`
+///   from the file's mtime and `display_name` from [`default_display_name`]
+///   (ffprobe-augmented later in a worker thread for `duration_ms`).
+/// - Backfills `display_name` for any retained entry whose name is still
+///   empty (e.g. loaded from an older 5-field index line), using its
+///   `created_unix` when present or the file's mtime otherwise. A non-empty
+///   `display_name` is never overwritten — that's the user's custom rename.
 pub fn reconcile(storage_dir: &Path) -> Vec<ClipMeta> {
     let mut indexed = load_index();
     let on_disk = current_mp4_set(storage_dir);
@@ -127,17 +228,32 @@ pub fn reconcile(storage_dir: &Path) -> Vec<ClipMeta> {
     indexed.retain(|m| on_disk.contains(&m.filename));
     let retained = indexed.len();
     let dropped = indexed_before - retained;
+
+    // Backfill display names for retained entries that have none yet.
+    for m in indexed.iter_mut() {
+        if m.display_name.is_empty() {
+            let ts = if m.created_unix != 0 {
+                m.created_unix
+            } else {
+                mtime_unix_secs(&storage_dir.join(&m.filename))
+            };
+            m.display_name = default_display_name(ts as i64);
+        }
+    }
+
     let known: std::collections::HashSet<String> =
         indexed.iter().map(|m| m.filename.clone()).collect();
     let mut added = 0usize;
     for filename in &on_disk {
         if !known.contains(filename) {
+            let created_unix = mtime_unix_secs(&storage_dir.join(filename));
             indexed.push(ClipMeta {
                 filename: filename.clone(),
                 duration_ms: 0,
-                created_unix: 0,
+                created_unix,
                 bitrate_kbps: 0,
                 resolution: String::new(),
+                display_name: default_display_name(created_unix as i64),
             });
             added += 1;
         }
@@ -383,6 +499,7 @@ mod index_tests {
             created_unix: 1715000000,
             bitrate_kbps: 25000,
             resolution: "1920x1080".into(),
+            display_name: "May 6, 2024 · 2:13 PM".into(),
         }
     }
 
@@ -390,8 +507,22 @@ mod index_tests {
     fn round_trip_one_entry() {
         let m = meta();
         let line = serialize_meta(&m);
+        // The new shape serializes 6 tab-separated fields.
+        assert_eq!(line.split('\t').count(), 6);
         let parsed = parse_meta(&line);
         assert_eq!(parsed, Some(m));
+    }
+
+    /// A clip with an empty display_name round-trips to an empty
+    /// display_name (it is NOT collapsed away by the trailing-field
+    /// serialization, and the 6-field parse path reads it back as "").
+    #[test]
+    fn round_trip_empty_display_name() {
+        let mut m = meta();
+        m.display_name = String::new();
+        let line = serialize_meta(&m);
+        assert_eq!(line.split('\t').count(), 6, "trailing empty field is kept");
+        assert_eq!(parse_meta(&line), Some(m));
     }
 
     #[test]
@@ -403,10 +534,39 @@ mod index_tests {
         assert!(parse_meta("a\tb\tc\td\te\tf\tg").is_none());
     }
 
+    /// Backward-compat: a 5-field index line written by the
+    /// pre-display-name build must parse with an EMPTY display_name (the
+    /// loader then backfills it in `reconcile`).
+    #[test]
+    fn parse_meta_5_field_yields_empty_display_name() {
+        let old = "2026-05-08-1934-clip.mp4\t60000\t1715000000\t25000\t1920x1080";
+        let m = parse_meta(old).expect("5-field line must parse");
+        assert_eq!(m.filename, "2026-05-08-1934-clip.mp4");
+        assert_eq!(m.duration_ms, 60000);
+        assert_eq!(m.created_unix, 1715000000);
+        assert_eq!(m.bitrate_kbps, 25000);
+        assert_eq!(m.resolution, "1920x1080");
+        assert_eq!(m.display_name, "", "old line must backfill from empty");
+    }
+
+    /// New 6-field shape with a real trailing display_name parses it
+    /// through (and is NOT mistaken for the legacy game-name layout,
+    /// because fields[2] and fields[3] are both numeric).
+    #[test]
+    fn parse_meta_6_field_new_shape_reads_display_name() {
+        let line = "clip.mp4\t60000\t1715000000\t25000\t1920x1080\tMy Epic Win";
+        let m = parse_meta(line).expect("new 6-field line must parse");
+        assert_eq!(m.created_unix, 1715000000);
+        assert_eq!(m.bitrate_kbps, 25000);
+        assert_eq!(m.resolution, "1920x1080");
+        assert_eq!(m.display_name, "My Epic Win");
+    }
+
     /// Legacy 6-field shape (pre-deletion of game-detection): the
-    /// `game_name` field was the 3rd column. The current parser must
-    /// silently drop that field so a pre-existing `clips_index.txt` from
-    /// an earlier build still loads after upgrading.
+    /// `game_name` field was the 3rd column (a non-numeric human string).
+    /// The current parser must detect that fields[2] is NOT a `created_unix`
+    /// integer, fall back to the legacy layout, drop the game name, and
+    /// leave display_name empty for later backfill.
     #[test]
     fn parse_meta_accepts_legacy_6_field_lines() {
         let legacy = "2026-05-08-1934-Apex-Legends.mp4\t60000\tApex Legends\t1715000000\t25000\t1920x1080";
@@ -416,6 +576,43 @@ mod index_tests {
         assert_eq!(m.created_unix, 1715000000);
         assert_eq!(m.bitrate_kbps, 25000);
         assert_eq!(m.resolution, "1920x1080");
+        assert_eq!(m.display_name, "");
+    }
+}
+
+#[cfg(test)]
+mod display_name_tests {
+    use super::*;
+
+    /// `default_display_name` produces a non-empty, dash-free string that
+    /// contains the middle-dot separator. Uses a fixed timestamp
+    /// (2024-05-06 ~14:13 UTC) so the assertion is deterministic regardless
+    /// of the runner's wall clock; the exact rendered local time depends on
+    /// $TZ, so we assert on structural properties rather than an exact
+    /// string.
+    #[test]
+    fn default_display_name_is_dash_free_and_has_middle_dot() {
+        let s = default_display_name(1_715_000_000);
+        assert!(!s.is_empty(), "should render a non-empty label");
+        assert!(s.contains('·'), "must use the U+00B7 middle dot: {s:?}");
+        assert!(!s.contains('-'), "must not contain an ASCII dash: {s:?}");
+        assert!(!s.contains('—'), "must not contain an em dash: {s:?}");
+        assert!(!s.contains('–'), "must not contain an en dash: {s:?}");
+        // No leftover double-spaces from %e / %l padding.
+        assert!(!s.contains("  "), "double-space not collapsed: {s:?}");
+    }
+
+    /// Single-digit day and hour must not leave a stray padding space
+    /// (e.g. "May 7" not "May  7"). 2026-05-07 is the 7th, single digit.
+    /// We can't pin the exact local hour without controlling $TZ, so we
+    /// only assert the no-double-space + non-empty invariants here.
+    #[test]
+    fn default_display_name_single_digit_no_double_space() {
+        // 2026-05-07T09:05:00Z
+        let s = default_display_name(1_778_144_700);
+        assert!(!s.is_empty());
+        assert!(!s.contains("  "), "double-space remained: {s:?}");
+        assert!(!s.starts_with(' '), "leading space remained: {s:?}");
     }
 }
 

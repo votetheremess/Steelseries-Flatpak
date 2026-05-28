@@ -90,6 +90,11 @@ pub struct ClipsPage {
     /// `Rc` and read on demand, so a path change reaches every closure
     /// without per-closure rewiring.
     pub storage_dir: Rc<RefCell<PathBuf>>,
+    /// Dim "N clips" count label in the loaded-page header. Updated from
+    /// `model.n_items()` after every `refresh_clips_model()` so it tracks
+    /// adds/deletes live. Held here (built in `loaded_page`) so the refresh
+    /// chokepoint can reach it without walking the widget tree.
+    count_label: gtk::Label,
 }
 
 pub struct WizardWidgets {
@@ -252,15 +257,13 @@ pub fn build_clips_page() -> ClipsPage {
     let wizard = Rc::new(build_wizard());
     stack.add_named(&wizard.stack, Some("onboarding"));
     stack.add_named(&empty_page(), Some("empty"));
-    stack.add_named(
-        &loaded_page(storage_dir.clone(), &model, on_remix),
-        Some("loaded"),
-    );
+    let (loaded, count_label) = loaded_page(storage_dir.clone(), &model, on_remix);
+    stack.add_named(&loaded, Some("loaded"));
     stack.add_named(&remix_container, Some("remix"));
 
     stack.set_visible_child_name("onboarding");
 
-    let page = ClipsPage { root: stack, state, wizard, model, storage_dir };
+    let page = ClipsPage { root: stack, state, wizard, model, storage_dir, count_label };
     // Initial population (and one-time backfill spawn).
     page.refresh_clips_model();
     page.spawn_duration_backfill();
@@ -664,19 +667,33 @@ fn empty_page() -> gtk::Widget {
 /// kebab MenuButton (which sits on the overlay layer) keeps its own
 /// click swallowing — clicking the kebab opens the menu without also
 /// triggering the editor.
+/// Render a clip duration (milliseconds) as a compact `m:ss` string, e.g.
+/// `0:32`, `1:05`, `10:30`. Floors any sub-second remainder — the card
+/// subtitle is an at-a-glance hint, not a frame-accurate readout. Callers
+/// only show this when `duration_ms > 0`, so `0:00` never surfaces in the UI.
+fn format_duration_ms(duration_ms: u64) -> String {
+    let total_secs = duration_ms / 1000;
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    format!("{mins}:{secs:02}")
+}
+
 #[derive(Clone)]
 struct CardWidgets {
     card: gtk::Overlay,
     content: gtk::Box,
     image: gtk::Picture,
     title: gtk::Label,
+    /// Dim duration subtitle below the title (e.g. "0:32"). Hidden when the
+    /// clip's duration is unknown (0) so we never show a misleading "0:00".
+    subtitle: gtk::Label,
     kebab: gtk::MenuButton,
 }
 
 fn build_clip_card() -> (gtk::Overlay, CardWidgets) {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(4)
+        .spacing(8)
         .build();
 
     let image = gtk::Picture::builder()
@@ -684,6 +701,17 @@ fn build_clip_card() -> (gtk::Overlay, CardWidgets) {
         .width_request(320)
         .build();
     image.add_css_class("clip-thumb");
+    // Clip the Picture's contents to its (rounded) allocation so the
+    // `.clip-thumb { border-radius }` CSS actually rounds the image corners
+    // rather than just the widget's invisible box. Without Hidden overflow a
+    // gtk::Picture paints its paintable past the rounded border.
+    image.set_overflow(gtk::Overflow::Hidden);
+
+    // Title + subtitle stack, left-aligned beneath the thumbnail.
+    let text_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .build();
 
     let title = gtk::Label::builder()
         .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -692,8 +720,17 @@ fn build_clip_card() -> (gtk::Overlay, CardWidgets) {
         .build();
     title.add_css_class("clip-title");
 
+    let subtitle = gtk::Label::builder()
+        .xalign(0.0)
+        .visible(false)
+        .build();
+    subtitle.add_css_class("clip-subtitle");
+
+    text_box.append(&title);
+    text_box.append(&subtitle);
+
     content.append(&image);
-    content.append(&title);
+    content.append(&text_box);
 
     // Outer card is a gtk::Overlay so the kebab MenuButton can float over
     // the thumbnail without resizing the layout when shown/hidden.
@@ -733,7 +770,7 @@ fn build_clip_card() -> (gtk::Overlay, CardWidgets) {
     kebab.set_menu_model(Some(&menu));
     card.add_overlay(&kebab);
 
-    (card.clone(), CardWidgets { card, content, image, title, kebab })
+    (card.clone(), CardWidgets { card, content, image, title, subtitle, kebab })
 }
 
 fn bind_clip_card(
@@ -745,16 +782,32 @@ fn bind_clip_card(
 ) {
     let meta = clip.meta();
     let clip_storage_dir = clip.storage_dir();
-    // Card title: use the filename stem (no extension). With game
-    // detection removed, the filename is the only thing the user has
-    // chosen — falling back to "Untitled" if the stem is unexpectedly
-    // empty (e.g., a file literally named ".mp4").
-    let title = std::path::Path::new(&meta.filename)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("Untitled");
-    widgets.title.set_label(title);
+    // Card title: the clip's human-readable display name. This is the
+    // creation-time label by default (set during reconcile) or the user's
+    // free-text rename. Fall back to the default creation-time label if the
+    // stored name is somehow empty (mid-backfill), then to "Untitled".
+    let title = if !meta.display_name.is_empty() {
+        meta.display_name.clone()
+    } else {
+        let fallback = crate::clips::library::default_display_name(meta.created_unix as i64);
+        if fallback.is_empty() {
+            "Untitled".to_string()
+        } else {
+            fallback
+        }
+    };
+    widgets.title.set_label(&title);
+
+    // Duration subtitle: only shown when we actually know the duration.
+    // A 0/unknown duration leaves the subtitle hidden rather than showing
+    // a misleading "0:00".
+    if meta.duration_ms > 0 {
+        widgets.subtitle.set_label(&format_duration_ms(meta.duration_ms));
+        widgets.subtitle.set_visible(true);
+    } else {
+        widgets.subtitle.set_label("");
+        widgets.subtitle.set_visible(false);
+    }
 
     // Click-on-card → open editor (remix panel). We attach to the inner
     // `content` Box, NOT the outer `card` Overlay: the kebab MenuButton
@@ -918,90 +971,6 @@ fn parent_window_of(widget: &impl IsA<gtk::Widget>) -> Option<gtk::Window> {
     widget.root().and_then(|r| r.downcast::<gtk::Window>().ok())
 }
 
-/// Replace `filename` in the on-disk index with `new_filename`, preserving
-/// the metadata (duration_ms, bitrate, resolution, created_unix). Without
-/// this, `library::reconcile()` would drop the renamed file's index entry
-/// (file gone) and re-add a default-meta entry for the new name, losing
-/// the ffprobe-backfilled duration. Best-effort — index errors are logged
-/// and swallowed since the .mp4 itself has already been renamed at this
-/// point.
-fn rename_in_index(old: &str, new: &str) {
-    let mut idx = crate::clips::library::load_index();
-    let mut changed = false;
-    for m in idx.iter_mut() {
-        if m.filename == old {
-            m.filename = new.to_string();
-            changed = true;
-        }
-    }
-    if changed {
-        if let Err(e) = crate::clips::library::save_index(&idx) {
-            log::warn!("rename: failed to update clips index: {e}");
-        }
-    }
-}
-
-/// Validate a user-typed rename stem. Reject anything that could escape
-/// the storage dir, smuggle a leading dash into a future ffmpeg/ffprobe
-/// invocation, masquerade as a hidden file, hide a control character in
-/// a terminal listing, or trip case-insensitive filesystem confusion.
-///
-/// Returns `Err(reason)` with a short user-facing message on failure;
-/// the caller surfaces that as a toast / inline error label and aborts
-/// the rename.
-///
-/// `pub(crate)` so the validator is unit-testable in isolation. Tests
-/// in `mod rename_validator_tests` exercise every rejection branch.
-pub(crate) fn validate_rename_stem(stem: &str) -> Result<(), &'static str> {
-    if stem.is_empty() {
-        return Err("Name cannot be empty.");
-    }
-    // Trim-then-empty catches all-whitespace ("   "), which would look
-    // like a normal name to the user but be empty after we trim before
-    // joining — that's the same bug class as an empty stem.
-    if stem.trim().is_empty() {
-        return Err("Name cannot be only whitespace.");
-    }
-    // Trailing whitespace and trailing `.` cause case-insensitive
-    // filesystem confusion (Windows / NTFS / case-insensitive volume on
-    // macOS) where `name. ` and `name` resolve to the same dirent. We
-    // store on Linux but the user might sync the folder to a Windows
-    // share; reject defensively.
-    if stem.ends_with(' ') || stem.ends_with('\t') || stem.ends_with('.') {
-        return Err("Name cannot end with whitespace or a period.");
-    }
-    if stem.starts_with('.') {
-        return Err("Name cannot start with a period (would create a hidden file).");
-    }
-    if stem.starts_with('-') {
-        // ffmpeg / ffprobe parse a leading '-' as a flag. A future invocation
-        // (e.g. remix export, thumbnail extraction) that accidentally puts
-        // the rendered filename in the args list without `--` would then
-        // execute attacker-controlled flags.
-        return Err("Name cannot start with a dash.");
-    }
-    if stem.contains("..") {
-        // library::resolve_collision ends up calling storage_dir.join(stem),
-        // and `..` in `stem` lets the joined path resolve outside the
-        // storage dir. Belt-and-suspenders: even though the rename target
-        // is `storage_dir.join("foo..bar.mp4")` (joined unconditionally,
-        // not interpreted as a path), the caller's collision-resolution
-        // helper path-walks the result and could produce `<storage>/../...
-        // .mp4` if a future change relaxes the join discipline.
-        return Err("Name cannot contain '..' (path traversal).");
-    }
-    if stem.contains('/') || stem.contains('\\') || stem.contains('\0') {
-        return Err("Name contains an invalid character.");
-    }
-    if stem.chars().any(|c| c.is_control()) {
-        // Terminal escape sequences (ESC, BEL, ANSI CSI introducers)
-        // could rewrite the user's terminal when an `ls` listing of the
-        // storage dir is rendered. Rare but cheap to guard.
-        return Err("Name contains a control character.");
-    }
-    Ok(())
-}
-
 /// Look up the active toast overlay for a widget so rename / delete
 /// failures (and any other transient UI feedback) can show via an
 /// `adw::Toast` with consistent styling. Returns `None` if the widget
@@ -1053,29 +1022,59 @@ pub(crate) fn surface_failure(
     }
 }
 
+/// Maximum length (in chars) of a user-typed display name. Long enough for
+/// a descriptive sentence, short enough to keep the card title sane.
+const MAX_DISPLAY_NAME_CHARS: usize = 80;
+
+/// Set the `display_name` of the index entry matching `filename`, then
+/// persist. Returns `true` if an entry was found and updated. Best-effort
+/// on the save (errors logged, not propagated) since the in-memory model
+/// is refreshed by the caller from the same reconcile path regardless.
+fn set_display_name_in_index(filename: &str, new_name: &str) -> bool {
+    let mut idx = crate::clips::library::load_index();
+    let mut changed = false;
+    for m in idx.iter_mut() {
+        if m.filename == filename {
+            m.display_name = new_name.to_string();
+            changed = true;
+        }
+    }
+    if changed {
+        if let Err(e) = crate::clips::library::save_index(&idx) {
+            log::warn!("rename: failed to update clips index: {e}");
+        }
+    }
+    changed
+}
+
 fn show_rename_dialog(
     anchor: &impl IsA<gtk::Widget>,
-    old_filename: String,
+    filename: String,
     storage_dir: PathBuf,
     model: gio::ListStore,
 ) {
     use crate::clips::library;
 
-    // Pre-fill the entry with the current basename (no extension). The
-    // user types a new stem and we re-attach the original extension on
-    // save. Falls back to the full filename if there's no extension.
-    let old_stem = std::path::Path::new(&old_filename)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| old_filename.clone());
-    let old_ext = std::path::Path::new(&old_filename)
-        .extension()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "mp4".to_string());
+    // Pre-fill the entry with the clip's current display name (free-text
+    // label, NOT the on-disk filename). Renaming now edits only this label;
+    // the .mp4 file on disk is never touched. If the index entry has no
+    // display_name yet (e.g. mid-backfill), fall back to the default
+    // creation-time label so the user starts from something meaningful.
+    let current_display = library::load_index()
+        .into_iter()
+        .find(|m| m.filename == filename)
+        .map(|m| {
+            if m.display_name.is_empty() {
+                library::default_display_name(m.created_unix as i64)
+            } else {
+                m.display_name
+            }
+        })
+        .unwrap_or_default();
 
     let dialog = adw::AlertDialog::new(
         Some("Rename clip"),
-        Some(&format!("Pick a new name for {old_filename}.")),
+        Some("Pick a name for this clip. This only changes the label shown here, not the file on disk."),
     );
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("save", "Save");
@@ -1088,7 +1087,10 @@ fn show_rename_dialog(
         .spacing(6)
         .build();
     let entry = gtk::Entry::builder()
-        .text(&old_stem)
+        .text(&current_display)
+        // Hard cap typed input at the display-name limit. We still trim +
+        // re-check below in case the platform IME bypasses max_length.
+        .max_length(MAX_DISPLAY_NAME_CHARS as i32)
         .activates_default(true)
         .hexpand(true)
         .build();
@@ -1105,62 +1107,29 @@ fn show_rename_dialog(
     dialog.set_extra_child(Some(&body));
 
     let parent = parent_window_of(anchor);
-    let anchor_for_response: gtk::Widget = anchor.clone().upcast();
     dialog.connect_response(None, move |_dlg, response| {
         if response != "save" {
             // "cancel" or any non-save response: AlertDialog closes itself.
             return;
         }
-        // Note: trim() before validation so the user's leading/trailing
-        // whitespace doesn't cause spurious failures, but the validator
-        // still rejects internal trailing whitespace via its own rules.
-        let new_stem = entry.text().trim().to_string();
-        if new_stem == old_stem {
+        let new_name = entry.text().trim().to_string();
+        if new_name.is_empty() {
+            status.set_label("Name cannot be empty.");
+            status.set_visible(true);
+            return;
+        }
+        // max_length is in bytes-ish for the Entry; enforce a char cap too
+        // (paste / IME can exceed it). Truncate defensively rather than
+        // rejecting, so the user isn't blocked over a couple of stray chars.
+        let new_name: String = new_name.chars().take(MAX_DISPLAY_NAME_CHARS).collect();
+        if new_name == current_display {
             // No-op rename.
             return;
         }
-        if let Err(reason) = validate_rename_stem(&new_stem) {
-            // Surface BOTH inline (in the dialog's status label, in case
-            // the dialog is still presented after AdwAlertDialog's
-            // response handling) AND via toast (covers the case where
-            // the dialog has dismissed by the time we get here).
-            status.set_label(reason);
-            status.set_visible(true);
-            surface_failure(&anchor_for_response, &format!("Rename failed: {reason}"));
-            log::warn!("rename: rejecting stem {new_stem:?}: {reason}");
-            return;
-        }
-        // Resolve collisions by appending -2, -3, … via the same helper
-        // used by the FIFO save path. The user gets a deterministic
-        // disambiguated name rather than a clobbered file.
-        let new_filename = library::resolve_collision(&storage_dir, &new_stem, &old_ext);
-        let old_path = storage_dir.join(&old_filename);
-        let new_path = storage_dir.join(&new_filename);
-        match std::fs::rename(&old_path, &new_path) {
-            Ok(()) => {
-                // Best-effort thumb rename so the existing thumbnail isn't
-                // wasted (if it exists). reconcile() will regenerate
-                // anyway on next bind, but skipping the regen is faster.
-                let old_thumb =
-                    crate::clips::thumbnail::thumb_path(&storage_dir, &old_filename);
-                let new_thumb =
-                    crate::clips::thumbnail::thumb_path(&storage_dir, &new_filename);
-                let _ = std::fs::rename(&old_thumb, &new_thumb);
-                rename_in_index(&old_filename, &new_filename);
-                refresh_model_in_place(&model, &storage_dir);
-            }
-            Err(e) => {
-                log::warn!(
-                    "rename failed: {} -> {}: {e}",
-                    old_path.display(),
-                    new_path.display()
-                );
-                surface_failure(
-                    &anchor_for_response,
-                    &format!("Couldn't rename clip: {e}"),
-                );
-            }
-        }
+        // Free-text label: no path validation needed, we never touch disk
+        // filenames any more. Just persist the label and refresh.
+        set_display_name_in_index(&filename, &new_name);
+        refresh_model_in_place(&model, &storage_dir);
     });
 
     dialog.present(parent.as_ref().map(|w| w.upcast_ref::<gtk::Widget>()));
@@ -1220,7 +1189,17 @@ fn show_delete_dialog(
 fn refresh_model_in_place(model: &gio::ListStore, storage_dir: &PathBuf) {
     use crate::clips::library;
     model.remove_all();
-    for meta in library::reconcile(storage_dir) {
+    let reconciled = library::reconcile(storage_dir);
+    // Persist the reconciled index so mtime-stamped `created_unix` values
+    // and backfilled `display_name`s for previously-unindexed / old-format
+    // clips become durable. Without this the backfill would re-run on every
+    // refresh and the user's first rename would load an empty display_name
+    // from disk. Best-effort — a write failure just means the backfill
+    // recomputes next time; the in-memory model below is unaffected.
+    if let Err(e) = library::save_index(&reconciled) {
+        log::warn!("[clip-lib] failed to persist reconciled index: {e}");
+    }
+    for meta in reconciled {
         model.append(&ClipObject::new(meta, storage_dir.clone()));
     }
     log::info!(
@@ -1230,14 +1209,23 @@ fn refresh_model_in_place(model: &gio::ListStore, storage_dir: &PathBuf) {
     );
 }
 
+/// Build the loaded-library view. Returns the root widget plus the header's
+/// "N clips" count `gtk::Label` so `ClipsPage` can keep it in sync with the
+/// model on every reconcile.
 fn loaded_page(
     storage_dir: Rc<RefCell<PathBuf>>,
     model: &gio::ListStore,
     on_remix: Rc<dyn Fn(PathBuf)>,
-) -> gtk::Widget {
+) -> (gtk::Widget, gtk::Label) {
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
+        // Inset the grid from the sidebar / window edges so cards aren't
+        // flush against the chrome. Top margin is small because the header
+        // row above already supplies the breathing room from the HeaderBar.
+        .margin_start(24)
+        .margin_end(24)
+        .margin_bottom(24)
         .build();
 
     let factory = gtk::SignalListItemFactory::new();
@@ -1314,11 +1302,61 @@ fn loaded_page(
         .model(&gtk::SingleSelection::new(Some(model.clone())))
         .factory(&factory)
         .min_columns(2)
-        .max_columns(5)
+        .max_columns(4)
         .build();
+    // Scopes the `gridview.clips-grid > child { padding }` gutter and the
+    // softened selection ring (see the CSS provider in window.rs) to this
+    // grid only, so other GridViews/ListViews keep their default chrome.
+    grid.add_css_class("clips-grid");
 
     scroll.set_child(Some(&grid));
-    scroll.upcast()
+
+    // Header row: a "Clips" title on the left and a dim count label.
+    let header = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .margin_top(20)
+        .margin_start(24)
+        .margin_end(24)
+        .margin_bottom(12)
+        .build();
+
+    let heading = gtk::Label::builder()
+        .label("Clips")
+        .xalign(0.0)
+        .build();
+    heading.add_css_class("title-2");
+    header.append(&heading);
+
+    let count_label = gtk::Label::builder()
+        .label("")
+        .xalign(0.0)
+        // Baseline-align the count with the title so it reads as a subtitle
+        // sitting beside the heading rather than floating.
+        .valign(gtk::Align::Baseline)
+        .build();
+    count_label.add_css_class("dim-label");
+    header.append(&count_label);
+
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    column.append(&header);
+    column.append(&scroll);
+
+    (column.upcast(), count_label)
+}
+
+/// Format the count label text with correct singular/plural. `0` reads
+/// "0 clips" (plural is the natural English for zero).
+fn format_clip_count(n: u32) -> String {
+    if n == 1 {
+        "1 clip".to_string()
+    } else {
+        format!("{n} clips")
+    }
 }
 
 impl ClipsPage {
@@ -1330,6 +1368,8 @@ impl ClipsPage {
     pub fn refresh_clips_model(&self) {
         let dir = self.storage_dir.borrow().clone();
         refresh_model_in_place(&self.model, &dir);
+        self.count_label
+            .set_label(&format_clip_count(self.model.n_items()));
     }
 
     /// True when the loaded clip-library GridView is the page the user is
@@ -1488,72 +1528,39 @@ mod object_tests {
 }
 
 #[cfg(test)]
-mod rename_validator_tests {
-    //! Tests for `validate_rename_stem` covering security M-1: every
-    //! way a malicious or accidentally-tricky rename could escape the
-    //! storage dir, smuggle a leading flag into a future ffmpeg call,
-    //! masquerade as a hidden file, hide a control character, or trip
-    //! case-insensitive filesystem confusion.
+mod duration_fmt_tests {
     use super::*;
 
     #[test]
-    fn rejects_empty_and_whitespace_only() {
-        assert!(validate_rename_stem("").is_err());
-        assert!(validate_rename_stem("   ").is_err());
-        assert!(validate_rename_stem("\t\t").is_err());
+    fn formats_seconds_only() {
+        assert_eq!(format_duration_ms(32_000), "0:32");
+        assert_eq!(format_duration_ms(5_000), "0:05");
+        assert_eq!(format_duration_ms(0), "0:00");
     }
 
     #[test]
-    fn rejects_path_traversal_double_dot() {
-        assert!(validate_rename_stem("..").is_err());
-        assert!(validate_rename_stem("..hello").is_err());
-        assert!(validate_rename_stem("hello..world").is_err());
-        assert!(validate_rename_stem("foo/../bar").is_err());
+    fn formats_minutes_and_seconds() {
+        assert_eq!(format_duration_ms(65_000), "1:05");
+        assert_eq!(format_duration_ms(60_000), "1:00");
+        assert_eq!(format_duration_ms(125_000), "2:05");
     }
 
     #[test]
-    fn rejects_leading_dot() {
-        assert!(validate_rename_stem(".hidden").is_err());
-        assert!(validate_rename_stem(".").is_err());
+    fn rounds_down_sub_second_remainder() {
+        // 32.9s -> 0:32 (we floor; the subtitle is approximate by design).
+        assert_eq!(format_duration_ms(32_900), "0:32");
     }
 
     #[test]
-    fn rejects_leading_dash() {
-        assert!(validate_rename_stem("-flag").is_err());
-        assert!(validate_rename_stem("--flag").is_err());
+    fn formats_over_ten_minutes() {
+        assert_eq!(format_duration_ms(630_000), "10:30");
     }
 
     #[test]
-    fn rejects_trailing_whitespace_or_period() {
-        assert!(validate_rename_stem("name ").is_err());
-        assert!(validate_rename_stem("name\t").is_err());
-        assert!(validate_rename_stem("name.").is_err());
-        assert!(validate_rename_stem("with.dots.").is_err());
-    }
-
-    #[test]
-    fn rejects_control_characters() {
-        assert!(validate_rename_stem("name\nwith\nnewline").is_err());
-        assert!(validate_rename_stem("escape\x1bhere").is_err());
-        assert!(validate_rename_stem("bell\x07").is_err());
-        // NUL is also a control char; the explicit `\0` check is
-        // technically redundant with the is_control() branch but harmless.
-        assert!(validate_rename_stem("nul\x00here").is_err());
-    }
-
-    #[test]
-    fn rejects_path_separators() {
-        assert!(validate_rename_stem("dir/file").is_err());
-        assert!(validate_rename_stem("c:\\windows").is_err());
-    }
-
-    #[test]
-    fn accepts_normal_names() {
-        assert!(validate_rename_stem("Cyberpunk - epic moment").is_ok());
-        assert!(validate_rename_stem("clip_2026-01-01").is_ok());
-        assert!(validate_rename_stem("game.session.1").is_ok());
-        assert!(validate_rename_stem("ARC Raiders win").is_ok());
-        // Internal periods are fine; trailing one is the only rejection.
-        assert!(validate_rename_stem("foo.bar.baz").is_ok());
+    fn clip_count_singular_vs_plural() {
+        assert_eq!(format_clip_count(0), "0 clips");
+        assert_eq!(format_clip_count(1), "1 clip");
+        assert_eq!(format_clip_count(2), "2 clips");
+        assert_eq!(format_clip_count(42), "42 clips");
     }
 }
