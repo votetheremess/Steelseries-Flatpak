@@ -1149,28 +1149,60 @@ fn run_fifo_reader(evt_tx: Sender<BackendEvent>, active_storage: Arc<Mutex<PathB
     // The FIFO lives under whichever storage dir was last set by `arm()`.
     // We re-resolve the path on each open so a settings-driven storage
     // change picks up the new FIFO without restarting the reader thread.
+    //
+    // Diagnostic note (save-wedge investigation): the user's trace showed the
+    // save callback signal was delivered to GSR exactly once but no
+    // `[clip-fifo] accepted` line ever appeared, so the `Saved` event never
+    // fired. The loop below DOES reopen the FIFO after each EOF (writer close),
+    // so the reader is NOT one-shot — but the instrumentation here makes the
+    // open/block/read/EOF lifecycle visible so the next trace pinpoints where
+    // the GSR -sc → printf → FIFO → reader chain actually breaks.
+    let mut open_generation: u64 = 0;
     loop {
         let storage_dir = active_storage
             .lock()
             .map(|g| g.clone())
             .unwrap_or_else(|p| p.into_inner().clone());
         let fifo_path = save_fifo_path(&storage_dir);
+        open_generation += 1;
         // Opening a FIFO for reading blocks until a writer connects; that's fine —
         // the GSR callback opens for write each time it fires.
+        log::info!(
+            "[clip-fifo] reader opening FIFO {} (open #{}); will BLOCK until a writer connects (GSR -sc callback)",
+            fifo_path.display(),
+            open_generation
+        );
         let f = match File::open(&fifo_path) {
             Ok(f) => f,
             Err(e) => {
-                log::warn!("clip-fifo-reader: open failed: {e}; sleeping");
+                log::warn!(
+                    "[clip-fifo] open of {} failed: {e}; sleeping 1s then retrying (open #{})",
+                    fifo_path.display(),
+                    open_generation
+                );
                 thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };
+        log::info!(
+            "[clip-fifo] writer connected on {} (open #{}); blocking on read for callback lines",
+            fifo_path.display(),
+            open_generation
+        );
         let r = BufReader::new(f);
+        let mut lines_this_open: u64 = 0;
         for line in r.lines() {
             let raw = match line {
                 Ok(s) => s,
-                Err(_) => continue,
+                Err(e) => {
+                    log::warn!(
+                        "[clip-fifo] read error on FIFO (open #{}): {e}; skipping line",
+                        open_generation
+                    );
+                    continue;
+                }
             };
+            lines_this_open += 1;
             // Re-read the active storage dir for each line — the user may
             // have just changed it, in which case a callback line still in
             // flight from the prior FIFO instance must be validated against
@@ -1214,6 +1246,11 @@ fn run_fifo_reader(evt_tx: Sender<BackendEvent>, active_storage: Arc<Mutex<PathB
         }
         // Reader EOF — writer closed; loop and re-open against the
         // currently-active storage dir.
+        log::info!(
+            "[clip-fifo] EOF on FIFO (open #{}, {} line(s) read this open); reopening against current storage dir",
+            open_generation,
+            lines_this_open
+        );
     }
 }
 
