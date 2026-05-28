@@ -20,8 +20,9 @@ pub struct ClipMeta {
 
 /// Build the default human-readable display name for a clip from its
 /// creation time (unix seconds, local timezone). Format example:
-/// `"May 27, 2026 · 5:57 PM"` — note the middle dot (U+00B7), never an
-/// em/en dash (project bans those in user-facing strings).
+/// `"May 27, 2026 - 5:57 PM"`. The date/time separator is a plain ASCII
+/// hyphen (per the user's request); the project ban is only on em/en
+/// dashes (U+2014 / U+2013), not the keyboard hyphen.
 ///
 /// Uses `glib::DateTime` so no extra crate dependency is pulled in. We
 /// format with the space-padded `%e` (day) and `%l` (12-hour) specifiers,
@@ -36,7 +37,7 @@ pub fn default_display_name(unix_ts: i64) -> String {
     let Ok(dt) = gtk::glib::DateTime::from_unix_local(unix_ts) else {
         return String::new();
     };
-    let Ok(raw) = dt.format("%B %e, %Y · %l:%M %p") else {
+    let Ok(raw) = dt.format("%B %e, %Y - %l:%M %p") else {
         return String::new();
     };
     // Collapse the space-padding that `%e` / `%l` insert for single-digit
@@ -591,11 +592,11 @@ mod display_name_tests {
     /// $TZ, so we assert on structural properties rather than an exact
     /// string.
     #[test]
-    fn default_display_name_is_dash_free_and_has_middle_dot() {
+    fn default_display_name_uses_hyphen_separator() {
         let s = default_display_name(1_715_000_000);
         assert!(!s.is_empty(), "should render a non-empty label");
-        assert!(s.contains('·'), "must use the U+00B7 middle dot: {s:?}");
-        assert!(!s.contains('-'), "must not contain an ASCII dash: {s:?}");
+        assert!(s.contains(" - "), "must use a spaced ASCII hyphen separator: {s:?}");
+        assert!(!s.contains('·'), "should no longer use the middle dot: {s:?}");
         assert!(!s.contains('—'), "must not contain an em dash: {s:?}");
         assert!(!s.contains('–'), "must not contain an en dash: {s:?}");
         // No leftover double-spaces from %e / %l padding.
