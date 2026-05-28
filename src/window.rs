@@ -225,6 +225,28 @@ impl ChatMixWindow {
              .clips-card-row button > box label { \
                font-weight: normal; \
              } \
+             /* ---- Clips library cards (loaded GridView) ---- */ \
+             /* Per-cell padding on the GridView children IS the inter-card \
+                gutter — GridView has no spacing property, so ~5px of padding \
+                on each side of every cell yields ~10px gaps between tiles. */ \
+             gridview.clips-grid > child { padding: 5px; } \
+             /* Soften the default heavy selection highlight to a subtle accent \
+                ring so a selected card reads as focused, not slammed. */ \
+             gridview.clips-grid > child:selected { \
+               background: none; \
+               box-shadow: inset 0 0 0 2px alpha(@accent_color, 0.6); \
+               border-radius: 12px; \
+             } \
+             .clip-card { padding: 6px; border-radius: 12px; \
+               transition: background-color 150ms; } \
+             .clip-card:hover { background-color: alpha(currentColor, 0.04); } \
+             /* Rounded thumbnail. The Picture also has overflow:hidden set in \
+                code so the image is actually clipped to these rounded corners; \
+                the 1px hairline border adds definition against dark backgrounds. */ \
+             .clip-thumb { border-radius: 10px; \
+               border: 1px solid alpha(currentColor, 0.12); } \
+             .clip-title { font-weight: bold; } \
+             .clip-subtitle { font-size: 85%; opacity: 0.6; } \
              @keyframes clip-pulse { \
                0%   { opacity: 0.55; } \
                50%  { opacity: 1.0;  } \
