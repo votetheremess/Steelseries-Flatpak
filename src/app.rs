@@ -766,9 +766,55 @@ pub fn run(start_hidden: bool) {
             // duration variants share on_save_hotkey_duration so the backend
             // can pick SIGRTMIN+1/2/3 for GSR. All four are state-machine
             // safe — they no-op outside the Armed state.
+            //
+            // Save-wedge fallback: a save transitions the BufferController to
+            // `Saving`, and the ONLY transition out of `Saving` is the FIFO
+            // `Saved` event. That callback chain can silently fail (confirmed
+            // bug: only the first clip ever saved because the `Saved` event
+            // never arrived, wedging the machine in `Saving` so presses 2..N
+            // were no-ops). To un-wedge, every save schedules a one-shot glib
+            // timer that, if still `Saving` ~1.5s later, returns the buffer to
+            // `Armed` (GSR runs with `-restart-replay-on-save yes` so its
+            // replay buffer is reset and ready almost immediately; the
+            // filesystem live-watch keeps the library correct, so this path
+            // needs no file). The FIFO `Saved` event stays the fast path —
+            // when it arrives first, the timer is a no-op. `on_save_timeout`
+            // re-checks `should_arm`, so a stale timer can't force-rearm a
+            // paused buffer; and because `Saving` blocks new saves, two saves
+            // can't overlap within the window, so a plain state check suffices
+            // as the staleness guard.
+            const SAVE_TIMEOUT: Duration = Duration::from_millis(1500);
+            let schedule_save_timeout: Rc<dyn Fn()> = {
+                let buffer_for_timeout = buffer.clone();
+                let resources_for_timeout = resources.clone();
+                let window_for_timeout = window.clone();
+                Rc::new(move || {
+                    let buffer_inner = buffer_for_timeout.clone();
+                    let resources_inner = resources_for_timeout.clone();
+                    let window_inner = window_for_timeout.clone();
+                    glib::timeout_add_local_once(SAVE_TIMEOUT, move || {
+                        let cmd_tx = resources_inner
+                            .borrow()
+                            .as_ref()
+                            .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
+                        if let Some(tx) = cmd_tx {
+                            let mut buf = buffer_inner.borrow_mut();
+                            if buf.on_save_timeout(&tx) {
+                                log::warn!(
+                                    "[clip-save] no Saved event within 1.5s; assuming save completed, returning to Armed"
+                                );
+                                let (state, paused) = (buf.state(), buf.user_paused());
+                                drop(buf);
+                                window_inner.set_clips_state(state, paused);
+                            }
+                        }
+                    });
+                })
+            };
             {
                 let buffer_for_save = buffer.clone();
                 let resources_for_save = resources.clone();
+                let schedule_timeout = schedule_save_timeout.clone();
                 let save_action = gtk::gio::ActionEntry::builder("save-clip")
                     .activate(move |_app: &adw::Application, _action, _param| {
                         let cmd_tx = resources_for_save
@@ -776,7 +822,14 @@ pub fn run(start_hidden: bool) {
                             .as_ref()
                             .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
                         if let Some(tx) = cmd_tx {
-                            buffer_for_save.borrow_mut().on_save_hotkey(&tx);
+                            let armed = {
+                                let mut buf = buffer_for_save.borrow_mut();
+                                buf.on_save_hotkey(&tx);
+                                matches!(buf.state(), crate::clips::BufferState::Saving)
+                            };
+                            if armed {
+                                schedule_timeout();
+                            }
                         } else {
                             log::warn!("no clip backend available for save-clip");
                         }
@@ -787,6 +840,7 @@ pub fn run(start_hidden: bool) {
             {
                 let buffer_for_save = buffer.clone();
                 let resources_for_save = resources.clone();
+                let schedule_timeout = schedule_save_timeout.clone();
                 let save_action = gtk::gio::ActionEntry::builder("save-clip-short")
                     .activate(move |_app: &adw::Application, _action, _param| {
                         let cmd_tx = resources_for_save
@@ -794,9 +848,17 @@ pub fn run(start_hidden: bool) {
                             .as_ref()
                             .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
                         if let Some(tx) = cmd_tx {
-                            buffer_for_save
-                                .borrow_mut()
-                                .on_save_hotkey_duration(crate::clips::ClipCommand::SaveClipShort, &tx);
+                            let armed = {
+                                let mut buf = buffer_for_save.borrow_mut();
+                                buf.on_save_hotkey_duration(
+                                    crate::clips::ClipCommand::SaveClipShort,
+                                    &tx,
+                                );
+                                matches!(buf.state(), crate::clips::BufferState::Saving)
+                            };
+                            if armed {
+                                schedule_timeout();
+                            }
                         } else {
                             log::warn!("no clip backend available for save-clip-short");
                         }
@@ -807,6 +869,7 @@ pub fn run(start_hidden: bool) {
             {
                 let buffer_for_save = buffer.clone();
                 let resources_for_save = resources.clone();
+                let schedule_timeout = schedule_save_timeout.clone();
                 let save_action = gtk::gio::ActionEntry::builder("save-clip-medium")
                     .activate(move |_app: &adw::Application, _action, _param| {
                         let cmd_tx = resources_for_save
@@ -814,9 +877,17 @@ pub fn run(start_hidden: bool) {
                             .as_ref()
                             .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
                         if let Some(tx) = cmd_tx {
-                            buffer_for_save
-                                .borrow_mut()
-                                .on_save_hotkey_duration(crate::clips::ClipCommand::SaveClipMedium, &tx);
+                            let armed = {
+                                let mut buf = buffer_for_save.borrow_mut();
+                                buf.on_save_hotkey_duration(
+                                    crate::clips::ClipCommand::SaveClipMedium,
+                                    &tx,
+                                );
+                                matches!(buf.state(), crate::clips::BufferState::Saving)
+                            };
+                            if armed {
+                                schedule_timeout();
+                            }
                         } else {
                             log::warn!("no clip backend available for save-clip-medium");
                         }
@@ -827,6 +898,7 @@ pub fn run(start_hidden: bool) {
             {
                 let buffer_for_save = buffer.clone();
                 let resources_for_save = resources.clone();
+                let schedule_timeout = schedule_save_timeout.clone();
                 let save_action = gtk::gio::ActionEntry::builder("save-clip-long")
                     .activate(move |_app: &adw::Application, _action, _param| {
                         let cmd_tx = resources_for_save
@@ -834,9 +906,17 @@ pub fn run(start_hidden: bool) {
                             .as_ref()
                             .and_then(|r| r.clip_backend.as_ref().map(|h| h.sender()));
                         if let Some(tx) = cmd_tx {
-                            buffer_for_save
-                                .borrow_mut()
-                                .on_save_hotkey_duration(crate::clips::ClipCommand::SaveClipLong, &tx);
+                            let armed = {
+                                let mut buf = buffer_for_save.borrow_mut();
+                                buf.on_save_hotkey_duration(
+                                    crate::clips::ClipCommand::SaveClipLong,
+                                    &tx,
+                                );
+                                matches!(buf.state(), crate::clips::BufferState::Saving)
+                            };
+                            if armed {
+                                schedule_timeout();
+                            }
                         } else {
                             log::warn!("no clip backend available for save-clip-long");
                         }

@@ -165,6 +165,47 @@ impl BufferController {
         }
     }
 
+    /// Save-completion timeout fallback. Scheduled (~1.5s) by the GTK-side
+    /// save handlers whenever a save is initiated. If the FIFO `Saved` event
+    /// already moved us out of `Saving`, this is a no-op. Otherwise we assume
+    /// the save completed (GSR runs with `-restart-replay-on-save yes`, so its
+    /// replay buffer is already reset and ready for the next save) and return
+    /// to `Armed` so presses 2..N aren't silently dropped while we wait on a
+    /// callback that may never arrive.
+    ///
+    /// This is the un-wedge for the confirmed "only clips once" bug: the FIFO
+    /// `Saved` callback chain can silently fail, and without this fallback the
+    /// machine stays in `Saving` forever.
+    ///
+    /// Mirrors the `Saved` handler's `should_arm` re-check so a user who
+    /// paused while the save was in flight isn't force-rearmed. The
+    /// filesystem live-watch poll keeps the library correct independently, so
+    /// this path doesn't need the saved file path.
+    ///
+    /// Returns `true` if it actually performed the `Saving → …` transition
+    /// (so the caller knows to refresh the UI), `false` if it was a no-op.
+    pub(crate) fn on_save_timeout(&mut self, cmd_tx: &Sender<ClipCommand>) -> bool {
+        if !matches!(self.state, BufferState::Saving) {
+            return false;
+        }
+        if self.should_arm() {
+            self.state = BufferState::Armed;
+            if self.pending_reconfigure {
+                let _ = cmd_tx.send(ClipCommand::Reconfigure { config: self.config.clone() });
+                self.pending_reconfigure = false;
+            }
+        } else {
+            let _ = cmd_tx.send(ClipCommand::StopReplay);
+            self.state = if self.user_paused {
+                BufferState::Paused
+            } else {
+                BufferState::Idle
+            };
+            self.pending_reconfigure = false;
+        }
+        true
+    }
+
     /// Settings change — rebuild config and reconfigure backend if armed.
     pub fn on_config_change(&mut self, new_config: CaptureConfig, cmd_tx: &Sender<ClipCommand>) {
         // Preserve restore_token if caller didn't provide one.
@@ -554,6 +595,69 @@ mod tests {
         bc.pause();
         assert_eq!(bc.state(), BufferState::Uninitialized, "pause must not strand the user");
         assert!(!bc.user_paused());
+    }
+
+    /// Save-wedge fix: the buffer must never get stuck in `Saving` waiting on
+    /// a FIFO `Saved` callback that may never arrive. `on_save_timeout` is the
+    /// testable seam the GTK-side glib timer calls ~1.5s after a save; if the
+    /// machine is still `Saving`, it returns to `Armed` so the next save fires.
+    #[test]
+    fn saving_times_out_back_to_armed() {
+        let (tx, rx) = channel();
+        let mut b = BufferController::new(cfg());
+        b.set_onboarding_complete(true, &tx);
+        b.on_portal_pick_complete("t".into(), &tx);
+        let _ = rx.try_recv(); // consume StartReplay
+        b.on_backend_event(&BackendEvent::Armed, &tx);
+        assert_eq!(b.state(), BufferState::Armed);
+
+        // First save: armed → saving, SaveClip sent.
+        b.on_save_hotkey(&tx);
+        assert_eq!(b.state(), BufferState::Saving);
+        assert!(matches!(rx.try_recv(), Ok(ClipCommand::SaveClip)));
+
+        // No `Saved` event arrives (broken FIFO callback). The 1.5s timeout
+        // fires and un-wedges the machine back to Armed (all gates satisfied).
+        let fired = b.on_save_timeout(&tx);
+        assert!(fired, "timeout must perform the transition when still Saving");
+        assert_eq!(b.state(), BufferState::Armed);
+
+        // A subsequent save now works — the wedge is gone.
+        b.on_save_hotkey(&tx);
+        assert_eq!(b.state(), BufferState::Saving);
+        assert!(matches!(rx.try_recv(), Ok(ClipCommand::SaveClip)));
+    }
+
+    /// If the real `Saved` event already moved the machine out of `Saving`,
+    /// a late-firing timeout must be a no-op (no spurious StopReplay, no
+    /// double transition).
+    #[test]
+    fn save_timeout_is_noop_after_saved_event() {
+        let (tx, rx) = channel();
+        let mut b = BufferController::new(cfg());
+        b.set_onboarding_complete(true, &tx);
+        b.on_portal_pick_complete("t".into(), &tx);
+        let _ = rx.try_recv(); // consume StartReplay
+        b.on_backend_event(&BackendEvent::Armed, &tx);
+        b.on_save_hotkey(&tx);
+        let _ = rx.try_recv(); // consume SaveClip
+        assert_eq!(b.state(), BufferState::Saving);
+
+        // Fast path: Saved arrives before the timeout.
+        b.on_backend_event(
+            &BackendEvent::Saved {
+                path: std::path::PathBuf::from("/tmp/c.mp4"),
+                duration_ms: 60_000,
+            },
+            &tx,
+        );
+        assert_eq!(b.state(), BufferState::Armed);
+
+        // Stale timer fires afterwards — must do nothing.
+        let fired = b.on_save_timeout(&tx);
+        assert!(!fired, "timeout must be a no-op once we've left Saving");
+        assert_eq!(b.state(), BufferState::Armed);
+        assert!(rx.try_recv().is_err(), "no spurious command on no-op timeout");
     }
 
     /// Round-4 Bug B: ErrorState must recover via the pause-recording-toggle
